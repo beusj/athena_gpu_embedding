@@ -15,11 +15,13 @@ import os
 import shutil
 import subprocess
 import sys
+from glob import glob
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from dotenv import load_dotenv
+from typer.main import get_command
 
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
@@ -29,10 +31,45 @@ from gpu_embedder.models import FilterSpec
 app = typer.Typer(
     name="gpu-embed",
     help="Batch-embed OHDSI Athena concepts with SapBERT into DuckDB.",
-    no_args_is_help=True,
+    no_args_is_help=False,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    invoke_without_command=True,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_java_executable() -> Path | None:
+    """Return a usable Java executable from PATH, JAVA_HOME, or common installs."""
+    on_path = shutil.which("java")
+    if on_path:
+        return Path(on_path)
+
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        suffix = "java.exe" if os.name == "nt" else "java"
+        candidate = Path(java_home) / "bin" / suffix
+        if candidate.exists():
+            return candidate
+
+    if os.name == "nt":
+        program_files = [
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        ]
+        patterns = [
+            "Eclipse Adoptium/*/bin/java.exe",
+            "Java/*/bin/java.exe",
+            "Microsoft/*/jdk/*/bin/java.exe",
+            "JetBrains/*/jbr/bin/java.exe",
+        ]
+        for root in program_files:
+            for pattern in patterns:
+                matches = sorted(glob(str(Path(root) / pattern)), reverse=True)
+                if matches:
+                    return Path(matches[0])
+
+    return None
 
 
 def _version_callback(value: bool) -> None:
@@ -43,6 +80,7 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
+    ctx: typer.Context,
     version: Annotated[
         bool | None,
         typer.Option("--version", callback=_version_callback, is_eager=True, help="Show version"),
@@ -51,6 +89,16 @@ def main(
 ) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(format="%(levelname)s %(name)s: %(message)s", level=level)
+
+    if ctx.invoked_subcommand is None:
+        group = get_command(app)
+        embed_command = group.commands["embed"]
+        embed_command.main(
+            args=list(ctx.args),
+            prog_name=f"{ctx.info_name} embed",
+            standalone_mode=False,
+        )
+        raise typer.Exit()
 
 
 # ---------------------------------------------------------------------------
@@ -279,14 +327,17 @@ def cpt4_cmd(
 ) -> None:
     """Populate CPT-4 concept names via the Athena-provided Java tool (requires UMLS license)."""
     load_dotenv(dotenv_path=Path(".env"), override=False)
+    cdm_version = "5"
 
     # Resolve vocab dir
-    effective_vocab_dir = vocab_dir or Path(os.environ.get("GPU_EMBED_VOCAB_DIR", "athena_vocab"))
+    effective_vocab_dir = (
+        vocab_dir or Path(os.environ.get("GPU_EMBED_VOCAB_DIR", "athena_vocab"))
+    ).resolve()
 
     # Resolve jar path
-    effective_jar = jar or Path(
-        os.environ.get("CPT4_JAR", str(effective_vocab_dir / "cpt4.jar"))
-    )
+    effective_jar = (
+        jar or Path(os.environ.get("CPT4_JAR", str(effective_vocab_dir / "cpt4.jar")))
+    ).resolve()
 
     # Resolve API key (never log the full value)
     effective_key = api_key or os.environ.get("UMLS_API_KEY", "")
@@ -298,10 +349,10 @@ def cpt4_cmd(
         )
         raise typer.Exit(1)
 
-    # Guard: java on PATH
-    if shutil.which("java") is None:
+    java_executable = _resolve_java_executable()
+    if java_executable is None:
         typer.echo(
-            "ERROR: 'java' not found on PATH. Install JRE ≥ 11 and ensure it is on PATH.",
+            "ERROR: Java not found. Install JRE ≥ 11, or set JAVA_HOME, or add java to PATH.",
             err=True,
         )
         raise typer.Exit(1)
@@ -319,13 +370,14 @@ def cpt4_cmd(
     try:
         subprocess.run(
             [
-                "java",
+                str(java_executable),
                 f"-Dumls-apikey={effective_key}",
                 "-jar",
                 str(effective_jar),
-                str(effective_vocab_dir),
+                cdm_version,
             ],
             check=True,
+            cwd=effective_vocab_dir,
         )
     except subprocess.CalledProcessError as exc:
         # Redact the API key from any exception message before printing

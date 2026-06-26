@@ -28,6 +28,10 @@ htmlcov/
 .coverage
 coverage.xml
 
+# logs
+*.logs
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

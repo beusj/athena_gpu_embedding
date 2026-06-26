@@ -95,12 +95,14 @@ uv run gpu-embed cpt4 --vocab-dir /path/to/vocab
 
 This invokes `cpt4.jar` (located via `CPT4_JAR` in `.env`) with your UMLS
 API key and populates CPT-4 names directly into the Athena CSV files in place.
-Java (JRE ≥ 11) must be available on `PATH`.
+Java (JRE ≥ 11) must be available on `PATH`, discoverable via `JAVA_HOME`, or
+installed in a standard Windows location.
 
 The `cpt4` subcommand will:
 - Verify `cpt4.jar` exists at the configured path
 - Verify `UMLS_API_KEY` is set
-- Run `java -Dumls-apikey=<key> -jar cpt4.jar <vocab_dir>` as a subprocess
+- Resolve Java from `PATH`, `JAVA_HOME`, or common Windows install locations
+- Run `java -Dumls-apikey=<key> -jar cpt4.jar 5` from the vocab directory
 - Stream stdout/stderr so you see progress in real time
 - Exit non-zero if the Java process fails
 

@@ -93,14 +93,16 @@ from `cli.py`.
 - The `cpt4` subcommand in `cli.py` invokes Java as a subprocess:
   ```python
   subprocess.run(
-      ["java", f"-Dumls-apikey={api_key}", "-jar", str(jar_path), str(vocab_dir)],
+      ["java", f"-Dumls-apikey={api_key}", "-jar", str(jar_path), "5"],
       check=True,
+      cwd=vocab_dir,
   )
   ```
 - Never store the UMLS API key in logs, exceptions, or error messages.
   Truncate or redact before surfacing to the user.
-- Java (JRE ≥ 11) must be on `PATH`. The subcommand should check for `java`
-  before attempting the subprocess and emit a clear error if missing.
+- Java resolution order for the `cpt4` subcommand is: `PATH` → `JAVA_HOME` →
+  common Windows install locations (Adoptium/Oracle/Microsoft/JetBrains). Emit
+  a clear error if no Java executable can be found.
 
 ### Embedding
 
