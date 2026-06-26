@@ -66,7 +66,8 @@ class EmbedConfig(BaseSettings):
             self.device = resolved
             if resolved == "cpu":
                 logger.warning(
-                    "No GPU backend detected; using CPU. torch.version.cuda=%s, cuda_available=%s, mps_available=%s",
+                    "No GPU backend detected; using CPU. "
+                    "torch.version.cuda=%s, cuda_available=%s, mps_available=%s",
                     torch.version.cuda,
                     torch.cuda.is_available(),
                     hasattr(torch.backends, "mps") and torch.backends.mps.is_available(),

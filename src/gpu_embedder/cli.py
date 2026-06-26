@@ -19,10 +19,10 @@ from glob import glob
 from pathlib import Path
 from typing import Annotated
 
+import torch
 import typer
 from dotenv import load_dotenv
 from typer.main import get_command
-import torch
 
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
@@ -227,6 +227,21 @@ def embed_cmd(
 
     cfg = EmbedConfig(**cfg_overrides)
 
+    if device is None and cfg.device == "cpu":
+        typer.secho(
+            "WARNING: CUDA is not available in this Python environment; "
+            "running embeddings on CPU. Install a CUDA-enabled PyTorch build "
+            "and/or pass --device cuda on a GPU machine.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        logger.warning(
+            "CPU fallback active: torch_version=%s, torch.version.cuda=%s, cuda_available=%s",
+            torch.__version__,
+            torch.version.cuda,
+            torch.cuda.is_available(),
+        )
+
     # Resolve CSV paths
     paths: list[Path]
     if csv_paths:
@@ -277,7 +292,8 @@ def embed_cmd(
 
     rev_label = cfg.model_revision or "default"
     logger.info(
-        "Device diagnostics: requested=%s, torch.cuda.is_available=%s, torch.version.cuda=%s, mps=%s",
+        "Device diagnostics: requested=%s, torch.cuda.is_available=%s, "
+        "torch.version.cuda=%s, mps=%s",
         cfg.device,
         torch.cuda.is_available(),
         torch.version.cuda,
