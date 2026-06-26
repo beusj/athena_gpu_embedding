@@ -193,7 +193,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
 | `--verbose` | false | Enable detailed logging and progress visibility |
 | `--force` | false | Re-embed rows that already exist in the store |
-| `--vocabulary-id` | _(all)_ | Keep only these vocabulary IDs (repeatable) |
+| `--vocabulary-id` | _(all)_ | Keep only these vocabulary IDs (repeatable or comma-delimited) |
 | `--domain-id` | _(all)_ | Keep only these domain IDs (repeatable) |
 | `--concept-class-id` | _(all)_ | Keep only these concept class IDs (repeatable) |
 | `--standard-concept` | _(all)_ | Keep only `S`, `C`, or _(blank)_ rows (repeatable) |
@@ -282,6 +282,9 @@ gpu-embed embed \
   --vocabulary-id SNOMED \
   --vocabulary-id RxNorm \
   --force
+
+# Equivalent comma-delimited form
+gpu-embed embed --vocabulary-id SNOMED,RxNorm --force
 
 # Embed with concept_code prepended to name
 gpu-embed embed \

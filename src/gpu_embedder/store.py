@@ -6,8 +6,8 @@ Modules do not open their own connections.
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import tempfile
 from pathlib import Path
 from typing import Literal

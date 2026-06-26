@@ -43,6 +43,21 @@ app = typer.Typer(
 logger = logging.getLogger(__name__)
 
 
+def _split_multi_values(values: list[str] | None) -> list[str]:
+    """Normalize repeatable option values with optional comma-delimited input.
+
+    Example:
+    - ["LOINC", "SNOMED,RxNorm"] -> ["LOINC", "SNOMED", "RxNorm"]
+    """
+    if not values:
+        return []
+
+    normalized: list[str] = []
+    for value in values:
+        normalized.extend(piece.strip() for piece in value.split(",") if piece.strip())
+    return normalized
+
+
 def _resolve_java_executable() -> Path | None:
     """Return a usable Java executable from PATH, JAVA_HOME, or common installs."""
     on_path = shutil.which("java")
@@ -160,7 +175,10 @@ def embed_cmd(
     ] = False,
     vocabulary_id: Annotated[
         list[str] | None,
-        typer.Option("--vocabulary-id", help="Filter: vocabulary IDs to include (repeatable)"),
+        typer.Option(
+            "--vocabulary-id",
+            help="Filter: vocabulary IDs (repeatable or comma-delimited)",
+        ),
     ] = None,
     domain_id: Annotated[
         list[str] | None,
@@ -261,8 +279,10 @@ def embed_cmd(
         paths = [default]
 
     # Build filter spec
+    normalized_vocabulary_ids = _split_multi_values(vocabulary_id)
+
     spec = FilterSpec(
-        vocabulary_ids=vocabulary_id or [],
+        vocabulary_ids=normalized_vocabulary_ids,
         domain_ids=domain_id or [],
         concept_class_ids=concept_class_id or [],
         standard_concepts=(

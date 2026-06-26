@@ -175,3 +175,55 @@ def test_coverage_writes_csv_output(tmp_path: Path) -> None:
         "coverage_pct",
     ]
     assert any(row[0] == "CPT4" for row in rows[1:])
+
+
+def test_embed_accepts_comma_delimited_vocabulary_id(monkeypatch) -> None:
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    captured: dict[str, object] = {}
+
+    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+        captured["path"] = path
+        captured["vocabulary_ids"] = spec.vocabulary_ids
+        captured["engine"] = engine
+        return []
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+
+    result = runner.invoke(
+        app,
+        ["embed", str(fixture), "--vocabulary-id", "LOINC,SNOMED"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["vocabulary_ids"] == ["LOINC", "SNOMED"]
+    assert "Nothing to embed." in result.output
+
+
+def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None:
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    captured: dict[str, object] = {}
+
+    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+        captured["vocabulary_ids"] = spec.vocabulary_ids
+        return []
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+
+    result = runner.invoke(
+        app,
+        [
+            "embed",
+            str(fixture),
+            "--vocabulary-id",
+            "LOINC,SNOMED",
+            "--vocabulary-id",
+            "RxNorm",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["vocabulary_ids"] == ["LOINC", "SNOMED", "RxNorm"]
