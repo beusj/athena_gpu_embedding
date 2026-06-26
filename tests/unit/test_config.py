@@ -15,6 +15,9 @@ class TestEmbedConfigDefaults:
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.vocab_dir == Path("athena_vocab")
         assert cfg.db == Path("embeddings.duckdb")
+        assert cfg.log_dir == Path("logs")
+        assert cfg.log_max_bytes == 2 * 1024 * 1024
+        assert cfg.log_max_files == 5
         assert cfg.model == "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
         assert cfg.model_revision is None
         assert cfg.batch_size == 256

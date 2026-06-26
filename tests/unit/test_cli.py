@@ -2,11 +2,30 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
+import duckdb
 from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
+from gpu_embedder.models import SCHEMA_DDL
+
+
+def _seed_embeddings_db(db_path: Path) -> None:
+    conn = duckdb.connect(str(db_path))
+    conn.execute(SCHEMA_DDL)
+    conn.execute(
+        """
+        INSERT INTO concept_embeddings (
+            concept_id, concept_name, domain_id, vocabulary_id,
+            concept_class_id, standard_concept, concept_code,
+            invalid_reason, embedding, embed_text, model_version, embedded_at
+        ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, NOW())
+        """,
+        [999002, "CPT4 test concept", "Procedure", "CPT4", [0.0] * 768, "CPT4 test concept", "v1"],
+    )
+    conn.close()
 
 
 def test_cpt4_loads_api_key_from_dotenv(tmp_path: Path, monkeypatch) -> None:
@@ -99,3 +118,60 @@ def test_cpt4_uses_java_home_when_java_not_on_path(tmp_path: Path, monkeypatch) 
     assert isinstance(cmd, list)
     assert Path(cmd[0]).name in {"java", "java.exe"}
     assert Path(cmd[0]).resolve() == java_exe.resolve()
+
+
+def test_coverage_shows_complete_section_by_default(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_embeddings_db(db_path)
+
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+    result = runner.invoke(app, ["coverage", str(fixture), "--db", str(db_path)])
+
+    assert result.exit_code == 0
+    assert "Groups With Gaps" in result.output
+    assert "Fully Embedded Groups" in result.output
+    assert "CPT4" in result.output
+
+
+def test_coverage_gaps_only_hides_complete_section(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_embeddings_db(db_path)
+
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+    result = runner.invoke(app, ["coverage", str(fixture), "--db", str(db_path), "--gaps-only"])
+
+    assert result.exit_code == 0
+    assert "Groups With Gaps" in result.output
+    assert "Fully Embedded Groups" not in result.output
+
+
+def test_coverage_writes_csv_output(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_embeddings_db(db_path)
+    csv_path = tmp_path / "coverage" / "report.csv"
+
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+    result = runner.invoke(
+        app,
+        ["coverage", str(fixture), "--db", str(db_path), "--csv", str(csv_path)],
+    )
+
+    assert result.exit_code == 0
+    assert csv_path.exists()
+    assert "Coverage CSV written" in result.output
+
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+
+    assert rows[0] == [
+        "vocabulary_id",
+        "domain_id",
+        "source_count",
+        "embedded_count",
+        "gap_count",
+        "coverage_pct",
+    ]
+    assert any(row[0] == "CPT4" for row in rows[1:])

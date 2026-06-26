@@ -76,6 +76,20 @@ large source files are narrowed before they are validated or embedded.
 If you need a compatibility fallback or want to debug parsing differences,
 use `--ingest-engine python` to switch the ingest path.
 
+### Logging
+
+CLI runs write logs to `logs/` by default using dated filenames:
+
+- `gpu-embed-YYYY-MM-DD.log`
+- size-based rotation at `2MB` per file
+- retention capped at `5` files total
+
+These are configurable in `.env`:
+
+- `GPU_EMBED_LOG_DIR` (default: `logs`)
+- `GPU_EMBED_LOG_MAX_BYTES` (default: `2097152`)
+- `GPU_EMBED_LOG_MAX_FILES` (default: `5`)
+
 ### GPU setup (CUDA)
 
 > **Python version constraint:** PyTorch CUDA wheels are not published for
@@ -235,7 +249,13 @@ gpu-embed coverage [OPTIONS] [CSV_PATH...]
 
 Scans a `CONCEPT.csv` and compares every (vocabulary, domain) group against the
 embeddings database, reporting how many concepts have been embedded and how many
-remain. By default only groups with a non-zero gap are shown.
+remain.
+
+By default the output is split into two sections:
+- **Groups With Gaps** (needs embedding work)
+- **Fully Embedded Groups** (already complete)
+
+Use `--gaps-only` to hide the fully-embedded section.
 
 When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
 
@@ -244,7 +264,8 @@ When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
 | `--db` | `embeddings.duckdb` | DuckDB file to compare against |
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` |
 | `--model-version` | _(most recent)_ | Limit comparison to the version starting with this prefix |
-| `--show-complete` | false | Also print groups that are fully embedded |
+| `--show-complete` / `--gaps-only` | `show-complete` | Include or hide fully-embedded groups |
+| `--csv`, `-o` | _(none)_ | Write the aggregated coverage report to a CSV file |
 
 ### Examples
 
@@ -297,11 +318,14 @@ gpu-embed status --model-version abc12345
 # Find all vocabularies/domains with unembedded concepts (default CONCEPT.csv)
 gpu-embed coverage
 
-# Coverage report including fully-embedded groups
-gpu-embed coverage --show-complete
+# Hide fully-embedded groups and show only gaps
+gpu-embed coverage --gaps-only
 
 # Coverage against an explicit CSV and specific DB
 gpu-embed coverage /data/vocab/CONCEPT.csv --db /data/embeddings/omop.duckdb
+
+# Write coverage results to CSV for follow-up workflows
+gpu-embed coverage --csv coverage_report.csv
 ```
 
 ---

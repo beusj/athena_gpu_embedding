@@ -7,7 +7,9 @@ Modules do not open their own connections.
 from __future__ import annotations
 
 import logging
+import tempfile
 from pathlib import Path
+from typing import Literal
 
 import duckdb
 
@@ -44,17 +46,8 @@ def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set
     return ids
 
 
-def upsert_rows(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
-    """Insert or replace a batch of EmbeddedRow objects.
-
-    Uses a staged merge strategy for better DuckDB performance on large vector
-    payloads:
-    1) insert incoming rows into a temporary table,
-    2) delete matching (concept_id, model_version) keys from target,
-    3) insert staged rows into target.
-
-    This avoids the per-row conflict handling overhead of INSERT OR REPLACE.
-    """
+def _upsert_rows_direct(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
+    """Direct staged upsert using a temporary table populated via executemany."""
     if not rows:
         return
 
@@ -129,7 +122,100 @@ def upsert_rows(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> Non
     finally:
         conn.execute("DROP TABLE IF EXISTS temp_embeddings")
 
-    logger.info("Upserted %d rows in total", len(rows))
+
+def _upsert_rows_parquet(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
+    """Parquet-backed staged upsert for faster bulk writes."""
+    if not rows:
+        return
+
+    with tempfile.TemporaryDirectory(prefix="gpu_embedder_") as temp_dir:
+        parquet_path = Path(temp_dir) / "embeddings.parquet"
+
+        records = [
+            {
+                "concept_id": r.concept.concept_id,
+                "concept_name": r.concept.concept_name,
+                "domain_id": r.concept.domain_id,
+                "vocabulary_id": r.concept.vocabulary_id,
+                "concept_class_id": r.concept.concept_class_id,
+                "standard_concept": r.concept.standard_concept,
+                "concept_code": r.concept.concept_code,
+                "invalid_reason": r.concept.invalid_reason,
+                "embedding": r.embedding,
+                "embed_text": r.embed_text,
+                "model_version": r.model_version,
+                "embedded_at": r.embedded_at,
+            }
+            for r in rows
+        ]
+
+        conn.register("incoming_embeddings", records)
+        try:
+            conn.execute(
+                """
+                COPY incoming_embeddings TO ? (FORMAT PARQUET)
+                """,
+                [str(parquet_path)],
+            )
+
+            conn.execute("BEGIN")
+            try:
+                conn.execute("DROP TABLE IF EXISTS temp_embeddings")
+                conn.execute(
+                    """
+                    CREATE TEMP TABLE temp_embeddings AS
+                    SELECT * FROM read_parquet(?)
+                    """,
+                    [str(parquet_path)],
+                )
+
+                conn.execute(
+                    """
+                    DELETE FROM concept_embeddings AS t
+                    USING temp_embeddings AS s
+                    WHERE t.concept_id = s.concept_id
+                      AND t.model_version = s.model_version
+                    """
+                )
+
+                conn.execute(
+                    """
+                    INSERT INTO concept_embeddings
+                    SELECT * FROM temp_embeddings
+                    """
+                )
+
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.execute("DROP TABLE IF EXISTS temp_embeddings")
+        finally:
+            conn.unregister("incoming_embeddings")
+
+
+def upsert_rows(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[EmbeddedRow],
+    mode: Literal["parquet", "direct"] = "parquet",
+) -> None:
+    """Insert or replace a batch of EmbeddedRow objects.
+
+    Uses a staged merge strategy for better DuckDB performance on large vector
+    payloads:
+    1) insert incoming rows into a temporary table,
+    2) delete matching (concept_id, model_version) keys from target,
+    3) insert staged rows into target.
+
+    This avoids the per-row conflict handling overhead of INSERT OR REPLACE.
+    """
+    if mode == "direct":
+        _upsert_rows_direct(conn, rows)
+    else:
+        _upsert_rows_parquet(conn, rows)
+
+    logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
 
 
 def count_rows(conn: duckdb.DuckDBPyConnection, model_version: str) -> int:

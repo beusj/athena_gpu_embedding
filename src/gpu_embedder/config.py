@@ -33,6 +33,9 @@ class EmbedConfig(BaseSettings):
     # Paths
     vocab_dir: Path = Path("athena_vocab")
     db: Path = Path("embeddings.duckdb")
+    log_dir: Path = Path("logs")
+    log_max_bytes: int = 2 * 1024 * 1024
+    log_max_files: int = 5
 
     # Model
     model: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
@@ -43,6 +46,7 @@ class EmbedConfig(BaseSettings):
     batch_size: int = 256
     max_length: int = 128
     ingest_engine: Literal["duckdb", "python"] = "duckdb"
+    write_mode: Literal["ndjson", "direct"] = "ndjson"
 
     # Text construction
     text_fields: Annotated[list[str], NoDecode] = ["concept_name"]
@@ -50,6 +54,13 @@ class EmbedConfig(BaseSettings):
 
     # Behaviour
     force: bool = False
+
+    @field_validator("log_max_bytes", "log_max_files")
+    @classmethod
+    def validate_positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("must be greater than 0")
+        return v
 
     @field_validator("text_fields", mode="before")
     @classmethod

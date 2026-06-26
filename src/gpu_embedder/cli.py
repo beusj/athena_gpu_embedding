@@ -10,11 +10,13 @@ and store.  cli.py is excluded from coverage requirements.
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from glob import glob
 from pathlib import Path
@@ -28,6 +30,7 @@ from typer.main import get_command
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
 from gpu_embedder.ingest import read_csv
+from gpu_embedder.logging_setup import setup_logging
 from gpu_embedder.models import FilterSpec
 
 app = typer.Typer(
@@ -89,8 +92,14 @@ def main(
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable DEBUG logging")] = False,
 ) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(format="%(levelname)s %(name)s: %(message)s", level=level)
+    cfg = EmbedConfig()
+    log_file = setup_logging(
+        verbose=verbose,
+        log_dir=cfg.log_dir,
+        max_bytes=cfg.log_max_bytes,
+        max_files=cfg.log_max_files,
+    )
+    logger.debug("File logging active at %s", log_file)
 
     if ctx.invoked_subcommand is None:
         group = get_command(app)
@@ -151,6 +160,14 @@ def embed_cmd(
             "--ingest-engine",
             envvar="GPU_EMBED_INGEST_ENGINE",
             help="CSV ingest engine: duckdb (default) or python",
+        ),
+    ] = None,
+    write_mode: Annotated[
+        str | None,
+        typer.Option(
+            "--write-mode",
+            envvar="GPU_EMBED_WRITE_MODE",
+            help="DB write mode: ndjson (default, faster) or direct",
         ),
     ] = None,
     force: Annotated[
@@ -219,6 +236,8 @@ def embed_cmd(
         cfg_overrides["max_length"] = max_length
     if ingest_engine is not None:
         cfg_overrides["ingest_engine"] = ingest_engine
+    if write_mode is not None:
+        cfg_overrides["write_mode"] = write_mode
     if force:
         cfg_overrides["force"] = True
     if text_field:
@@ -335,6 +354,7 @@ def embed_cmd(
         typer.echo("Nothing new to embed. Use --force to re-embed.")
         raise typer.Exit(0)
 
+    embed_started = time.perf_counter()
     embedded = embed_all(
         to_embed,
         mdl,
@@ -346,8 +366,14 @@ def embed_cmd(
         cfg.separator,
         model_version,
     )
+    embed_seconds = time.perf_counter() - embed_started
+    typer.echo(f"Embedding phase: {embed_seconds:.2f}s for {len(embedded)} rows.")
 
-    st.upsert_rows(conn, embedded)
+    write_started = time.perf_counter()
+    st.upsert_rows(conn, embedded, mode=cfg.write_mode)
+    write_seconds = time.perf_counter() - write_started
+    typer.echo(f"Write phase: {write_seconds:.2f}s for {len(embedded)} rows.")
+
     total = st.count_rows(conn, model_version)
     typer.echo(
         f"Done. Embedded {len(embedded)} concepts. "
@@ -553,8 +579,19 @@ def coverage_cmd(
     ] = None,
     show_complete: Annotated[
         bool,
-        typer.Option("--show-complete", help="Include fully-embedded groups in the output"),
-    ] = False,
+        typer.Option(
+            "--show-complete/--gaps-only",
+            help="Show fully-embedded groups in a separate section (enabled by default)",
+        ),
+    ] = True,
+    csv_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--csv",
+            "-o",
+            help="Write the aggregated coverage report to a CSV file",
+        ),
+    ] = None,
 ) -> None:
     """Compare a CONCEPT.csv against the embeddings database to identify gaps."""
     from gpu_embedder import store as st
@@ -623,30 +660,56 @@ def coverage_cmd(
 
     all_rows = sorted(agg.values(), key=lambda r: (r.vocabulary_id, r.domain_id))
 
-    if not show_complete:
-        display_rows = [r for r in all_rows if r.gap > 0]
-    else:
-        display_rows = all_rows
+    gap_rows = [r for r in all_rows if r.gap > 0]
+    complete_rows = [r for r in all_rows if r.gap == 0]
 
-    if not display_rows:
+    if not all_rows:
+        typer.echo("No rows found in source CSV(s).")
+        raise typer.Exit(0)
+
+    if not gap_rows and not show_complete:
         typer.secho("All concepts in the source CSV(s) are fully embedded.", fg=typer.colors.GREEN)
         raise typer.Exit(0)
 
-    typer.echo(
-        f"\n{'VOCABULARY':22}  {'DOMAIN':22}  {'SOURCE':>9}  {'EMBEDDED':>9}  "
-        f"{'GAP':>9}  COVERAGE"
-    )
-    typer.echo("-" * 89)
-    for r in display_rows:
-        coverage_str = f"{r.pct:5.1f}%"
+    if gap_rows:
+        typer.echo("\nGroups With Gaps")
         typer.echo(
-            f"{r.vocabulary_id or '(null)':<22}  "
-            f"{r.domain_id or '(null)':<22}  "
-            f"{r.total:>9,}  "
-            f"{r.embedded:>9,}  "
-            f"{r.gap:>9,}  "
-            f"{coverage_str}"
+            f"{'VOCABULARY':22}  {'DOMAIN':22}  {'SOURCE':>9}  {'EMBEDDED':>9}  "
+            f"{'GAP':>9}  COVERAGE"
         )
+        typer.echo("-" * 89)
+        for r in gap_rows:
+            coverage_str = f"{r.pct:5.1f}%"
+            typer.echo(
+                f"{r.vocabulary_id or '(null)':<22}  "
+                f"{r.domain_id or '(null)':<22}  "
+                f"{r.total:>9,}  "
+                f"{r.embedded:>9,}  "
+                f"{r.gap:>9,}  "
+                f"{coverage_str}"
+            )
+    else:
+        typer.secho("\nGroups With Gaps\n(none)", fg=typer.colors.GREEN)
+
+    if show_complete:
+        if complete_rows:
+            typer.echo("\nFully Embedded Groups")
+            typer.echo(
+                f"{'VOCABULARY':22}  {'DOMAIN':22}  {'SOURCE':>9}  {'EMBEDDED':>9}  "
+                f"{'GAP':>9}  COVERAGE"
+            )
+            typer.echo("-" * 89)
+            for r in complete_rows:
+                typer.echo(
+                    f"{r.vocabulary_id or '(null)':<22}  "
+                    f"{r.domain_id or '(null)':<22}  "
+                    f"{r.total:>9,}  "
+                    f"{r.embedded:>9,}  "
+                    f"{r.gap:>9,}  "
+                    "100.0%"
+                )
+        else:
+            typer.echo("\nFully Embedded Groups\n(none)")
 
     total_source = sum(r.total for r in all_rows)
     total_embedded = sum(r.embedded for r in all_rows)
@@ -657,8 +720,30 @@ def coverage_cmd(
         f"{'TOTAL':<22}  {'':22}  {total_source:>9,}  {total_embedded:>9,}  "
         f"{total_gap:>9,}  {overall_pct:5.1f}%\n"
     )
-    if not show_complete and any(r.gap == 0 for r in all_rows):
-        complete_count = sum(1 for r in all_rows if r.gap == 0)
-        typer.echo(
-            f"({complete_count} fully-embedded group(s) hidden — pass --show-complete to include)"
-        )
+
+    if csv_output is not None:
+        csv_output.parent.mkdir(parents=True, exist_ok=True)
+        with csv_output.open("w", encoding="utf-8", newline="") as output_file:
+            writer = csv.writer(output_file)
+            writer.writerow(
+                [
+                    "vocabulary_id",
+                    "domain_id",
+                    "source_count",
+                    "embedded_count",
+                    "gap_count",
+                    "coverage_pct",
+                ]
+            )
+            for row in all_rows:
+                writer.writerow(
+                    [
+                        row.vocabulary_id,
+                        row.domain_id,
+                        row.total,
+                        row.embedded,
+                        row.gap,
+                        round(row.pct, 1),
+                    ]
+                )
+        typer.echo(f"Coverage CSV written: {csv_output}")
