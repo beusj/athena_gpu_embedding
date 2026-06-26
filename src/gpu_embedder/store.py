@@ -47,41 +47,47 @@ def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set
 def upsert_rows(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
     """Insert or replace a batch of EmbeddedRow objects.
 
-    Uses a single executemany call for efficiency.  If any row fails the
-    whole batch is rolled back (DuckDB wraps executemany in a transaction).
+    Uses batched executemany calls (256 rows per batch) to avoid PRIMARY KEY
+    constraint checking bottlenecks on large inserts with large embedding vectors.
+    Each batch is wrapped in its own transaction.
     """
     if not rows:
         return
 
-    records = [
-        (
-            r.concept.concept_id,
-            r.concept.concept_name,
-            r.concept.domain_id,
-            r.concept.vocabulary_id,
-            r.concept.concept_class_id,
-            r.concept.standard_concept,
-            r.concept.concept_code,
-            r.concept.invalid_reason,
-            r.embedding,
-            r.embed_text,
-            r.model_version,
-            r.embedded_at,
-        )
-        for r in rows
-    ]
+    chunk_size = 256
+    for chunk_start in range(0, len(rows), chunk_size):
+        chunk = rows[chunk_start : chunk_start + chunk_size]
+        records = [
+            (
+                r.concept.concept_id,
+                r.concept.concept_name,
+                r.concept.domain_id,
+                r.concept.vocabulary_id,
+                r.concept.concept_class_id,
+                r.concept.standard_concept,
+                r.concept.concept_code,
+                r.concept.invalid_reason,
+                r.embedding,
+                r.embed_text,
+                r.model_version,
+                r.embedded_at,
+            )
+            for r in chunk
+        ]
 
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO concept_embeddings (
-            concept_id, concept_name, domain_id, vocabulary_id,
-            concept_class_id, standard_concept, concept_code,
-            invalid_reason, embedding, embed_text, model_version, embedded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        records,
-    )
-    logger.info("Upserted %d rows", len(rows))
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO concept_embeddings (
+                concept_id, concept_name, domain_id, vocabulary_id,
+                concept_class_id, standard_concept, concept_code,
+                invalid_reason, embedding, embed_text, model_version, embedded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            records,
+        )
+        logger.debug("Upserted chunk of %d rows (%d/%d)", len(chunk), chunk_start + len(chunk), len(rows))
+
+    logger.info("Upserted %d rows in total", len(rows))
 
 
 def count_rows(conn: duckdb.DuckDBPyConnection, model_version: str) -> int:

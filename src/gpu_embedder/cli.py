@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from glob import glob
 from pathlib import Path
 from typing import Annotated
@@ -419,3 +420,229 @@ def cpt4_cmd(
         sys.exit(exc.returncode)
 
     typer.echo("CPT-4 population complete.")
+
+
+# ---------------------------------------------------------------------------
+# status subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("status")
+def status_cmd(
+    db: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_DB", help="DuckDB file to inspect"),
+    ] = None,
+    model_version_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--model-version",
+            help="Limit breakdown to the model version starting with this prefix",
+        ),
+    ] = None,
+) -> None:
+    """Show a summary of what is currently stored in the embeddings database."""
+    from gpu_embedder import store as st
+    from gpu_embedder.report import embedded_summary, list_model_versions
+
+    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+
+    if not cfg.db.exists():
+        typer.echo(f"Database not found: {cfg.db}")
+        raise typer.Exit(0)
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    versions = list_model_versions(conn)
+    if not versions:
+        typer.echo("No embeddings found in the database.")
+        raise typer.Exit(0)
+
+    typer.echo(f"\nDatabase: {cfg.db}\n")
+    typer.echo(f"{'MODEL VERSION':18}  {'CONCEPTS':>9}  {'FIRST EMBEDDED':20}  LAST EMBEDDED")
+    typer.echo("-" * 75)
+    for v in versions:
+        typer.echo(
+            f"{v.short_hash}…  {v.count:>9,}  "
+            f"{v.first_embedded_at.strftime('%Y-%m-%d %H:%M'):20}  "
+            f"{v.last_embedded_at.strftime('%Y-%m-%d %H:%M')}"
+        )
+    typer.echo()
+
+    # Resolve which model version to break down
+    mv_filter: str | None = None
+    if model_version_prefix:
+        matched = [v for v in versions if v.model_version.startswith(model_version_prefix)]
+        if not matched:
+            typer.echo(
+                f"No model version starting with '{model_version_prefix}' found.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        mv_filter = matched[0].model_version
+        typer.echo(f"Breakdown for model version: {matched[0].short_hash}…\n")
+    else:
+        mv_filter = versions[0].model_version  # most recent
+        typer.echo(f"Breakdown for most recent model version: {versions[0].short_hash}…\n")
+
+    rows = embedded_summary(conn, model_version=mv_filter)
+    if not rows:
+        typer.echo("No rows found for this model version.")
+        raise typer.Exit(0)
+
+    typer.echo(f"{'VOCABULARY':22}  {'DOMAIN':22}  {'EMBEDDED':>9}")
+    typer.echo("-" * 60)
+    for r in rows:
+        typer.echo(
+            f"{r.vocabulary_id or '(null)':<22}  "
+            f"{r.domain_id or '(null)':<22}  "
+            f"{r.embedded:>9,}"
+        )
+    total = sum(r.embedded for r in rows)
+    typer.echo("-" * 60)
+    typer.echo(f"{'TOTAL':<22}  {'':22}  {total:>9,}\n")
+
+
+# ---------------------------------------------------------------------------
+# coverage subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("coverage")
+def coverage_cmd(
+    csv_paths: Annotated[
+        list[Path] | None,
+        typer.Argument(help="Explicit CONCEPT.csv path(s) (defaults to <vocab-dir>/CONCEPT.csv)"),
+    ] = None,
+    vocab_dir: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_VOCAB_DIR", help="Directory containing CONCEPT.csv"),
+    ] = None,
+    db: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_DB", help="DuckDB file to compare against"),
+    ] = None,
+    model_version_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--model-version",
+            help=(
+                "Limit comparison to embeddings for this model version prefix "
+                "(default: most recent)"
+            ),
+        ),
+    ] = None,
+    show_complete: Annotated[
+        bool,
+        typer.Option("--show-complete", help="Include fully-embedded groups in the output"),
+    ] = False,
+) -> None:
+    """Compare a CONCEPT.csv against the embeddings database to identify gaps."""
+    from gpu_embedder import store as st
+    from gpu_embedder.report import coverage_report, list_model_versions
+        from gpu_embedder.report import VocabCoverage
+
+    cfg_overrides: dict[str, object] = {}
+    if db is not None:
+        cfg_overrides["db"] = db
+    if vocab_dir is not None:
+        cfg_overrides["vocab_dir"] = vocab_dir
+    cfg = EmbedConfig(**cfg_overrides)
+
+    # Resolve CSV paths
+    paths: list[Path]
+    if csv_paths:
+        paths = list(csv_paths)
+    else:
+        default = cfg.vocab_dir / "CONCEPT.csv"
+        if not default.exists():
+            typer.echo(
+                f"ERROR: {default} not found. Use --vocab-dir or pass explicit CSV path(s).",
+                err=True,
+            )
+            raise typer.Exit(1)
+        paths = [default]
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    # Resolve model version filter
+    mv_filter: str | None = None
+    if model_version_prefix:
+        versions = list_model_versions(conn)
+        matched = [v for v in versions if v.model_version.startswith(model_version_prefix)]
+        if not matched:
+            typer.echo(
+                f"No model version starting with '{model_version_prefix}' found.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        mv_filter = matched[0].model_version
+        typer.echo(f"Using model version: {mv_filter[:16]}…\n")
+    else:
+        versions = list_model_versions(conn)
+        if versions:
+            mv_filter = versions[0].model_version  # most recent
+            typer.echo(f"Using most recent model version: {mv_filter[:16]}…\n")
+        else:
+            typer.echo("No embeddings found in database — all concepts will show as gaps.\n")
+
+    # Accumulate coverage across all provided CSVs
+    all_rows: list = []
+        agg: dict[tuple[str, str], VocabCoverage] = defaultdict(
+        lambda: VocabCoverage(vocabulary_id="", domain_id="", total=0, embedded=0)
+    )
+    for p in paths:
+        typer.echo(f"Scanning {p} …")
+        for r in coverage_report(conn, p, model_version=mv_filter):
+            key = (r.vocabulary_id, r.domain_id)
+            existing = agg[key]
+            agg[key] = VocabCoverage(
+                vocabulary_id=r.vocabulary_id,
+                domain_id=r.domain_id,
+                total=existing.total + r.total,
+                embedded=existing.embedded + r.embedded,
+            )
+
+    all_rows = sorted(agg.values(), key=lambda r: (r.vocabulary_id, r.domain_id))
+
+    if not show_complete:
+        display_rows = [r for r in all_rows if r.gap > 0]
+    else:
+        display_rows = all_rows
+
+    if not display_rows:
+        typer.secho("All concepts in the source CSV(s) are fully embedded.", fg=typer.colors.GREEN)
+        raise typer.Exit(0)
+
+    typer.echo(
+        f"\n{'VOCABULARY':22}  {'DOMAIN':22}  {'SOURCE':>9}  {'EMBEDDED':>9}  "
+        f"{'GAP':>9}  COVERAGE"
+    )
+    typer.echo("-" * 89)
+    for r in display_rows:
+        coverage_str = f"{r.pct:5.1f}%"
+        typer.echo(
+            f"{r.vocabulary_id or '(null)':<22}  "
+            f"{r.domain_id or '(null)':<22}  "
+            f"{r.total:>9,}  "
+            f"{r.embedded:>9,}  "
+            f"{r.gap:>9,}  "
+            f"{coverage_str}"
+        )
+
+    total_source = sum(r.total for r in all_rows)
+    total_embedded = sum(r.embedded for r in all_rows)
+    total_gap = total_source - total_embedded
+    overall_pct = 100.0 * total_embedded / total_source if total_source else 0.0
+    typer.echo("-" * 89)
+    typer.echo(
+        f"{'TOTAL':<22}  {'':22}  {total_source:>9,}  {total_embedded:>9,}  "
+        f"{total_gap:>9,}  {overall_pct:5.1f}%\n"
+    )
+    if not show_complete and any(r.gap == 0 for r in all_rows):
+        complete_count = sum(1 for r in all_rows if r.gap == 0)
+        typer.echo(
+            f"({complete_count} fully-embedded group(s) hidden — pass --show-complete to include)"
+        )
