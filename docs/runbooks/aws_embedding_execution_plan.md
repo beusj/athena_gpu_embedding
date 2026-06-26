@@ -41,6 +41,13 @@ current one.
 - Replacing Snowflake/Fabric portability strategy
 - Reworking stage scoring/retrieval logic
 
+## Environment assumptions (academic AWS)
+
+- Deployment is in an academic AWS environment with HIPAA compliance controls available.
+- This project does not intend to process or share PHI, PII, or institutional IP.
+- Even without regulated data, controls should align with HIPAA-ready guardrails to simplify
+  review and prevent accidental data handling drift.
+
 ---
 
 ## Recommended AWS architecture (price/perf first)
@@ -97,6 +104,44 @@ Keep embedding output as an artifact, then ingest into warehouse tables.
 
 This preserves current stage contracts and keeps retrieval behavior unchanged.
 
+## Read/write path recommendation
+
+Use S3 as the default read/write layer for AWS execution:
+
+- Read shard inputs from S3 (or generate shard manifests then upload once).
+- Write per-shard embedding outputs to S3.
+- Write run metadata (manifest, counts, checksums, completion markers) to S3.
+
+This keeps workers stateless, improves retry behavior under Spot interruption,
+and decouples GPU compute from downstream warehouse import.
+
+When not to use S3 as primary I/O:
+
+- Only for special cases needing low-latency shared POSIX semantics during a single job
+  (consider EFS/FSx then). For this batch workload, S3 should remain the default.
+
+## Source code + data movement model
+
+- The runtime image can pull this repository from GitHub during build/CI and publish a pinned image to ECR.
+- Batch jobs should run the pinned image tag/digest (not git clone on every job start).
+- Input data (`CONCEPT.csv` or prepared shards) should be staged in S3 before submit.
+
+Data files needed for embedding-only runs:
+
+- Required: `CONCEPT.csv` (or derived shard files with the required concept fields).
+- Optional: existing partial embedding state for resume logic.
+- Not required for embedding itself: other Athena vocabulary files (`CONCEPT_ANCESTOR`, `CONCEPT_RELATIONSHIP`, etc.) unless a separate pipeline step uses them.
+
+Note on CPT-4:
+
+- If CPT-4 name population has already been done, only the resulting `CONCEPT.csv` content is needed for embedding.
+- If CPT-4 enrichment has not been run yet, do that upstream first; do not couple Java/UMLS enrichment into AWS embedding workers.
+
+Note on partial `embeddings.duckdb`:
+
+- Prefer artifact-first shard outputs + manifest/checkpoint over sharing a mutable DuckDB file across workers.
+- If carrying forward a local partial state is necessary, upload it to an S3 checkpoint prefix as a snapshot input to a single merge/import step, not as a concurrently written shared DB.
+
 ---
 
 ## Price-to-performance strategy
@@ -131,6 +176,31 @@ For each run, hold constant:
 
 Then choose by lowest stable `$ per 1M concepts` at acceptable wall-clock.
 
+## Pre-run utilization test plan (before full dataset)
+
+Run a short resource-utilization gate before full production execution.
+
+Test shape:
+
+- 3 shard sizes (small/medium/large; target ~5 min / ~10 min / ~20 min runtime each)
+- 2 candidate instance types (`g5.xlarge`, `g6e.xlarge`)
+- 2–3 batch sizes per instance
+
+Capture per run:
+
+- GPU utilization and memory utilization
+- CPU and RAM usage
+- input rows/sec and embedded rows/sec
+- retry/interruption behavior and median restart penalty
+- cost estimate from runtime * effective instance price
+
+Promotion gate for full run:
+
+- no OOM on selected batch size
+- p95 shard time within SLA target
+- stable retries (no sustained retry storm)
+- selected profile wins on both throughput and `$ per 1M concepts`
+
 ## Cost controls
 
 - Spot-first with capped retries and checkpointed shards
@@ -138,6 +208,137 @@ Then choose by lowest stable `$ per 1M concepts` at acceptable wall-clock.
 - EBS `gp3` right-sized throughput, avoid overprovisioning
 - Pre-pulled image + warm HuggingFace cache layer in AMI/image where practical
 - Strict CloudWatch alarms on queue backlog and retry storm conditions
+
+---
+
+## Suggested S3 directory structure
+
+Use one bucket (or one dedicated prefix) per environment with immutable run IDs.
+
+Example:
+
+- `s3://<bucket>/gpu-embed/<env>/inputs/raw/CONCEPT/<date>/CONCEPT.csv`
+- `s3://<bucket>/gpu-embed/<env>/inputs/shards/<run_id>/manifest.json`
+- `s3://<bucket>/gpu-embed/<env>/inputs/shards/<run_id>/part-00000.parquet`
+- `s3://<bucket>/gpu-embed/<env>/outputs/<run_id>/shards/part-00000.ndjson.gz`
+- `s3://<bucket>/gpu-embed/<env>/outputs/<run_id>/manifests/completion.json`
+- `s3://<bucket>/gpu-embed/<env>/outputs/<run_id>/metrics/summary.json`
+- `s3://<bucket>/gpu-embed/<env>/checkpoints/<run_id>/embeddings.duckdb` (optional snapshot only)
+- `s3://<bucket>/gpu-embed/<env>/logs/<run_id>/worker-<job_id>.log`
+
+Naming guidance:
+
+- `run_id` should include timestamp + short git SHA + model-version prefix.
+- Keep shard outputs immutable; retries write new attempt files and update manifest pointers.
+- Treat `outputs/<run_id>/manifests/completion.json` as the source of truth for import eligibility.
+
+Import handoff:
+
+- Downstream import should consume only completion-manifest-declared shard files.
+- Never import directly from in-progress shard prefixes.
+
+---
+
+## Artifact schema + import modes
+
+Default recommendation:
+
+- Primary output format: Parquet (for scale and warehouse load efficiency).
+- Optional debug output: NDJSON (for easy inspection/troubleshooting).
+
+Minimum artifact columns for `llm_concept_mapping` compatibility:
+
+- `concept_id` (int)
+- `vocabulary_id` (string)
+- `domain_id` (string)
+- `concept_name` (string)
+- `standard_concept` (nullable string)
+- `embedding` (array<float>, length 768)
+- `embedded_at` (timestamp)
+- `embed_model_version` (string; canonical version id)
+
+Recommended optional columns:
+
+- `concept_class_id`
+- `invalid_reason`
+- `embed_text` (the exact concatenated text used for embedding)
+- `model_version_legacy` (existing gpu-embedder SHA-256 weights hash)
+- `run_id`, `shard_id`, `attempt`
+
+Import modes to support:
+
+- Direct stage load: `S3 -> Snowflake external stage -> COPY/MERGE` (default for production)
+- Local relay: `S3 -> local download -> Snowflake load` (fallback/manual mode)
+
+In both modes, import must be idempotent on `(concept_id, embed_model_version)`.
+
+---
+
+## Model version naming alignment (cross-repo)
+
+Current state:
+
+- `gpu_embedding` stores a raw SHA-256 digest of weight files as `model_version`.
+- `llm_concept_mapping` expects a namespaced version string format:
+  `sapbert-<backend>-<quantization>-<digest10>`.
+
+Recommendation:
+
+- Define `embed_model_version` as the canonical cross-repo identifier using the
+  `llm_concept_mapping` naming convention.
+- Keep the existing gpu hash as `model_version_legacy` during transition for lineage.
+
+Canonical digest input (pinned attributes, sorted JSON):
+
+- model_name
+- revision
+- backend
+- quantization
+- dimension
+- normalize
+
+Canonical ID format:
+
+- `sapbert-<backend>-<quantization>-<sha256(pinned_attributes_json)[:10]>`
+
+For current GPU embedder defaults, likely namespace example:
+
+- `sapbert-torch-fp32-<digest10>`
+
+Transition strategy:
+
+1. Write both `embed_model_version` (canonical) and `model_version_legacy` in new AWS artifacts.
+2. During import to Snowflake, populate `embed_model_version` from artifact directly.
+3. Keep legacy value available for audit/backfill verification.
+4. After validation period, treat canonical `embed_model_version` as the only operational key.
+
+---
+
+## Ingesting existing `embeddings.duckdb`
+
+Yes, existing local DuckDB files can be migrated.
+
+Recommended one-time backfill path:
+
+1. Snapshot the current DuckDB file.
+2. Export `concept_embeddings` to Parquet shards (include legacy and canonical model version columns).
+3. Upload shards to S3 under a dedicated backfill run prefix.
+4. Generate a completion manifest with row counts/checksums.
+5. Load to Snowflake with MERGE on `(concept_id, embed_model_version)`.
+6. Run post-load validation queries (counts by vocabulary/domain/model version).
+
+Important migration decision:
+
+- If historical DuckDB rows only have legacy hash versions, either:
+  - map each legacy hash to one canonical `embed_model_version` (preferred when provenance is clear), or
+  - preserve them as legacy-only history and re-embed into canonical namespace.
+
+Validation checks after backfill:
+
+- row counts match source export totals
+- all vectors have dimension 768
+- no duplicate `(concept_id, embed_model_version)`
+- retrieval queries in `llm_concept_mapping` can target the expected canonical version
 
 ---
 
@@ -212,6 +413,47 @@ Do not change stage logic. Add ingestion path for external embeddings.
 - Restrict S3 prefixes and KMS keys per environment.
 - Use VPC endpoints for S3/ECR/CloudWatch where required.
 - Log model version, shard id, and row counts; never log sensitive keys.
+
+## HIPAA-oriented baseline controls (recommended)
+
+Apply these controls even though PHI/PII is out of scope:
+
+- Private S3 buckets with public access blocked and ACLs disabled.
+- SSE-KMS encryption for all S3 objects and logs.
+- Least-privilege IAM for job roles (prefix-scoped read/write only).
+- CloudTrail management events plus S3 data events for object-level audit.
+- Lifecycle rules: expire intermediates, retain manifests/audit artifacts longer.
+- Prefer private networking paths (S3/ECR/CloudWatch VPC endpoints).
+
+---
+
+## Infrastructure templates (recommended)
+
+Yes: create infrastructure templates in a dedicated directory so the AWS path is reproducible,
+reviewable, and environment-specific.
+
+Suggested location:
+
+- `infra/aws/`
+- Outline scaffold now exists in this repo under `infra/aws/` with env/module README placeholders.
+
+Suggested contents:
+
+- `infra/aws/README.md` (how to deploy, required vars, environments)
+- `infra/aws/envs/dev/` and `infra/aws/envs/prod/` (or `academic-dev` / `academic-prod`)
+- `infra/aws/modules/batch_gpu/` (Batch queue, compute env, job definition)
+- `infra/aws/modules/storage/` (S3 buckets, lifecycle, bucket policy)
+- `infra/aws/modules/security/` (KMS, IAM roles/policies, CloudTrail wiring)
+
+Tooling options:
+
+- Terraform is the most portable/common choice for this stack.
+- AWS CDK is also viable if your team prefers typed IaC and has strong TypeScript/Python CDK conventions.
+
+MVP guidance:
+
+- Start with one environment template that provisions S3 + Batch + IAM + KMS only.
+- Add optional observability and advanced networking modules after first successful benchmark cycle.
 
 ---
 
