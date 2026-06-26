@@ -26,12 +26,20 @@ Key invariants:
 ## Setup & commands
 
 ```bash
-uv sync --group dev       # install project + dev deps (Python ≥ 3.12)
+uv sync --group dev       # install project + dev deps (Python ≥ 3.12, < 3.14)
 uv run pytest             # run tests (unit + skips GPU tests on CPU-only machines)
 uv run pytest tests/unit/ # fast unit tests only
 uv run ruff check src tests
 uv run gpu-embed --help   # CLI entry point
 ```
+
+> **CUDA torch requires Python ≤ 3.13.** PyTorch CUDA wheels are not published
+> for Python 3.14+. `pyproject.toml` constrains `requires-python = ">=3.12,<3.14"`
+> so uv will not create a 3.14 venv. If one already exists, recreate it:
+> `uv venv --python 3.13 && uv sync --group dev`.
+> `[tool.uv.sources]` in `pyproject.toml` routes `torch` to the CUDA 13.0 index
+> on Linux/Windows automatically, so `uv sync` is sufficient. For ad-hoc installs:
+> `uv pip install torch --torch-backend=auto` (auto-detects driver version).
 
 ---
 

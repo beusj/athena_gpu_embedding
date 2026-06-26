@@ -63,11 +63,6 @@ cp .env.example .env
 # 2. Install project + dev deps (requires uv ≥ 0.4)
 uv sync --group dev
 
-# GPU support — install PyTorch with CUDA before syncing if needed:
-# pip install torch --index-url https://download.pytorch.org/whl/cu124
-# then:
-uv sync --group dev
-
 # 3. Place Athena vocabulary files in athena_vocab/
 #    (or set GPU_EMBED_VOCAB_DIR in .env to your download location)
 ```
@@ -80,6 +75,47 @@ large source files are narrowed before they are validated or embedded.
 
 If you need a compatibility fallback or want to debug parsing differences,
 use `--ingest-engine python` to switch the ingest path.
+
+### GPU setup (CUDA)
+
+> **Python version constraint:** PyTorch CUDA wheels are not published for
+> Python 3.14+. `pyproject.toml` already constrains `requires-python = ">=3.12,<3.14"`
+> so `uv` will not create a 3.14 environment. If you already have a 3.14 venv,
+> recreate it:
+> ```bash
+> uv venv --python 3.13
+> uv sync --group dev
+> ```
+
+`pyproject.toml` includes a `[tool.uv.sources]` entry that routes `torch` to
+the CUDA 13.0 index on Linux and Windows, so a plain `uv sync` automatically
+installs the CUDA build — no extra step needed after the initial sync.
+
+To install or upgrade torch independently (e.g. into a fresh venv or when
+testing a different backend), use uv's built-in `--torch-backend` flag:
+
+```bash
+# auto-detects your CUDA driver version and picks the right build
+uv pip install torch --torch-backend=auto
+
+# or pin explicitly (cu118 / cu126 / cu128 / cu130 / rocm6.4 / cpu)
+uv pip install torch --torch-backend=cu130
+```
+
+Verify GPU is detected before running a full embed:
+
+```bash
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no GPU')"
+```
+
+Expected output (example): `2.6.0+cu130 True NVIDIA GeForce RTX 5060 Ti`
+
+If `cuda.is_available()` is still `False` after syncing:
+- Confirm the driver supports the installed CUDA toolkit (`nvidia-smi` shows
+  the maximum supported CUDA version in the top-right corner).
+- Run `uv pip show torch` and verify `Location:` is inside your active venv.
+- `--torch-backend=auto` resolves the right backend for your installed driver
+  automatically; use it to sanity-check what uv would pick.
 
 ---
 
