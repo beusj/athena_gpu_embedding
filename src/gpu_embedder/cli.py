@@ -750,3 +750,286 @@ def coverage_cmd(
                     ]
                 )
         typer.echo(f"Coverage CSV written: {csv_output}")
+
+
+# ---------------------------------------------------------------------------
+# AWS execution path (optional, opt-in)
+# ---------------------------------------------------------------------------
+#
+# These subcommands implement the runbook's remote model:
+#   aws-submit     move filtered concepts to S3 + submit an AWS Batch array job
+#   aws-run-shard  the per-task worker (runs inside the container on AWS)
+#   aws-collect    export the embeddings back into the local DuckDB store
+#
+# boto3 is only imported when one of these actually runs, so the local embed
+# path never depends on the AWS SDK.
+
+
+def _build_aws_config(overrides: dict[str, object]) -> object:
+    from gpu_embedder.aws.config import AwsConfig
+
+    return AwsConfig(**{k: v for k, v in overrides.items() if v is not None})
+
+
+@app.command("aws-submit")
+def aws_submit_cmd(
+    csv_paths: Annotated[
+        list[Path] | None,
+        typer.Argument(help="Explicit CONCEPT.csv path(s) (defaults to <vocab-dir>/CONCEPT.csv)"),
+    ] = None,
+    vocab_dir: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_VOCAB_DIR", help="Directory containing CONCEPT.csv"),
+    ] = None,
+    s3_bucket: Annotated[
+        str | None,
+        typer.Option(envvar="GPU_EMBED_AWS_S3_BUCKET", help="Target S3 bucket"),
+    ] = None,
+    region: Annotated[
+        str | None,
+        typer.Option(envvar="GPU_EMBED_AWS_REGION", help="AWS region"),
+    ] = None,
+    job_queue: Annotated[
+        str | None,
+        typer.Option(envvar="GPU_EMBED_AWS_JOB_QUEUE", help="AWS Batch job queue"),
+    ] = None,
+    job_definition: Annotated[
+        str | None,
+        typer.Option(
+            envvar="GPU_EMBED_AWS_JOB_DEFINITION", help="AWS Batch job definition"
+        ),
+    ] = None,
+    shard_size: Annotated[
+        int | None,
+        typer.Option(envvar="GPU_EMBED_AWS_SHARD_SIZE", help="Rows per shard / array task"),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(envvar="GPU_EMBED_MODEL", help="HuggingFace model ID or local path"),
+    ] = None,
+    model_revision: Annotated[
+        str | None,
+        typer.Option("--model-revision", envvar="GPU_EMBED_MODEL_REVISION"),
+    ] = None,
+    max_length: Annotated[
+        int | None, typer.Option(envvar="GPU_EMBED_MAX_LENGTH")
+    ] = None,
+    batch_size: Annotated[
+        int | None, typer.Option(envvar="GPU_EMBED_BATCH_SIZE")
+    ] = None,
+    text_field: Annotated[
+        list[str] | None,
+        typer.Option("--text-field", help="Concept columns to concatenate (repeatable)"),
+    ] = None,
+    separator: Annotated[
+        str | None, typer.Option(envvar="GPU_EMBED_SEPARATOR")
+    ] = None,
+    vocabulary_id: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--vocabulary-id", help="Filter: vocabulary IDs (repeatable or comma-delimited)"
+        ),
+    ] = None,
+    domain_id: Annotated[
+        list[str] | None, typer.Option("--domain-id", help="Filter: domain IDs (repeatable)")
+    ] = None,
+    concept_class_id: Annotated[
+        list[str] | None,
+        typer.Option("--concept-class-id", help="Filter: concept class IDs (repeatable)"),
+    ] = None,
+    standard_concept: Annotated[
+        list[str] | None,
+        typer.Option("--standard-concept", help="Filter: standard_concept values (repeatable)"),
+    ] = None,
+    invalid_reason: Annotated[
+        list[str] | None,
+        typer.Option("--invalid-reason", help='Filter: invalid_reason; "valid" for NULL/empty'),
+    ] = None,
+) -> None:
+    """Move filtered Athena concepts to S3 and submit an AWS Batch embedding run."""
+    from gpu_embedder.aws import orchestrate
+    from gpu_embedder.aws.batch import BatchJobScheduler
+    from gpu_embedder.aws.s3 import S3ObjectStore
+
+    cfg = EmbedConfig(
+        **{
+            k: v
+            for k, v in {
+                "vocab_dir": vocab_dir,
+                "model": model,
+                "model_revision": model_revision,
+                "max_length": max_length,
+                "batch_size": batch_size,
+                "separator": separator,
+                "text_fields": text_field or None,
+            }.items()
+            if v is not None
+        }
+    )
+    aws_cfg = _build_aws_config(
+        {
+            "region": region,
+            "s3_bucket": s3_bucket,
+            "job_queue": job_queue,
+            "job_definition": job_definition,
+            "shard_size": shard_size,
+        }
+    )
+
+    # Resolve CSV paths (same convention as `embed`).
+    if csv_paths:
+        paths = list(csv_paths)
+    else:
+        default = cfg.vocab_dir / "CONCEPT.csv"
+        if not default.exists():
+            typer.echo(
+                f"ERROR: {default} not found. Use --vocab-dir or pass CSV path(s).", err=True
+            )
+            raise typer.Exit(1)
+        paths = [default]
+
+    spec = FilterSpec(
+        vocabulary_ids=_split_multi_values(vocabulary_id),
+        domain_ids=domain_id or [],
+        concept_class_ids=concept_class_id or [],
+        standard_concepts=(
+            [None if v in ("", "null", "NULL") else v for v in standard_concept]
+            if standard_concept
+            else []
+        ),
+        invalid_reasons=invalid_reason or [],
+    )
+
+    rows = []
+    for p in paths:
+        rows.extend(read_csv(p, spec=spec, engine=cfg.ingest_engine))
+
+    # Dedup by concept_id (mirror the embed path).
+    seen: set[int] = set()
+    deduped = []
+    for r in rows:
+        if r.concept_id in seen:
+            continue
+        seen.add(r.concept_id)
+        deduped.append(r)
+    typer.echo(f"Submitting {len(deduped)} unique concepts to AWS …")
+
+    store = S3ObjectStore(aws_cfg.require_bucket(), region=aws_cfg.region)
+    scheduler = BatchJobScheduler(region=aws_cfg.region)
+
+    submission = orchestrate.submit_run(
+        deduped,
+        cfg=aws_cfg,
+        store=store,
+        scheduler=scheduler,
+        model=cfg.model,
+        model_revision=cfg.model_revision,
+        model_version=None,  # the worker computes the weights digest
+        text_fields=cfg.text_fields,
+        separator=cfg.separator,
+        max_length=cfg.max_length,
+        batch_size=cfg.batch_size,
+    )
+
+    typer.secho(
+        f"Submitted run {submission.run_id} as Batch job {submission.job_id} "
+        f"({submission.num_shards} shards, {submission.total_rows} rows).",
+        fg=typer.colors.GREEN,
+    )
+    typer.echo(
+        f"When the job finishes, import results with:\n"
+        f"  gpu-embed aws-collect --run-id {submission.run_id}"
+    )
+
+
+@app.command("aws-run-shard")
+def aws_run_shard_cmd(
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", envvar="GPU_EMBED_AWS_RUN_ID", help="Run id to embed"),
+    ] = None,
+    shard_index: Annotated[
+        int | None,
+        typer.Option(
+            "--shard-index",
+            envvar="AWS_BATCH_JOB_ARRAY_INDEX",
+            help="Shard / array index (defaults to AWS_BATCH_JOB_ARRAY_INDEX)",
+        ),
+    ] = None,
+    s3_bucket: Annotated[
+        str | None, typer.Option(envvar="GPU_EMBED_AWS_S3_BUCKET")
+    ] = None,
+    region: Annotated[str | None, typer.Option(envvar="GPU_EMBED_AWS_REGION")] = None,
+    device: Annotated[
+        str | None, typer.Option(envvar="GPU_EMBED_DEVICE", help="cuda | cpu | mps | auto")
+    ] = None,
+) -> None:
+    """Worker entrypoint: embed one shard and upload the vectors to S3."""
+    from gpu_embedder.aws import orchestrate
+    from gpu_embedder.aws.s3 import S3ObjectStore
+
+    if not run_id:
+        typer.echo("ERROR: --run-id (or GPU_EMBED_AWS_RUN_ID) is required.", err=True)
+        raise typer.Exit(1)
+
+    aws_cfg = _build_aws_config({"region": region, "s3_bucket": s3_bucket})
+    resolved_index = shard_index if shard_index is not None else 0
+
+    store = S3ObjectStore(aws_cfg.require_bucket(), region=aws_cfg.region)
+    embed_fn = orchestrate.default_embed_fn(device=device or "auto")
+
+    count = orchestrate.run_shard(
+        run_id=run_id,
+        shard_index=resolved_index,
+        cfg=aws_cfg,
+        store=store,
+        embed_fn=embed_fn,
+    )
+    typer.echo(f"Shard {resolved_index} of run {run_id}: embedded {count} concepts.")
+
+
+@app.command("aws-collect")
+def aws_collect_cmd(
+    run_id: Annotated[
+        str, typer.Option("--run-id", help="Run id whose outputs to import")
+    ],
+    db: Annotated[
+        Path | None, typer.Option(envvar="GPU_EMBED_DB", help="DuckDB output file")
+    ] = None,
+    s3_bucket: Annotated[
+        str | None, typer.Option(envvar="GPU_EMBED_AWS_S3_BUCKET")
+    ] = None,
+    region: Annotated[str | None, typer.Option(envvar="GPU_EMBED_AWS_REGION")] = None,
+    model_version: Annotated[
+        str | None,
+        typer.Option(
+            "--expect-model-version",
+            help="Require every imported row to carry this exact model_version",
+        ),
+    ] = None,
+) -> None:
+    """Export AWS embedding outputs back into the local DuckDB store."""
+    from gpu_embedder import store as st
+    from gpu_embedder.aws import orchestrate
+    from gpu_embedder.aws.s3 import S3ObjectStore
+
+    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+    aws_cfg = _build_aws_config({"region": region, "s3_bucket": s3_bucket})
+
+    store = S3ObjectStore(aws_cfg.require_bucket(), region=aws_cfg.region)
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    summary = orchestrate.collect_run(
+        run_id=run_id,
+        cfg=aws_cfg,
+        store=store,
+        conn=conn,
+        expected_model_version=model_version,
+    )
+    mv = (summary.model_version or "unknown")[:16]
+    typer.secho(
+        f"Imported {summary.rows_imported} embeddings from {summary.shards} shard(s) "
+        f"of run {summary.run_id} (model_version={mv}…) into {cfg.db}.",
+        fg=typer.colors.GREEN,
+    )

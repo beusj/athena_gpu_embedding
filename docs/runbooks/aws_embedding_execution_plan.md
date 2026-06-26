@@ -1,7 +1,18 @@
 # Runbook Plan: AWS-Based Embedding Execution (Out-of-Main-Path)
 
-This document is a planning-only proposal for running embedding workloads on AWS.
+This document is a planning proposal for running embedding workloads on AWS.
 It does **not** change the default/local execution path in either repository.
+
+> **Implementation status (prototype):** an opt-in AWS path is now implemented
+> in `gpu_embedder` under `src/gpu_embedder/aws/` and exposed via the
+> `aws-submit`, `aws-run-shard`, and `aws-collect` subcommands (see the README
+> "AWS execution path" section). It follows the **Target execution model** below:
+> shard + upload to S3 → AWS Batch array job (one task per shard, FP32 SapBERT) →
+> validate + merge the output artifacts into DuckDB. `boto3` is an optional extra
+> (`pip install ".[aws]"`) and the local `embed` path is unchanged. The
+> infrastructure pieces still to provision are the ECR image
+> (`docker/Dockerfile.aws`), the Batch compute environment/queue, the job
+> definition, and the S3 bucket/IAM policy.
 
 ## Why this plan exists
 

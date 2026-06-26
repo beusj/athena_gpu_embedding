@@ -1,0 +1,37 @@
+# Container image for the gpu-embedder AWS Batch worker.
+#
+# Build (from the repo root):
+#   docker build -f docker/Dockerfile.aws -t gpu-embedder-aws .
+#   docker tag gpu-embedder-aws <acct>.dkr.ecr.<region>.amazonaws.com/gpu-embedder:latest
+#   docker push <acct>.dkr.ecr.<region>.amazonaws.com/gpu-embedder:latest
+#
+# The AWS Batch job definition should set the container command to:
+#   ["gpu-embed", "aws-run-shard", "--run-id", "<run>"]
+# (gpu-embed reads the shard index from AWS_BATCH_JOB_ARRAY_INDEX automatically).
+#
+# CUDA base image — match the tag to the driver on your Batch compute environment.
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    # Warm the HF cache into the image layer where practical (see runbook).
+    HF_HOME=/opt/hf-cache
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3.12 python3-pip git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install the package plus the AWS extra (boto3) and a CUDA torch build.
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN python3.12 -m pip install --upgrade pip \
+    && python3.12 -m pip install ".[aws]" \
+    && python3.12 -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# Default command is overridden per-run by the Batch job submission, but provide
+# a sensible fallback so `docker run` shows help.
+ENTRYPOINT ["gpu-embed"]
+CMD ["--help"]

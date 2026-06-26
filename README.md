@@ -319,6 +319,68 @@ gpu-embed coverage --csv coverage_report.csv
 
 ---
 
+## AWS execution path (optional)
+
+For GPU throughput beyond a local workstation, an **opt-in** remote path can run
+the embeddings on AWS Batch. It does not change the default local `embed`
+behaviour, and `boto3` is only required when an `aws-*` subcommand actually runs.
+Install the extra with:
+
+```bash
+uv pip install ".[aws]"      # adds boto3
+```
+
+The flow moves the Athena vocab + source concepts to AWS, embeds on GPU there,
+and exports the vectors back into the same local DuckDB store:
+
+```
+            aws-submit                 AWS Batch array job              aws-collect
+ CONCEPT.csv ─────────► S3 input ──► (aws-run-shard per shard) ──► S3 output ─────► embeddings.duckdb
+  (filter+shard locally)            (SapBERT FP32 on g5/g6e GPU)    (validate + merge)
+```
+
+1. **Move to AWS** — `aws-submit` reads and filters `CONCEPT.csv` exactly like
+   `embed`, shards the rows, uploads each shard plus a run manifest to S3, and
+   submits one AWS Batch array job (one task per shard):
+
+   ```bash
+   gpu-embed aws-submit \
+     --vocabulary-id SNOMED,RxNorm --standard-concept S --invalid-reason valid \
+     --s3-bucket my-embeddings-bucket --region us-east-1 \
+     --job-queue gpu-embed-queue --job-definition gpu-embed-def \
+     --shard-size 50000
+   # → prints a run id, e.g. 20260626T201500Z-a1b2c3
+   ```
+
+2. **Embed on AWS** — each Batch array task runs the worker inside the container
+   image (`docker/Dockerfile.aws`). The Batch job definition's command is
+   `gpu-embed aws-run-shard --run-id <run>`; the shard index comes from
+   `AWS_BATCH_JOB_ARRAY_INDEX`. Each task downloads its shard, embeds it in FP32,
+   and writes the vectors back to S3.
+
+3. **Export back** — once the job succeeds, pull the outputs into local DuckDB
+   (idempotent merge on `(concept_id, model_version)`, with dimension and
+   model-version validation):
+
+   ```bash
+   gpu-embed aws-collect --run-id 20260626T201500Z-a1b2c3 \
+     --s3-bucket my-embeddings-bucket --region us-east-1
+   ```
+
+All `GPU_EMBED_AWS_*` settings can live in `.env` instead of being passed as
+flags — see `.env.example`. Architecture, instance-family, and cost guidance is
+in [`docs/runbooks/aws_embedding_execution_plan.md`](docs/runbooks/aws_embedding_execution_plan.md).
+
+### AWS subcommands
+
+| Command | Description |
+|---------|-------------|
+| `gpu-embed aws-submit [CSV_PATH...]` | Filter + shard concepts, upload to S3, submit a Batch array job |
+| `gpu-embed aws-run-shard --run-id <run>` | Worker: embed one shard (index from `AWS_BATCH_JOB_ARRAY_INDEX`) and upload |
+| `gpu-embed aws-collect --run-id <run>` | Download, validate, and merge output embeddings into DuckDB |
+
+---
+
 ## DuckDB schema
 
 ```sql
