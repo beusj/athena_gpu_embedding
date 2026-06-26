@@ -8,7 +8,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow
+from gpu_embedder.models import SCHEMA_DDL
 from gpu_embedder.report import (
     ModelVersionInfo,
     VocabCoverage,

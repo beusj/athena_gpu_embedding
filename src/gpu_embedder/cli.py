@@ -278,6 +278,24 @@ def embed_cmd(
 
     typer.echo(f"Loaded {len(filtered)} rows after {cfg.ingest_engine} filtering.")
 
+    # Deduplicate by concept_id before model loading/embedding. Keep first-seen row.
+    seen_concept_ids: set[int] = set()
+    deduped: list = []
+    duplicate_count = 0
+    for row in filtered:
+        if row.concept_id in seen_concept_ids:
+            duplicate_count += 1
+            continue
+        seen_concept_ids.add(row.concept_id)
+        deduped.append(row)
+
+    if duplicate_count:
+        typer.echo(
+            f"Deduplicated {duplicate_count} duplicate input rows by concept_id; "
+            f"{len(deduped)} unique rows remain."
+        )
+    filtered = deduped
+
     if not filtered:
         typer.echo("Nothing to embed.")
         raise typer.Exit(0)
@@ -540,8 +558,7 @@ def coverage_cmd(
 ) -> None:
     """Compare a CONCEPT.csv against the embeddings database to identify gaps."""
     from gpu_embedder import store as st
-    from gpu_embedder.report import coverage_report, list_model_versions
-        from gpu_embedder.report import VocabCoverage
+    from gpu_embedder.report import VocabCoverage, coverage_report, list_model_versions
 
     cfg_overrides: dict[str, object] = {}
     if db is not None:
@@ -589,8 +606,7 @@ def coverage_cmd(
             typer.echo("No embeddings found in database — all concepts will show as gaps.\n")
 
     # Accumulate coverage across all provided CSVs
-    all_rows: list = []
-        agg: dict[tuple[str, str], VocabCoverage] = defaultdict(
+    agg: dict[tuple[str, str], VocabCoverage] = defaultdict(
         lambda: VocabCoverage(vocabulary_id="", domain_id="", total=0, embedded=0)
     )
     for p in paths:

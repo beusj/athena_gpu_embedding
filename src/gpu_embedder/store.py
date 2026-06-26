@@ -47,45 +47,87 @@ def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set
 def upsert_rows(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
     """Insert or replace a batch of EmbeddedRow objects.
 
-    Uses batched executemany calls (256 rows per batch) to avoid PRIMARY KEY
-    constraint checking bottlenecks on large inserts with large embedding vectors.
-    Each batch is wrapped in its own transaction.
+    Uses a staged merge strategy for better DuckDB performance on large vector
+    payloads:
+    1) insert incoming rows into a temporary table,
+    2) delete matching (concept_id, model_version) keys from target,
+    3) insert staged rows into target.
+
+    This avoids the per-row conflict handling overhead of INSERT OR REPLACE.
     """
     if not rows:
         return
 
-    chunk_size = 256
-    for chunk_start in range(0, len(rows), chunk_size):
-        chunk = rows[chunk_start : chunk_start + chunk_size]
-        records = [
-            (
-                r.concept.concept_id,
-                r.concept.concept_name,
-                r.concept.domain_id,
-                r.concept.vocabulary_id,
-                r.concept.concept_class_id,
-                r.concept.standard_concept,
-                r.concept.concept_code,
-                r.concept.invalid_reason,
-                r.embedding,
-                r.embed_text,
-                r.model_version,
-                r.embedded_at,
-            )
-            for r in chunk
-        ]
-
-        conn.executemany(
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP TABLE IF EXISTS temp_embeddings")
+        conn.execute(
             """
-            INSERT OR REPLACE INTO concept_embeddings (
-                concept_id, concept_name, domain_id, vocabulary_id,
-                concept_class_id, standard_concept, concept_code,
-                invalid_reason, embedding, embed_text, model_version, embedded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            records,
+            CREATE TEMP TABLE temp_embeddings AS
+            SELECT * FROM concept_embeddings WHERE 1=0
+            """
         )
-        logger.debug("Upserted chunk of %d rows (%d/%d)", len(chunk), chunk_start + len(chunk), len(rows))
+
+        chunk_size = 1024
+        for chunk_start in range(0, len(rows), chunk_size):
+            chunk = rows[chunk_start : chunk_start + chunk_size]
+            records = [
+                (
+                    r.concept.concept_id,
+                    r.concept.concept_name,
+                    r.concept.domain_id,
+                    r.concept.vocabulary_id,
+                    r.concept.concept_class_id,
+                    r.concept.standard_concept,
+                    r.concept.concept_code,
+                    r.concept.invalid_reason,
+                    r.embedding,
+                    r.embed_text,
+                    r.model_version,
+                    r.embedded_at,
+                )
+                for r in chunk
+            ]
+
+            conn.executemany(
+                """
+                INSERT INTO temp_embeddings (
+                    concept_id, concept_name, domain_id, vocabulary_id,
+                    concept_class_id, standard_concept, concept_code,
+                    invalid_reason, embedding, embed_text, model_version, embedded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                records,
+            )
+            logger.debug(
+                "Staged chunk of %d rows (%d/%d)",
+                len(chunk),
+                chunk_start + len(chunk),
+                len(rows),
+            )
+
+        conn.execute(
+            """
+            DELETE FROM concept_embeddings AS t
+            USING temp_embeddings AS s
+            WHERE t.concept_id = s.concept_id
+              AND t.model_version = s.model_version
+            """
+        )
+
+        conn.execute(
+            """
+            INSERT INTO concept_embeddings
+            SELECT * FROM temp_embeddings
+            """
+        )
+
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("DROP TABLE IF EXISTS temp_embeddings")
 
     logger.info("Upserted %d rows in total", len(rows))
 

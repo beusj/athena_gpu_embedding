@@ -153,11 +153,13 @@ The `cpt4` subcommand will:
 
 ## CLI usage
 
-The tool has two subcommands:
+The tool has four subcommands:
 
 ```
-gpu-embed embed [OPTIONS] [CSV_PATH...]
-gpu-embed cpt4  [OPTIONS]
+gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
+gpu-embed status    [OPTIONS]                — show what is stored in the DB
+gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
+gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 ```
 
 Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
@@ -211,6 +213,39 @@ gpu-embed cpt4 [OPTIONS]
 | `--jar` | `CPT4_JAR` / `athena_vocab/cpt4.jar` | Explicit path to `cpt4.jar` |
 | `--api-key` | `UMLS_API_KEY` | UMLS API key (prefer setting in `.env`) |
 
+### `status` — show what is stored in the database
+
+```
+gpu-embed status [OPTIONS]
+```
+
+Prints the model versions stored in the database and a per-(vocabulary, domain)
+breakdown of embedded concept counts. No source CSV is required.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db` | `embeddings.duckdb` | DuckDB file to inspect |
+| `--model-version` | _(most recent)_ | Show breakdown for the version starting with this prefix |
+
+### `coverage` — identify unembedded concepts
+
+```
+gpu-embed coverage [OPTIONS] [CSV_PATH...]
+```
+
+Scans a `CONCEPT.csv` and compares every (vocabulary, domain) group against the
+embeddings database, reporting how many concepts have been embedded and how many
+remain. By default only groups with a non-zero gap are shown.
+
+When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db` | `embeddings.duckdb` | DuckDB file to compare against |
+| `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` |
+| `--model-version` | _(most recent)_ | Limit comparison to the version starting with this prefix |
+| `--show-complete` | false | Also print groups that are fully embedded |
+
 ### Examples
 
 ```bash
@@ -252,6 +287,21 @@ gpu-embed embed /data/vocab/CONCEPT.csv \
   --db /data/embeddings/omop.duckdb \
   --device cpu \
   --batch-size 64
+
+# Show what model versions are stored and concept counts by vocabulary/domain
+gpu-embed status
+
+# Show only the breakdown for a specific model version (prefix match)
+gpu-embed status --model-version abc12345
+
+# Find all vocabularies/domains with unembedded concepts (default CONCEPT.csv)
+gpu-embed coverage
+
+# Coverage report including fully-embedded groups
+gpu-embed coverage --show-complete
+
+# Coverage against an explicit CSV and specific DB
+gpu-embed coverage /data/vocab/CONCEPT.csv --db /data/embeddings/omop.duckdb
 ```
 
 ---
