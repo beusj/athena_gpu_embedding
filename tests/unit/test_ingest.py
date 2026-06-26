@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gpu_embedder.ingest import filter_rows, read_csv
+from gpu_embedder.ingest import count_csv_rows, filter_rows, read_csv
 from gpu_embedder.models import ConceptRow, FilterSpec
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
@@ -15,9 +15,17 @@ FIXTURE = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
 # ---------------------------------------------------------------------------
 
 class TestReadCsv:
+    def test_count_csv_rows(self) -> None:
+        assert count_csv_rows(FIXTURE) == 10
+
     def test_loads_all_rows(self) -> None:
         rows = read_csv(FIXTURE)
         assert len(rows) == 10
+
+    def test_read_csv_with_duckdb_filter_pushdown(self) -> None:
+        rows = read_csv(FIXTURE, FilterSpec(vocabulary_ids=["LOINC"]))
+        assert len(rows) == 3
+        assert all(row.vocabulary_id == "LOINC" for row in rows)
 
     def test_returns_concept_rows(self) -> None:
         rows = read_csv(FIXTURE)

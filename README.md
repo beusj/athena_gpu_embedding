@@ -13,7 +13,8 @@ passed, so runs are safe to restart or extend incrementally.
    explicit paths passed as arguments.
 2. **Filters** rows by any combination of Athena columns
    (`vocabulary_id`, `domain_id`, `concept_class_id`, `standard_concept`,
-   `invalid_reason`) so you only embed what you need.
+   `invalid_reason`) so you only embed what you need. CSV scan + filter are
+   pushed through **DuckDB by default** before Pydantic validation.
 3. **Embeds** the filtered concept names with
    [SapBERT](https://huggingface.co/cambridgeltl/SapBERT-from-PubMedBERT-fulltext)
    running in FP32 on a CUDA GPU (falls back to CPU when no GPU is available,
@@ -42,7 +43,7 @@ gpu_embedding/
 │       ├── cli.py          # Typer app: `embed` + `cpt4` subcommands
 │       ├── config.py       # Settings (Pydantic BaseSettings + env)
 │       ├── models.py       # Pydantic row models + DuckDB schema DDL
-│       ├── ingest.py       # CSV → filtered DataFrame/records
+│       ├── ingest.py       # DuckDB-backed CSV scan + filter → ConceptRow records
 │       ├── embed.py        # SapBERT FP32 tokenize + forward pass
 │       └── store.py        # DuckDB upsert / existence checks
 └── tests/
@@ -73,6 +74,9 @@ uv sync --group dev
 
 The SapBERT model is downloaded from Hugging Face on first run and cached
 locally via the normal `~/.cache/huggingface` path.
+
+DuckDB is also the default engine for reading and filtering Athena TSVs, so
+large source files are narrowed before they are validated or embedded.
 
 ---
 

@@ -73,6 +73,8 @@ from `cli.py`.
 - The default vocabulary directory is `GPU_EMBED_VOCAB_DIR` (default
   `athena_vocab/`). When no explicit `CSV_PATH` arguments are given, the CLI
   reads `<vocab_dir>/CONCEPT.csv`.
+- **DuckDB is the default CSV engine.** Read/filter Athena TSVs through DuckDB
+  before Pydantic validation so large files are narrowed early.
 - Athena CSVs use **tab-separated values** (`\t`) with a header row. Always
   open with `sep="\t"` and `dtype=str` (then coerce). Do not assume column
   order.

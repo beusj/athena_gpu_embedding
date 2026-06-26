@@ -1,6 +1,8 @@
-"""CSV ingestion: read Athena CONCEPT.csv and apply column filters.
+"""CSV ingestion: read Athena CONCEPT.csv and apply DuckDB-backed filters.
 
-Both public functions are pure (no I/O side effects in filter_rows).
+`read_csv()` and `filter_rows()` are both pure. DuckDB is the default engine
+for CSV scanning and filtering so large Athena files can be narrowed before
+Pydantic validation and embedding.
 """
 
 from __future__ import annotations
@@ -8,7 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import pandas as pd
+import duckdb
 
 from gpu_embedder.models import ConceptRow, FilterSpec
 
@@ -29,60 +31,167 @@ _ATHENA_COLUMNS = [
 ]
 
 
-def read_csv(path: Path) -> list[ConceptRow]:
-    """Read a single Athena CONCEPT.csv (tab-separated) and return validated rows.
+def _sql_quote(value: str) -> str:
+    """Return a safely quoted SQL string literal for DuckDB expressions."""
+    return "'" + value.replace("'", "''") + "'"
 
-    All columns are read as strings first; type coercion happens inside
-    ConceptRow validators (empty / "NULL" → None, concept_id → int).
+
+def _nullish_predicate(column: str) -> str:
+    """Match Athena nullish strings: NULL, empty string, or actual NULL."""
+    return f"({column} IS NULL OR {column} = '' OR UPPER({column}) = 'NULL')"
+
+
+def _in_predicate(column: str, values: list[str]) -> str:
+    """Build an IN predicate for a non-empty list of string values."""
+    literals = ", ".join(_sql_quote(value) for value in values)
+    return f"{column} IN ({literals})"
+
+
+def _nullable_predicate(column: str, values: list[str | None]) -> str | None:
+    """Build a predicate for fields that may legitimately be nullish."""
+    non_null_values = [value for value in values if value is not None]
+    include_null = any(value is None for value in values)
+
+    predicates: list[str] = []
+    if non_null_values:
+        predicates.append(_in_predicate(column, non_null_values))
+    if include_null:
+        predicates.append(_nullish_predicate(column))
+
+    if not predicates:
+        return None
+    return "(" + " OR ".join(predicates) + ")"
+
+
+def _build_where_clause(spec: FilterSpec | None) -> str:
+    """Translate a FilterSpec into a DuckDB WHERE clause."""
+    if spec is None:
+        return ""
+
+    predicates: list[str] = []
+    if spec.vocabulary_ids:
+        predicates.append(_in_predicate("vocabulary_id", spec.vocabulary_ids))
+    if spec.domain_ids:
+        predicates.append(_in_predicate("domain_id", spec.domain_ids))
+    if spec.concept_class_ids:
+        predicates.append(_in_predicate("concept_class_id", spec.concept_class_ids))
+    if spec.standard_concepts:
+        predicate = _nullable_predicate("standard_concept", spec.standard_concepts)
+        if predicate is not None:
+            predicates.append(predicate)
+    if spec.invalid_reasons:
+        normalized_invalid_reasons = [
+            None if value == "valid" else value for value in spec.invalid_reasons
+        ]
+        predicate = _nullable_predicate("invalid_reason", normalized_invalid_reasons)
+        if predicate is not None:
+            predicates.append(predicate)
+
+    if not predicates:
+        return ""
+    return " WHERE " + " AND ".join(predicates)
+
+
+def _records_to_concepts(records: list[tuple[object, ...]]) -> list[ConceptRow]:
+    """Validate raw row tuples into ConceptRow objects, skipping malformed rows."""
+    rows: list[ConceptRow] = []
+    for record in records:
+        payload = dict(zip(_ATHENA_COLUMNS, record, strict=True))
+        try:
+            rows.append(ConceptRow.model_validate(payload))
+        except Exception:
+            logger.warning("Skipping malformed row: %s", payload)
+    return rows
+
+
+def count_csv_rows(path: Path) -> int:
+    """Count rows in an Athena TSV via DuckDB without loading them all into Python."""
+    logger.info("Counting rows in %s", path)
+    with duckdb.connect() as conn:
+        result = conn.execute(
+            "SELECT COUNT(*) FROM read_csv(?, delim='\t', header=true, all_varchar=true)",
+            [str(path)],
+        ).fetchone()
+    return int(result[0]) if result is not None else 0
+
+
+def read_csv(path: Path, spec: FilterSpec | None = None) -> list[ConceptRow]:
+    """Read a single Athena CONCEPT.csv and return validated ConceptRow objects.
+
+    DuckDB is used as the default scanner and filter engine. All columns are
+    loaded as strings first; type coercion happens inside `ConceptRow`
+    validators (empty / "NULL" → None, concept_id → int).
     """
     logger.info("Reading %s", path)
-    df = pd.read_csv(
-        path,
-        sep="\t",
-        dtype=str,
-        keep_default_na=False,  # don't let pandas silently convert "" to NaN
-        usecols=lambda c: c in _ATHENA_COLUMNS,
+    sql = (
+        "SELECT "
+        + ", ".join(_ATHENA_COLUMNS)
+        + " FROM read_csv(?, delim='\\t', header=true, all_varchar=true)"
+        + _build_where_clause(spec)
     )
-    # Ensure all expected columns are present (fill with empty string if absent)
-    for col in _ATHENA_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
+    with duckdb.connect() as conn:
+        records = conn.execute(sql, [str(path)]).fetchall()
 
-    rows: list[ConceptRow] = []
-    for record in df.to_dict(orient="records"):
-        try:
-            rows.append(ConceptRow.model_validate(record))
-        except Exception:
-            logger.warning("Skipping malformed row: %s", record)
+    rows = _records_to_concepts(records)
     logger.info("Loaded %d rows from %s", len(rows), path)
     return rows
 
 
 def filter_rows(rows: list[ConceptRow], spec: FilterSpec) -> list[ConceptRow]:
-    """Filter rows according to FilterSpec.
+    """Filter in-memory rows using DuckDB semantics.
 
-    Logic:
-    - OR within each column's include-list.
-    - AND across different columns (only rows that pass every non-empty filter).
-    - An empty include-list for a column means "accept all values".
-    - For invalid_reason the string "valid" is treated as None (null / empty).
+    This keeps filtering behavior consistent with `read_csv(..., spec=...)`,
+    which pushes the same logic down into DuckDB for the default ingest path.
     """
-    result: list[ConceptRow] = []
-    for row in rows:
-        if spec.vocabulary_ids and row.vocabulary_id not in spec.vocabulary_ids:
-            continue
-        if spec.domain_ids and row.domain_id not in spec.domain_ids:
-            continue
-        if spec.concept_class_ids and row.concept_class_id not in spec.concept_class_ids:
-            continue
-        if spec.standard_concepts and row.standard_concept not in spec.standard_concepts:
-            continue
-        if spec.invalid_reasons:
-            # normalise "valid" sentinel → None before comparing
-            normalised = [None if v == "valid" else v for v in spec.invalid_reasons]
-            if row.invalid_reason not in normalised:
-                continue
-        result.append(row)
+    where_clause = _build_where_clause(spec)
+    if not rows or not where_clause:
+        logger.info("filter_rows: %d → %d rows after filtering", len(rows), len(rows))
+        return list(rows)
 
+    with duckdb.connect() as conn:
+        conn.execute(
+            """
+            CREATE TEMP TABLE concept_rows (
+                concept_id VARCHAR,
+                concept_name VARCHAR,
+                domain_id VARCHAR,
+                vocabulary_id VARCHAR,
+                concept_class_id VARCHAR,
+                standard_concept VARCHAR,
+                concept_code VARCHAR,
+                valid_start_date VARCHAR,
+                valid_end_date VARCHAR,
+                invalid_reason VARCHAR
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO concept_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(row.concept_id),
+                    row.concept_name,
+                    row.domain_id,
+                    row.vocabulary_id,
+                    row.concept_class_id,
+                    row.standard_concept,
+                    row.concept_code,
+                    row.valid_start_date,
+                    row.valid_end_date,
+                    row.invalid_reason,
+                )
+                for row in rows
+            ],
+        )
+        records = conn.execute(
+            "SELECT "
+            + ", ".join(_ATHENA_COLUMNS)
+            + " FROM concept_rows"
+            + where_clause
+        ).fetchall()
+
+    result = _records_to_concepts(records)
     logger.info("filter_rows: %d → %d rows after filtering", len(rows), len(result))
     return result

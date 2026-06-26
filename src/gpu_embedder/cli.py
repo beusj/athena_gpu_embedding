@@ -25,7 +25,7 @@ from typer.main import get_command
 
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
-from gpu_embedder.ingest import filter_rows, read_csv
+from gpu_embedder.ingest import read_csv
 from gpu_embedder.models import FilterSpec
 
 app = typer.Typer(
@@ -244,13 +244,12 @@ def embed_cmd(
         invalid_reasons=invalid_reason or [],
     )
 
-    # Load all rows
-    all_rows = []
+    # Load all rows with DuckDB pushdown filtering
+    filtered = []
     for p in paths:
-        all_rows.extend(read_csv(p))
+        filtered.extend(read_csv(p, spec=spec))
 
-    filtered = filter_rows(all_rows, spec)
-    typer.echo(f"Loaded {len(all_rows)} rows, {len(filtered)} after filtering.")
+    typer.echo(f"Loaded {len(filtered)} rows after DuckDB filtering.")
 
     if not filtered:
         typer.echo("Nothing to embed.")
