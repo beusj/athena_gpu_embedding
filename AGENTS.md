@@ -75,6 +75,8 @@ from `cli.py`.
   reads `<vocab_dir>/CONCEPT.csv`.
 - **DuckDB is the default CSV engine.** Read/filter Athena TSVs through DuckDB
   before Pydantic validation so large files are narrowed early.
+- `ingest_engine` can be set to `python` for a pure-Python fallback, but the
+  default path should remain DuckDB.
 - Athena CSVs use **tab-separated values** (`\t`) with a header row. Always
   open with `sep="\t"` and `dtype=str` (then coerce). Do not assume column
   order.

@@ -7,6 +7,7 @@ Pydantic validation and embedding.
 
 from __future__ import annotations
 
+import csv
 import logging
 from pathlib import Path
 
@@ -115,7 +116,25 @@ def count_csv_rows(path: Path) -> int:
     return int(result[0]) if result is not None else 0
 
 
-def read_csv(path: Path, spec: FilterSpec | None = None) -> list[ConceptRow]:
+def _read_csv_python(path: Path) -> list[ConceptRow]:
+    """Read Athena TSV rows in pure Python as a fallback engine."""
+    rows: list[ConceptRow] = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for record in reader:
+            payload = {column: record.get(column, "") or "" for column in _ATHENA_COLUMNS}
+            try:
+                rows.append(ConceptRow.model_validate(payload))
+            except Exception:
+                logger.warning("Skipping malformed row: %s", payload)
+    return rows
+
+
+def read_csv(
+    path: Path,
+    spec: FilterSpec | None = None,
+    engine: str = "duckdb",
+) -> list[ConceptRow]:
     """Read a single Athena CONCEPT.csv and return validated ConceptRow objects.
 
     DuckDB is used as the default scanner and filter engine. All columns are
@@ -123,6 +142,10 @@ def read_csv(path: Path, spec: FilterSpec | None = None) -> list[ConceptRow]:
     validators (empty / "NULL" → None, concept_id → int).
     """
     logger.info("Reading %s", path)
+    if engine == "python":
+        rows = _read_csv_python(path)
+        return filter_rows(rows, spec) if spec is not None else rows
+
     sql = (
         "SELECT "
         + ", ".join(_ATHENA_COLUMNS)

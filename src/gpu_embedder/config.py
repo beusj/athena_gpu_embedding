@@ -6,12 +6,15 @@ a .env file in the working directory.  CLI flags always override env values.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import torch
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 def _auto_device() -> str:
@@ -39,6 +42,7 @@ class EmbedConfig(BaseSettings):
     device: str = "auto"
     batch_size: int = 256
     max_length: int = 128
+    ingest_engine: Literal["duckdb", "python"] = "duckdb"
 
     # Text construction
     text_fields: Annotated[list[str], NoDecode] = ["concept_name"]
@@ -58,5 +62,15 @@ class EmbedConfig(BaseSettings):
     @model_validator(mode="after")
     def resolve_device(self) -> EmbedConfig:
         if self.device == "auto":
-            self.device = _auto_device()
+            resolved = _auto_device()
+            self.device = resolved
+            if resolved == "cpu":
+                logger.warning(
+                    "No GPU backend detected; using CPU. torch.version.cuda=%s, cuda_available=%s, mps_available=%s",
+                    torch.version.cuda,
+                    torch.cuda.is_available(),
+                    hasattr(torch.backends, "mps") and torch.backends.mps.is_available(),
+                )
+            else:
+                logger.info("Selected device=%s", resolved)
         return self

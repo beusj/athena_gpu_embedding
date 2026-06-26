@@ -23,9 +23,22 @@ class TestReadCsv:
         assert len(rows) == 10
 
     def test_read_csv_with_duckdb_filter_pushdown(self) -> None:
-        rows = read_csv(FIXTURE, FilterSpec(vocabulary_ids=["LOINC"]))
+        rows = read_csv(FIXTURE, spec=FilterSpec(vocabulary_ids=["LOINC"]))
         assert len(rows) == 3
         assert all(row.vocabulary_id == "LOINC" for row in rows)
+
+    def test_python_engine_loads_all_rows(self) -> None:
+        rows = read_csv(FIXTURE, engine="python")
+        assert len(rows) == 10
+
+    def test_python_engine_filter_matches_duckdb(self) -> None:
+        duckdb_rows = read_csv(FIXTURE, spec=FilterSpec(vocabulary_ids=["LOINC"]))
+        python_rows = read_csv(
+            FIXTURE,
+            spec=FilterSpec(vocabulary_ids=["LOINC"]),
+            engine="python",
+        )
+        assert python_rows == duckdb_rows
 
     def test_returns_concept_rows(self) -> None:
         rows = read_csv(FIXTURE)

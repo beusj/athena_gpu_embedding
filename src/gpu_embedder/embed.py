@@ -27,6 +27,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_cached_snapshot(model_id: str, revision: str | None) -> Path | None:
+    """Return a local Hugging Face snapshot if one is already cached."""
+    import huggingface_hub  # type: ignore[import-untyped]
+
+    try:
+        snapshot = huggingface_hub.snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_files_only=True,
+        )
+    except Exception:
+        return None
+    return Path(snapshot)
+
+
+def _resolve_model_source(model_id: str, revision: str | None) -> tuple[Path | str, bool]:
+    """Resolve a model path from cache first, then fall back to Hub download."""
+    local_path = Path(model_id)
+    if local_path.exists():
+        return local_path, True
+
+    cached = _resolve_cached_snapshot(model_id, revision)
+    if cached is not None:
+        return cached, True
+
+    return model_id, False
+
+
 # ---------------------------------------------------------------------------
 # Protocol for unit-test injection
 # ---------------------------------------------------------------------------
@@ -49,14 +77,13 @@ class Embedder(Protocol):
 # Model version
 # ---------------------------------------------------------------------------
 
-def compute_model_version(model_id_or_path: str | Path) -> str:
+def compute_model_version(model_id_or_path: str | Path, revision: str | None = None) -> str:
     """Return a SHA-256 hex digest of the model weights file.
 
     Tries model.safetensors first, then pytorch_model.bin.  If neither is
     found at a local path, falls back to hashing the model ID string (used in
     tests with non-existent paths).
     """
-    candidates: list[Path] = []
     base = Path(model_id_or_path)
     if base.is_dir():
         candidates = [
@@ -64,22 +91,30 @@ def compute_model_version(model_id_or_path: str | Path) -> str:
             base / "pytorch_model.bin",
         ]
     else:
-        # Try HuggingFace cache layout
-        import huggingface_hub  # type: ignore[import-untyped]
-
-        try:
-            cache_dir = Path(
-                huggingface_hub.snapshot_download(
-                    str(model_id_or_path),
-                    local_files_only=True,
-                )
-            )
+        cached = _resolve_cached_snapshot(str(model_id_or_path), revision)
+        if cached is not None:
             candidates = [
-                cache_dir / "model.safetensors",
-                cache_dir / "pytorch_model.bin",
+                cached / "model.safetensors",
+                cached / "pytorch_model.bin",
             ]
-        except Exception:
-            logger.debug("Could not resolve HF cache path for %s", model_id_or_path)
+        else:
+            try:
+                import huggingface_hub  # type: ignore[import-untyped]
+
+                cache_dir = Path(
+                    huggingface_hub.snapshot_download(
+                        repo_id=str(model_id_or_path),
+                        revision=revision,
+                        local_files_only=False,
+                    )
+                )
+                candidates = [
+                    cache_dir / "model.safetensors",
+                    cache_dir / "pytorch_model.bin",
+                ]
+            except Exception:
+                logger.debug("Could not resolve HF cache path for %s", model_id_or_path)
+                candidates = []
 
     for candidate in candidates:
         if candidate.exists():
@@ -117,13 +152,30 @@ def load_model(
     from transformers import AutoModel, AutoTokenizer  # type: ignore[import-untyped]
 
     rev_label = revision or "default"
-    logger.info("Loading tokenizer from %s (revision=%s)", model_id, rev_label)
-    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    source, cached = _resolve_model_source(model_id, revision)
+    source_label = str(source)
+    cache_state = "cached" if cached else "download"
 
     logger.info(
-        "Loading model from %s → device=%s (FP32, revision=%s)", model_id, device, rev_label
+        "Loading tokenizer from %s (revision=%s, source=%s)",
+        model_id,
+        rev_label,
+        cache_state,
     )
-    model = AutoModel.from_pretrained(model_id, revision=revision)
+    tokenizer = AutoTokenizer.from_pretrained(
+        source,
+        revision=revision,
+        local_files_only=cached,
+    )
+
+    logger.info(
+        "Loading model from %s → device=%s (FP32, revision=%s, source=%s)",
+        model_id,
+        device,
+        rev_label,
+        source_label,
+    )
+    model = AutoModel.from_pretrained(source, revision=revision, local_files_only=cached)
     model = model.float()  # enforce FP32 — never call .half()
     model = model.to(device)
     model = model.eval()
@@ -198,13 +250,36 @@ def embed_all(
     Progress is shown via tqdm.  On any exception within a batch the error is
     logged and re-raised — no partial writes.
     """
+    total_batches = max((len(rows) + batch_size - 1) // batch_size, 1)
+    logger.info(
+        "Embedding %d rows in %d batches of up to %d on %s",
+        len(rows),
+        total_batches,
+        batch_size,
+        device,
+    )
+
     result: list[EmbeddedRow] = []
     now = datetime.now(tz=UTC)
 
-    for start in tqdm(range(0, len(rows), batch_size), desc="Embedding", unit="batch"):
+    progress = tqdm(
+        range(0, len(rows), batch_size),
+        desc=f"Embedding ({device})",
+        unit="batch",
+        total=total_batches,
+        leave=True,
+    )
+    for batch_index, start in enumerate(progress, start=1):
         batch = rows[start : start + batch_size]
         texts = [build_embed_text(r, text_fields, separator) for r in batch]
         try:
+            logger.info(
+                "Embedding batch %d/%d (%d rows)",
+                batch_index,
+                total_batches,
+                len(batch),
+            )
+            progress.set_postfix(rows=f"{start + 1}-{start + len(batch)}")
             vecs: np.ndarray = embed_batch(texts, model, tokenizer, device, max_length)
         except Exception:
             logger.error(

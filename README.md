@@ -78,6 +78,9 @@ locally via the normal `~/.cache/huggingface` path.
 DuckDB is also the default engine for reading and filtering Athena TSVs, so
 large source files are narrowed before they are validated or embedded.
 
+If you need a compatibility fallback or want to debug parsing differences,
+use `--ingest-engine python` to switch the ingest path.
+
 ---
 
 ## CPT-4 population (requires UMLS license)

@@ -22,6 +22,7 @@ from typing import Annotated
 import typer
 from dotenv import load_dotenv
 from typer.main import get_command
+import torch
 
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
@@ -143,6 +144,14 @@ def embed_cmd(
         int | None,
         typer.Option(envvar="GPU_EMBED_MAX_LENGTH", help="Tokenizer max sequence length"),
     ] = None,
+    ingest_engine: Annotated[
+        str | None,
+        typer.Option(
+            "--ingest-engine",
+            envvar="GPU_EMBED_INGEST_ENGINE",
+            help="CSV ingest engine: duckdb (default) or python",
+        ),
+    ] = None,
     force: Annotated[
         bool, typer.Option("--force", help="Re-embed already-stored concepts")
     ] = False,
@@ -207,6 +216,8 @@ def embed_cmd(
         cfg_overrides["batch_size"] = batch_size
     if max_length is not None:
         cfg_overrides["max_length"] = max_length
+    if ingest_engine is not None:
+        cfg_overrides["ingest_engine"] = ingest_engine
     if force:
         cfg_overrides["force"] = True
     if text_field:
@@ -247,9 +258,9 @@ def embed_cmd(
     # Load all rows with DuckDB pushdown filtering
     filtered = []
     for p in paths:
-        filtered.extend(read_csv(p, spec=spec))
+        filtered.extend(read_csv(p, spec=spec, engine=cfg.ingest_engine))
 
-    typer.echo(f"Loaded {len(filtered)} rows after DuckDB filtering.")
+    typer.echo(f"Loaded {len(filtered)} rows after {cfg.ingest_engine} filtering.")
 
     if not filtered:
         typer.echo("Nothing to embed.")
@@ -265,9 +276,16 @@ def embed_cmd(
     from gpu_embedder.embed import compute_model_version, embed_all, load_model
 
     rev_label = cfg.model_revision or "default"
+    logger.info(
+        "Device diagnostics: requested=%s, torch.cuda.is_available=%s, torch.version.cuda=%s, mps=%s",
+        cfg.device,
+        torch.cuda.is_available(),
+        torch.version.cuda,
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available(),
+    )
     typer.echo(f"Loading model {cfg.model} (revision={rev_label}) on {cfg.device} …")
     mdl, tok = load_model(cfg.model, cfg.device, revision=cfg.model_revision)
-    model_version = compute_model_version(cfg.model)
+    model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
     typer.echo(f"model_version={model_version[:16]}…")
 
     skip_ids: set[int] = set()
