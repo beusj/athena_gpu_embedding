@@ -1,0 +1,33 @@
+# secrets — never commit the real .env
+.env
+
+# vocabulary CSVs (large binary/text downloads; not source-controlled)
+athena_vocab/
+*.zip
+
+# DuckDB databases
+*.duckdb
+
+# data
+*.csv
+*.json
+*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# pytest / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# OS
+.DS_Store
+Thumbs.db
