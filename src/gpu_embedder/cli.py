@@ -30,7 +30,6 @@ from typer.main import get_command
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
 from gpu_embedder.ingest import read_csv
-from gpu_embedder.logging_setup import setup_logging
 from gpu_embedder.models import FilterSpec
 
 app = typer.Typer(
@@ -92,14 +91,8 @@ def main(
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable DEBUG logging")] = False,
 ) -> None:
-    cfg = EmbedConfig()
-    log_file = setup_logging(
-        verbose=verbose,
-        log_dir=cfg.log_dir,
-        max_bytes=cfg.log_max_bytes,
-        max_files=cfg.log_max_files,
-    )
-    logger.debug("File logging active at %s", log_file)
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(format="%(levelname)s %(name)s: %(message)s", level=level)
 
     if ctx.invoked_subcommand is None:
         group = get_command(app)
@@ -160,14 +153,6 @@ def embed_cmd(
             "--ingest-engine",
             envvar="GPU_EMBED_INGEST_ENGINE",
             help="CSV ingest engine: duckdb (default) or python",
-        ),
-    ] = None,
-    write_mode: Annotated[
-        str | None,
-        typer.Option(
-            "--write-mode",
-            envvar="GPU_EMBED_WRITE_MODE",
-            help="DB write mode: ndjson (default, faster) or direct",
         ),
     ] = None,
     force: Annotated[
@@ -236,8 +221,6 @@ def embed_cmd(
         cfg_overrides["max_length"] = max_length
     if ingest_engine is not None:
         cfg_overrides["ingest_engine"] = ingest_engine
-    if write_mode is not None:
-        cfg_overrides["write_mode"] = write_mode
     if force:
         cfg_overrides["force"] = True
     if text_field:
@@ -370,7 +353,7 @@ def embed_cmd(
     typer.echo(f"Embedding phase: {embed_seconds:.2f}s for {len(embedded)} rows.")
 
     write_started = time.perf_counter()
-    st.upsert_rows(conn, embedded, mode=cfg.write_mode)
+    st.upsert_rows(conn, embedded)
     write_seconds = time.perf_counter() - write_started
     typer.echo(f"Write phase: {write_seconds:.2f}s for {len(embedded)} rows.")
 
