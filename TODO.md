@@ -33,7 +33,7 @@ Tick items off as they are merged.
 
 - [ ] `src/gpu_embedder/config.py`
   - `EmbedConfig(BaseSettings)`: `vocab_dir`, `db`, `batch_size`, `model`,
-    `device`, `force`, `text_fields`, `separator`, `max_length`
+    `model_revision`, `device`, `force`, `text_fields`, `separator`, `max_length`
   - `model_config = SettingsConfigDict(env_file=".env", extra="ignore")`
   - Env prefix `GPU_EMBED_` for all fields except `UMLS_API_KEY` / `CPT4_JAR`
     (those are read directly in the `cpt4` subcommand, not via `EmbedConfig`)

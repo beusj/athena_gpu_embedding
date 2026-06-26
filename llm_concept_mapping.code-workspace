@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "../../llm_concept_mapping"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"uv": true
+		}
+	}
+}

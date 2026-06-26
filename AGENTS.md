@@ -105,6 +105,10 @@ from `cli.py`.
 ### Embedding
 
 - Model: `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` (768-dim).
+- Pin the revision via `GPU_EMBED_MODEL_REVISION` (commit hash, branch, or tag)
+  so downloads are reproducible. Pass as `revision=` to both
+  `AutoModel.from_pretrained` and `AutoTokenizer.from_pretrained`. `None` uses
+  the upstream default branch (not recommended for production).
 - Always run in **FP32** (`model.float()`). Never call `.half()`.
 - Pool strategy: **CLS token** (`last_hidden_state[:, 0, :]`), L2-normalized.
 - Tokenize with `max_length=128`, `truncation=True`, `padding=True`.

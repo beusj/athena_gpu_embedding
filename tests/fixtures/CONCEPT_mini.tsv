@@ -1,0 +1,11 @@
+concept_id	concept_name	domain_id	vocabulary_id	concept_class_id	standard_concept	concept_code	valid_start_date	valid_end_date	invalid_reason
+4119783	Type 2 diabetes mellitus	Condition	SNOMED	Clinical Finding	S	44054006	19700101	20991231	
+40481088	Hemoglobin A1c/Hemoglobin.total in Blood	Measurement	LOINC	Lab Test	S	4548-4	19700101	20991231	
+3004249	Systolic blood pressure	Measurement	LOINC	Lab Test	S	8480-6	19700101	20991231	
+1310149	metformin 500 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	861007	19700101	20991231	
+1310150	metformin 1000 MG Oral Tablet	Drug	RxNorm	Clinical Drug	S	861021	19700101	20991231	
+40481089	Old LOINC code for HbA1c	Measurement	LOINC	Lab Test		2093-3	19700101	20150101	D
+44054099	Diabetes NOS (non-standard)	Condition	SNOMED	Clinical Finding		73211009	19700101	20991231	
+4119000	Fictional concept to test invalid	Condition	SNOMED	Clinical Finding	S	99999999	19700101	20150101	D
+999001	Vancomycin 500 MG Injection	Drug	RxNorm	Clinical Drug	S	308460	19700101	20991231	
+999002	CPT4 test concept	Procedure	CPT4	CPT4	S	99213	19700101	20991231	

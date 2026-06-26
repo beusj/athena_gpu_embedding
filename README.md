@@ -140,6 +140,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--db` | `embeddings.duckdb` | DuckDB file path |
 | `--batch-size` | `256` | Rows per GPU forward pass |
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
+| `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
 | `--max-length` | `128` | Tokenizer max sequence length |
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
 | `--force` | false | Re-embed rows that already exist in the store |
@@ -236,6 +237,7 @@ GPU_EMBED_DB=embeddings.duckdb
 
 # Model
 GPU_EMBED_MODEL=cambridgeltl/SapBERT-from-PubMedBERT-fulltext
+GPU_EMBED_MODEL_REVISION=       # HF commit hash / branch / tag; blank = default branch
 GPU_EMBED_DEVICE=auto
 GPU_EMBED_BATCH_SIZE=256
 GPU_EMBED_MAX_LENGTH=128
