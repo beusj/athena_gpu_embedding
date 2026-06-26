@@ -32,12 +32,13 @@ module "security" {
   tags         = local.common_tags
   bucket_arn   = module.storage.bucket_arn
   prefix_scope = module.storage.prefix_scope
-  kms_key_arn  = coalesce(var.kms_key_arn, module.storage.kms_key_arn)
+  kms_key_arn  = var.kms_key_arn != null ? var.kms_key_arn : module.storage.kms_key_arn
 }
 
 module "batch_gpu" {
   source = "../../modules/batch_gpu"
 
+  aws_region               = var.aws_region
   environment              = var.environment
   tags                     = local.common_tags
   instance_families        = var.batch_instance_families
@@ -45,4 +46,8 @@ module "batch_gpu" {
   on_demand_base_capacity  = var.batch_on_demand_base_capacity
   job_role_arn             = module.security.batch_job_role_arn
   task_execution_role_arn  = module.security.batch_task_execution_role_arn
+  ecr_image_uri            = var.batch_ecr_image_uri
+  vcpus                    = var.batch_vcpus
+  memory                   = var.batch_memory
+  subnet_ids               = var.batch_subnet_ids
 }

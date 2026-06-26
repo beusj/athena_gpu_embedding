@@ -1,12 +1,16 @@
 aws_region                     = "us-east-1"
-environment                    = "academic-dev"
-s3_bucket_name                 = "replace-with-academic-dev-bucket"
+environment                    = "dev"
+s3_bucket_name                 = "<bucket_name>"
 s3_prefix_root                 = "gpu-embed"
 kms_key_arn                    = null
 batch_instance_families        = ["g5", "g6e"]
 batch_spot_enabled             = true
 batch_on_demand_base_capacity  = 0
+batch_vcpus                    = 4
+batch_memory                   = 32768
+batch_ecr_image_uri            = "<account_id>.dkr.ecr.us-east-1.amazonaws.com/gpu-embedder:latest"
+batch_subnet_ids               = ["subnet-xxxxx", "subnet-yyyyy"]
 
 tags = {
-  Owner = "replace-with-team"
+  Owner = "<owner>"
 }

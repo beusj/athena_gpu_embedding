@@ -1,11 +1,11 @@
 output "bucket_name" {
   description = "Artifact bucket name"
-  value       = var.bucket_name
+  value       = aws_s3_bucket.artifacts.id
 }
 
 output "bucket_arn" {
-  description = "Artifact bucket ARN (derived placeholder)"
-  value       = local.bucket_arn
+  description = "Artifact bucket ARN"
+  value       = aws_s3_bucket.artifacts.arn
 }
 
 output "prefix_scope" {
@@ -14,6 +14,6 @@ output "prefix_scope" {
 }
 
 output "kms_key_arn" {
-  description = "KMS key ARN (placeholder passthrough)"
+  description = "KMS key ARN (or null if SSE-S3)"
   value       = local.resolved_kms
 }

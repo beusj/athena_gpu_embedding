@@ -1,6 +1,20 @@
 # secrets — never commit the real .env
 .env
 
+# Terraform
+*.tfvars
+!*.tfvars.example
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
 # vocabulary CSVs (large binary/text downloads; not source-controlled)
 athena_vocab/
 *.zip

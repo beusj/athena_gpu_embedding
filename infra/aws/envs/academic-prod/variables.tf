@@ -49,3 +49,24 @@ variable "batch_on_demand_base_capacity" {
   type        = number
   default     = 1
 }
+variable "batch_vcpus" {
+  description = "vCPUs per Batch job"
+  type        = number
+  default     = 4
+}
+
+variable "batch_memory" {
+  description = "Memory (MB) per Batch job"
+  type        = number
+  default     = 32768
+}
+
+variable "batch_ecr_image_uri" {
+  description = "ECR image URI for gpu-embedder Docker image"
+  type        = string
+}
+
+variable "batch_subnet_ids" {
+  description = "VPC subnet IDs for Batch EC2 instances"
+  type        = list(string)
+}

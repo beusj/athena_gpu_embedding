@@ -1,5 +1,9 @@
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+}
+
 variable "environment" {
-  description = "Environment name"
   type        = string
 }
 
@@ -30,11 +34,31 @@ variable "on_demand_base_capacity" {
 variable "job_role_arn" {
   description = "Batch job IAM role ARN"
   type        = string
-  default     = null
 }
 
 variable "task_execution_role_arn" {
   description = "Batch task execution IAM role ARN"
   type        = string
-  default     = null
+}
+
+variable "ecr_image_uri" {
+  description = "ECR image URI for gpu-embedder Docker image"
+  type        = string
+}
+
+variable "vcpus" {
+  description = "vCPUs per job"
+  type        = number
+  default     = 4
+}
+
+variable "memory" {
+  description = "Memory (MB) per job"
+  type        = number
+  default     = 32768 # 32 GB for GPU workload
+}
+
+variable "subnet_ids" {
+  description = "VPC subnet IDs for EC2 instances"
+  type        = list(string)
 }
