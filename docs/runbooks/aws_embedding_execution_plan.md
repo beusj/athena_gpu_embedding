@@ -9,10 +9,17 @@ It does **not** change the default/local execution path in either repository.
 > "AWS execution path" section). It follows the **Target execution model** below:
 > shard + upload to S3 → AWS Batch array job (one task per shard, FP32 SapBERT) →
 > validate + merge the output artifacts into DuckDB. `boto3` is an optional extra
-> (`pip install ".[aws]"`) and the local `embed` path is unchanged. The
-> infrastructure pieces still to provision are the ECR image
-> (`docker/Dockerfile.aws`), the Batch compute environment/queue, the job
-> definition, and the S3 bucket/IAM policy.
+> (`pip install ".[aws]"`) and the local `embed` path is unchanged.
+>
+> The infrastructure (control plane) is implemented as Terraform under
+> `infra/aws/` — the `storage` (S3), `security` (IAM), and `batch_gpu` (Batch
+> compute env/queue/GPU job definition) modules, wired through `academic-dev`
+> and `academic-prod` envs. Every create-vs-reuse decision (bucket, IAM, KMS,
+> VPC, Batch) is gated behind a variable with conservative defaults so it can be
+> applied in a locked-down academic account. `terraform output cli_env` emits
+> the `GPU_EMBED_AWS_*` values the CLI consumes. The remaining manual step is
+> building/pushing the worker image (`docker/Dockerfile.aws`) to ECR and, in new
+> accounts, requesting a GPU service-quota increase.
 
 ## Why this plan exists
 

@@ -145,11 +145,13 @@ def submit_run(
         "--run-id",
         run_id,
     ]
+    # Prefixes are always resolved to concrete strings by AwsConfig validators.
     environment = {
         "GPU_EMBED_AWS_RUN_ID": run_id,
+        "GPU_EMBED_AWS_ENVIRONMENT": cfg.environment,
         "GPU_EMBED_AWS_S3_BUCKET": cfg.require_bucket(),
-        "GPU_EMBED_AWS_S3_INPUT_PREFIX": cfg.s3_input_prefix,
-        "GPU_EMBED_AWS_S3_OUTPUT_PREFIX": cfg.s3_output_prefix,
+        "GPU_EMBED_AWS_S3_INPUT_PREFIX": str(cfg.s3_input_prefix),
+        "GPU_EMBED_AWS_S3_OUTPUT_PREFIX": str(cfg.s3_output_prefix),
     }
 
     job_id = scheduler.submit_array_job(

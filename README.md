@@ -368,7 +368,15 @@ and exports the vectors back into the same local DuckDB store:
    ```
 
 All `GPU_EMBED_AWS_*` settings can live in `.env` instead of being passed as
-flags — see `.env.example`. Architecture, instance-family, and cost guidance is
+flags — see `.env.example`. The S3 prefix defaults to
+`<prefix_root>/<environment>/{input,output}` so it lines up with the provisioned
+bucket policy.
+
+The matching infrastructure (S3 bucket, IAM roles, Batch GPU compute
+environment/queue/job-definition) is provided as Terraform under
+[`infra/aws/`](infra/aws/), with create-vs-reuse toggles for locked-down
+academic accounts; `terraform output cli_env` prints the exact `GPU_EMBED_AWS_*`
+values to drop into `.env`. Architecture, instance-family, and cost guidance is
 in [`docs/runbooks/aws_embedding_execution_plan.md`](docs/runbooks/aws_embedding_execution_plan.md).
 
 ### AWS subcommands

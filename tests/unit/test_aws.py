@@ -140,18 +140,33 @@ def test_fakes_satisfy_protocols() -> None:
 class TestAwsConfig:
     def test_defaults(self) -> None:
         cfg = AwsConfig(_env_file=None)  # type: ignore[call-arg]
-        assert cfg.s3_input_prefix == "gpu-embedder/input"
-        assert cfg.s3_output_prefix == "gpu-embedder/output"
+        assert cfg.environment == "academic-dev"
+        assert cfg.s3_prefix_root == "gpu-embed"
+        # Prefixes are derived as <prefix_root>/<environment>/{input,output}.
+        assert cfg.s3_input_prefix == "gpu-embed/academic-dev/input"
+        assert cfg.s3_output_prefix == "gpu-embed/academic-dev/output"
         assert cfg.shard_size == 50_000
         assert cfg.embedding_dim == 768
         assert cfg.spot_preferred is True
 
+    def test_prefixes_track_environment(self) -> None:
+        cfg = AwsConfig(_env_file=None, environment="academic-prod")  # type: ignore[call-arg]
+        assert cfg.s3_input_prefix == "gpu-embed/academic-prod/input"
+        assert cfg.s3_output_prefix == "gpu-embed/academic-prod/output"
+
+    def test_explicit_prefix_override(self) -> None:
+        cfg = AwsConfig(_env_file=None, s3_input_prefix="custom/in")  # type: ignore[call-arg]
+        assert cfg.s3_input_prefix == "custom/in"
+        # The non-overridden side is still derived.
+        assert cfg.s3_output_prefix == "gpu-embed/academic-dev/output"
+
     def test_key_builders(self) -> None:
         cfg = _cfg()
-        assert cfg.input_key("run1", 3) == "gpu-embedder/input/run1/shard-00003.ndjson"
-        assert cfg.output_key("run1", 3) == "gpu-embedder/output/run1/shard-00003.ndjson"
-        assert cfg.manifest_key("run1") == "gpu-embedder/input/run1/manifest.json"
-        assert cfg.output_prefix_for("run1") == "gpu-embedder/output/run1/"
+        base = "gpu-embed/academic-dev"
+        assert cfg.input_key("run1", 3) == f"{base}/input/run1/shard-00003.ndjson"
+        assert cfg.output_key("run1", 3) == f"{base}/output/run1/shard-00003.ndjson"
+        assert cfg.manifest_key("run1") == f"{base}/input/run1/manifest.json"
+        assert cfg.output_prefix_for("run1") == f"{base}/output/run1/"
 
     def test_require_bucket_raises(self) -> None:
         cfg = AwsConfig(_env_file=None)  # type: ignore[call-arg]
@@ -303,9 +318,9 @@ class TestSubmitRun:
         assert sub.job_id == "job-1"
         # 3 shard inputs + 1 manifest uploaded
         assert store.objects.keys() >= {
-            "gpu-embedder/input/run1/shard-00000.ndjson",
-            "gpu-embedder/input/run1/shard-00002.ndjson",
-            "gpu-embedder/input/run1/manifest.json",
+            "gpu-embed/academic-dev/input/run1/shard-00000.ndjson",
+            "gpu-embed/academic-dev/input/run1/shard-00002.ndjson",
+            "gpu-embed/academic-dev/input/run1/manifest.json",
         }
         sched = scheduler.submissions[0]
         assert sched["array_size"] == 3
@@ -389,7 +404,7 @@ class TestRunShard:
             embed_fn=_fake_embed_fn,
         )
         assert count == 2  # shard_size 2
-        assert "gpu-embedder/output/run1/shard-00000.ndjson" in store.objects
+        assert "gpu-embed/academic-dev/output/run1/shard-00000.ndjson" in store.objects
 
 
 class TestCollectRun:

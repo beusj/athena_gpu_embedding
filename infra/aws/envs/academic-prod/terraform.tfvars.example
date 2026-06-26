@@ -1,11 +1,35 @@
-aws_region                     = "us-east-1"
-environment                    = "academic-prod"
-s3_bucket_name                 = "replace-with-academic-prod-bucket"
-s3_prefix_root                 = "gpu-embed"
-kms_key_arn                    = null
-batch_instance_families        = ["g5", "g6e"]
-batch_spot_enabled             = true
-batch_on_demand_base_capacity  = 1
+aws_region     = "us-east-1"
+environment    = "academic-prod"
+s3_bucket_name = "replace-with-academic-prod-bucket"
+s3_prefix_root = "gpu-embed"
+kms_key_arn    = null
+
+# --- create-vs-reuse toggles -------------------------------------------------
+# Flip these to false in locked-down accounts and supply the existing_* ARNs /
+# networking IDs below. Defaults assume an account that permits creation.
+create_bucket = true
+create_roles  = true
+create_batch  = true
+
+# Required by many academic accounts when creating IAM roles:
+permissions_boundary_arn = null
+
+# Used only when create_roles = false:
+existing_job_role_arn            = null
+existing_task_execution_role_arn = null
+existing_instance_profile_arn    = null
+
+# --- networking (bring-your-own VPC; required when create_batch = true) -------
+subnet_ids         = [] # e.g. ["subnet-aaaa", "subnet-bbbb"]
+security_group_ids = [] # e.g. ["sg-cccc"]
+
+# --- compute / image ---------------------------------------------------------
+# Push docker/Dockerfile.aws to ECR and set the image URI here.
+container_image               = "" # e.g. "123456789012.dkr.ecr.us-east-1.amazonaws.com/gpu-embedder:latest"
+batch_instance_families       = ["g5", "g6e"]
+batch_spot_enabled            = true
+batch_on_demand_base_capacity = 1
+batch_max_vcpus               = 128
 
 tags = {
   Owner = "replace-with-team"

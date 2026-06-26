@@ -22,10 +22,18 @@ class AwsConfig(BaseSettings):
     # Connectivity
     region: str | None = None
 
-    # S3 layout
+    # Environment label. Matches the Terraform `environment` (e.g. academic-dev,
+    # academic-prod) so the S3 layout below lines up with `infra/aws` outputs.
+    environment: str = "academic-dev"
+
+    # S3 layout. The default prefixes mirror the Terraform `prefix_scope`
+    # (``<s3_prefix_root>/<environment>``), so a run submitted by the CLI lands
+    # exactly where the provisioned bucket policy/lifecycle rules expect it.
+    # Either prefix may be overridden explicitly; otherwise it is derived.
     s3_bucket: str | None = None
-    s3_input_prefix: str = "gpu-embedder/input"
-    s3_output_prefix: str = "gpu-embedder/output"
+    s3_prefix_root: str = "gpu-embed"
+    s3_input_prefix: str | None = None
+    s3_output_prefix: str | None = None
 
     # AWS Batch
     job_queue: str | None = None
@@ -50,6 +58,16 @@ class AwsConfig(BaseSettings):
             raise ValueError("max_array_size must be greater than 0")
         if self.embedding_dim <= 0:
             raise ValueError("embedding_dim must be greater than 0")
+        return self
+
+    @model_validator(mode="after")
+    def _resolve_prefixes(self) -> AwsConfig:
+        """Derive env-scoped prefixes from the prefix root when not overridden."""
+        base = f"{self.s3_prefix_root}/{self.environment}"
+        if self.s3_input_prefix is None:
+            self.s3_input_prefix = f"{base}/input"
+        if self.s3_output_prefix is None:
+            self.s3_output_prefix = f"{base}/output"
         return self
 
     # -- derived helpers ----------------------------------------------------
