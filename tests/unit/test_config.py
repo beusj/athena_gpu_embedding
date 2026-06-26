@@ -23,6 +23,7 @@ class TestEmbedConfigDefaults:
         assert cfg.batch_size == 256
         assert cfg.max_length == 128
         assert cfg.ingest_engine == "duckdb"
+        assert cfg.write_mode == "ndjson"
         assert cfg.text_fields == ["concept_name"]
         assert cfg.separator == " "
         assert cfg.force is False
@@ -93,3 +94,12 @@ class TestEmbedConfigRevision:
         monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(model_revision="abc123def456", _env_file=None)  # type: ignore[call-arg]
         assert cfg.model_revision == "abc123def456"
+
+
+class TestEmbedConfigWriteMode:
+    def test_write_mode_env_override(self, monkeypatch) -> None:
+        from gpu_embedder.config import EmbedConfig
+
+        monkeypatch.setenv("GPU_EMBED_WRITE_MODE", "direct")
+        cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.write_mode == "direct"

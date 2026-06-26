@@ -7,6 +7,7 @@ Modules do not open their own connections.
 from __future__ import annotations
 
 import logging
+import json
 import tempfile
 from pathlib import Path
 from typing import Literal
@@ -123,82 +124,84 @@ def _upsert_rows_direct(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]
         conn.execute("DROP TABLE IF EXISTS temp_embeddings")
 
 
-def _upsert_rows_parquet(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
-    """Parquet-backed staged upsert for faster bulk writes."""
+def _upsert_rows_ndjson(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
+    """NDJSON-backed staged upsert for faster bulk writes."""
     if not rows:
         return
 
     with tempfile.TemporaryDirectory(prefix="gpu_embedder_") as temp_dir:
-        parquet_path = Path(temp_dir) / "embeddings.parquet"
+        ndjson_path = Path(temp_dir) / "embeddings.ndjson"
+        with ndjson_path.open("w", encoding="utf-8") as handle:
+            for r in rows:
+                payload = {
+                    "concept_id": r.concept.concept_id,
+                    "concept_name": r.concept.concept_name,
+                    "domain_id": r.concept.domain_id,
+                    "vocabulary_id": r.concept.vocabulary_id,
+                    "concept_class_id": r.concept.concept_class_id,
+                    "standard_concept": r.concept.standard_concept,
+                    "concept_code": r.concept.concept_code,
+                    "invalid_reason": r.concept.invalid_reason,
+                    "embedding": r.embedding,
+                    "embed_text": r.embed_text,
+                    "model_version": r.model_version,
+                    "embedded_at": r.embedded_at.isoformat(),
+                }
+                handle.write(json.dumps(payload))
+                handle.write("\n")
 
-        records = [
-            {
-                "concept_id": r.concept.concept_id,
-                "concept_name": r.concept.concept_name,
-                "domain_id": r.concept.domain_id,
-                "vocabulary_id": r.concept.vocabulary_id,
-                "concept_class_id": r.concept.concept_class_id,
-                "standard_concept": r.concept.standard_concept,
-                "concept_code": r.concept.concept_code,
-                "invalid_reason": r.concept.invalid_reason,
-                "embedding": r.embedding,
-                "embed_text": r.embed_text,
-                "model_version": r.model_version,
-                "embedded_at": r.embedded_at,
-            }
-            for r in rows
-        ]
-
-        conn.register("incoming_embeddings", records)
+        conn.execute("BEGIN")
         try:
+            conn.execute("DROP TABLE IF EXISTS temp_embeddings")
             conn.execute(
                 """
-                COPY incoming_embeddings TO ? (FORMAT PARQUET)
+                CREATE TEMP TABLE temp_embeddings AS
+                SELECT
+                    concept_id::BIGINT AS concept_id,
+                    concept_name::VARCHAR AS concept_name,
+                    domain_id::VARCHAR AS domain_id,
+                    vocabulary_id::VARCHAR AS vocabulary_id,
+                    concept_class_id::VARCHAR AS concept_class_id,
+                    standard_concept::VARCHAR AS standard_concept,
+                    concept_code::VARCHAR AS concept_code,
+                    invalid_reason::VARCHAR AS invalid_reason,
+                    embedding::FLOAT[768] AS embedding,
+                    embed_text::VARCHAR AS embed_text,
+                    model_version::VARCHAR AS model_version,
+                    CAST(embedded_at AS TIMESTAMP) AS embedded_at
+                FROM read_ndjson_auto(?)
                 """,
-                [str(parquet_path)],
+                [str(ndjson_path)],
             )
 
-            conn.execute("BEGIN")
-            try:
-                conn.execute("DROP TABLE IF EXISTS temp_embeddings")
-                conn.execute(
-                    """
-                    CREATE TEMP TABLE temp_embeddings AS
-                    SELECT * FROM read_parquet(?)
-                    """,
-                    [str(parquet_path)],
-                )
+            conn.execute(
+                """
+                DELETE FROM concept_embeddings AS t
+                USING temp_embeddings AS s
+                WHERE t.concept_id = s.concept_id
+                  AND t.model_version = s.model_version
+                """
+            )
 
-                conn.execute(
-                    """
-                    DELETE FROM concept_embeddings AS t
-                    USING temp_embeddings AS s
-                    WHERE t.concept_id = s.concept_id
-                      AND t.model_version = s.model_version
-                    """
-                )
+            conn.execute(
+                """
+                INSERT INTO concept_embeddings
+                SELECT * FROM temp_embeddings
+                """
+            )
 
-                conn.execute(
-                    """
-                    INSERT INTO concept_embeddings
-                    SELECT * FROM temp_embeddings
-                    """
-                )
-
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
-            finally:
-                conn.execute("DROP TABLE IF EXISTS temp_embeddings")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         finally:
-            conn.unregister("incoming_embeddings")
+            conn.execute("DROP TABLE IF EXISTS temp_embeddings")
 
 
 def upsert_rows(
     conn: duckdb.DuckDBPyConnection,
     rows: list[EmbeddedRow],
-    mode: Literal["parquet", "direct"] = "parquet",
+    mode: Literal["ndjson", "direct"] = "ndjson",
 ) -> None:
     """Insert or replace a batch of EmbeddedRow objects.
 
@@ -213,7 +216,7 @@ def upsert_rows(
     if mode == "direct":
         _upsert_rows_direct(conn, rows)
     else:
-        _upsert_rows_parquet(conn, rows)
+        _upsert_rows_ndjson(conn, rows)
 
     logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
 

@@ -76,6 +76,19 @@ large source files are narrowed before they are validated or embedded.
 If you need a compatibility fallback or want to debug parsing differences,
 use `--ingest-engine python` to switch the ingest path.
 
+### Write performance
+
+`embed` now defaults to `--write-mode ndjson` (`GPU_EMBED_WRITE_MODE=ndjson`),
+which stages rows as NDJSON and performs a set-based merge in DuckDB.
+
+Measured on the UCUM run (1,128 rows):
+- `--write-mode ndjson`: write phase `0.38s`
+- `--write-mode direct`: write phase `243.96s`
+
+To disable the fast path:
+- Per run: `--write-mode direct`
+- Environment: `GPU_EMBED_WRITE_MODE=direct`
+
 ### Logging
 
 CLI runs write logs to `logs/` by default using dated filenames:
@@ -204,6 +217,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
 | `--max-length` | `128` | Tokenizer max sequence length |
 | `--ingest-engine` | `duckdb` | CSV ingest engine: `duckdb` (default) or `python` fallback |
+| `--write-mode` | `ndjson` | DB write mode: `ndjson` (default, faster) or `direct` |
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
 | `--verbose` | false | Enable detailed logging and progress visibility |
 | `--force` | false | Re-embed rows that already exist in the store |
@@ -281,6 +295,9 @@ gpu-embed embed --vocabulary-id UCUM --verbose
 
 # Force the Python ingest fallback if you need to debug DuckDB parsing
 gpu-embed embed --vocabulary-id UCUM --ingest-engine python
+
+# Disable fast write mode for compatibility/debugging
+gpu-embed embed --vocabulary-id UCUM --write-mode direct
 
 # Embed all standard valid concepts from athena_vocab/ (default dir)
 gpu-embed embed --standard-concept S --invalid-reason valid
@@ -371,6 +388,7 @@ GPU_EMBED_MODEL_REVISION=       # HF commit hash / branch / tag; blank = default
 GPU_EMBED_DEVICE=auto
 GPU_EMBED_BATCH_SIZE=256
 GPU_EMBED_MAX_LENGTH=128
+GPU_EMBED_WRITE_MODE=ndjson   # set to direct to disable fast write path
 GPU_EMBED_TEXT_FIELDS=concept_name
 GPU_EMBED_SEPARATOR=" "
 
