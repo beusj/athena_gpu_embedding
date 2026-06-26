@@ -148,7 +148,9 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
 | `--max-length` | `128` | Tokenizer max sequence length |
+| `--ingest-engine` | `duckdb` | CSV ingest engine: `duckdb` (default) or `python` fallback |
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
+| `--verbose` | false | Enable detailed logging and progress visibility |
 | `--force` | false | Re-embed rows that already exist in the store |
 | `--vocabulary-id` | _(all)_ | Keep only these vocabulary IDs (repeatable) |
 | `--domain-id` | _(all)_ | Keep only these domain IDs (repeatable) |
@@ -175,6 +177,15 @@ gpu-embed cpt4 [OPTIONS]
 ```bash
 # Populate CPT-4 names first (only needed once per Athena download)
 gpu-embed cpt4
+
+# Embed UCUM concepts only
+gpu-embed embed --vocabulary-id UCUM
+
+# Same, but with detailed logging and progress visibility
+gpu-embed embed --vocabulary-id UCUM --verbose
+
+# Force the Python ingest fallback if you need to debug DuckDB parsing
+gpu-embed embed --vocabulary-id UCUM --ingest-engine python
 
 # Embed all standard valid concepts from athena_vocab/ (default dir)
 gpu-embed embed --standard-concept S --invalid-reason valid
