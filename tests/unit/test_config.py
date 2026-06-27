@@ -22,6 +22,7 @@ class TestEmbedConfigDefaults:
         assert cfg.model_revision is None
         assert cfg.batch_size == 256
         assert cfg.max_length == 128
+        assert cfg.upsert_every_batches == 250
         assert cfg.ingest_engine == "duckdb"
         assert cfg.write_mode == "ndjson"
         assert cfg.text_fields == ["concept_name"]
@@ -103,3 +104,21 @@ class TestEmbedConfigWriteMode:
         monkeypatch.setenv("GPU_EMBED_WRITE_MODE", "direct")
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.write_mode == "direct"
+
+
+class TestEmbedConfigCheckpointing:
+    def test_upsert_every_batches_env_override(self, monkeypatch) -> None:
+        from gpu_embedder.config import EmbedConfig
+
+        monkeypatch.setenv("GPU_EMBED_UPSERT_EVERY_BATCHES", "7")
+        cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.upsert_every_batches == 7
+
+    def test_upsert_every_batches_must_be_positive(self, monkeypatch) -> None:
+        import pytest
+
+        from gpu_embedder.config import EmbedConfig
+
+        monkeypatch.setenv("GPU_EMBED_UPSERT_EVERY_BATCHES", "0")
+        with pytest.raises(ValueError, match="must be greater than 0"):
+            EmbedConfig(_env_file=None)  # type: ignore[call-arg]

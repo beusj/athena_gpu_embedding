@@ -60,3 +60,10 @@ From an environment folder (example: `infra/aws/envs/academic-dev`):
 2. Run `terraform init`.
 3. Run `terraform plan`.
 4. Run `terraform apply` only after module resources are implemented and reviewed.
+
+## Documentation split
+
+- Planning and architecture:
+  - `docs/runbooks/aws_embedding_execution_plan.md`
+- Day-to-day AWS interaction and command flows:
+  - `docs/runbooks/aws_interaction_guide.md`

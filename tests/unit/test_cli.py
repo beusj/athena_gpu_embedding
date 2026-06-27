@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import csv
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
 from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
-from gpu_embedder.models import SCHEMA_DDL
+from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow
 
 
 def _seed_embeddings_db(db_path: Path) -> None:
@@ -175,6 +176,103 @@ def test_coverage_writes_csv_output(tmp_path: Path) -> None:
         "coverage_pct",
     ]
     assert any(row[0] == "CPT4" for row in rows[1:])
+
+
+def test_embed_upserts_every_n_batches(monkeypatch) -> None:
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    rows = [
+        ConceptRow(
+            concept_id=i,
+            concept_name=f"Concept {i}",
+            domain_id="Drug",
+            vocabulary_id="NDC",
+            concept_class_id="Drug",
+            standard_concept="S",
+            concept_code=str(i),
+            invalid_reason=None,
+        )
+        for i in range(1, 6)
+    ]
+
+    upsert_sizes: list[int] = []
+
+    class _FakeConn:
+        pass
+
+    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+        return rows
+
+    def fake_load_model(model_id: str, device: str, revision: str | None = None):
+        return object(), object()
+
+    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+        return "test-model-version"
+
+    def fake_embed_all(
+        chunk_rows,
+        model,
+        tokenizer,
+        device,
+        batch_size,
+        max_length,
+        text_fields,
+        separator,
+        model_version,
+    ):
+        return [
+            EmbeddedRow(
+                concept=r,
+                embedding=[0.0] * 768,
+                embed_text=r.concept_name,
+                model_version=model_version,
+                embedded_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+            for r in chunk_rows
+        ]
+
+    def fake_open_db(path: Path):
+        return _FakeConn()
+
+    def fake_ensure_schema(conn) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_get_existing_ids(conn, model_version: str) -> set[int]:  # type: ignore[no-untyped-def]
+        return set()
+
+    def fake_upsert_rows(conn, embedded_rows, mode: str = "ndjson") -> None:  # type: ignore[no-untyped-def]
+        upsert_sizes.append(len(embedded_rows))
+
+    def fake_count_rows(conn, model_version: str) -> int:  # type: ignore[no-untyped-def]
+        return sum(upsert_sizes)
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+    monkeypatch.setattr("gpu_embedder.embed.load_model", fake_load_model)
+    monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
+    monkeypatch.setattr("gpu_embedder.embed.embed_all", fake_embed_all)
+    monkeypatch.setattr("gpu_embedder.store.open_db", fake_open_db)
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", fake_ensure_schema)
+    monkeypatch.setattr("gpu_embedder.store.get_existing_ids", fake_get_existing_ids)
+    monkeypatch.setattr("gpu_embedder.store.upsert_rows", fake_upsert_rows)
+    monkeypatch.setattr("gpu_embedder.store.count_rows", fake_count_rows)
+
+    result = runner.invoke(
+        app,
+        [
+            "embed",
+            str(fixture),
+            "--batch-size",
+            "2",
+            "--upsert-every-batches",
+            "2",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert upsert_sizes == [4, 1]
 
 
 def test_embed_accepts_comma_delimited_vocabulary_id(monkeypatch) -> None:

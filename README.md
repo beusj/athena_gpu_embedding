@@ -189,6 +189,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
 | `--max-length` | `128` | Tokenizer max sequence length |
+| `--upsert-every-batches` | `250` | Checkpoint writes every N embedding batches |
 | `--ingest-engine` | `duckdb` | CSV ingest engine: `duckdb` (default) or `python` fallback |
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
 | `--verbose` | false | Enable detailed logging and progress visibility |
@@ -360,6 +361,7 @@ GPU_EMBED_MODEL_REVISION=       # HF commit hash / branch / tag; blank = default
 GPU_EMBED_DEVICE=auto
 GPU_EMBED_BATCH_SIZE=256
 GPU_EMBED_MAX_LENGTH=128
+GPU_EMBED_UPSERT_EVERY_BATCHES=250
 GPU_EMBED_TEXT_FIELDS=concept_name
 GPU_EMBED_SEPARATOR=" "
 

@@ -162,6 +162,14 @@ def embed_cmd(
         int | None,
         typer.Option(envvar="GPU_EMBED_MAX_LENGTH", help="Tokenizer max sequence length"),
     ] = None,
+    upsert_every_batches: Annotated[
+        int | None,
+        typer.Option(
+            "--upsert-every-batches",
+            envvar="GPU_EMBED_UPSERT_EVERY_BATCHES",
+            help="Checkpoint writes every N embedding batches",
+        ),
+    ] = None,
     ingest_engine: Annotated[
         str | None,
         typer.Option(
@@ -237,6 +245,8 @@ def embed_cmd(
         cfg_overrides["batch_size"] = batch_size
     if max_length is not None:
         cfg_overrides["max_length"] = max_length
+    if upsert_every_batches is not None:
+        cfg_overrides["upsert_every_batches"] = upsert_every_batches
     if ingest_engine is not None:
         cfg_overrides["ingest_engine"] = ingest_engine
     if force:
@@ -357,29 +367,53 @@ def embed_cmd(
         typer.echo("Nothing new to embed. Use --force to re-embed.")
         raise typer.Exit(0)
 
-    embed_started = time.perf_counter()
-    embedded = embed_all(
-        to_embed,
-        mdl,
-        tok,
-        cfg.device,
-        cfg.batch_size,
-        cfg.max_length,
-        cfg.text_fields,
-        cfg.separator,
-        model_version,
+    checkpoint_size = cfg.batch_size * cfg.upsert_every_batches
+    typer.echo(
+        "Checkpointing writes every "
+        f"{cfg.upsert_every_batches} batch(es) ({checkpoint_size} rows max per upsert)."
     )
-    embed_seconds = time.perf_counter() - embed_started
-    typer.echo(f"Embedding phase: {embed_seconds:.2f}s for {len(embedded)} rows.")
 
-    write_started = time.perf_counter()
-    st.upsert_rows(conn, embedded)
-    write_seconds = time.perf_counter() - write_started
-    typer.echo(f"Write phase: {write_seconds:.2f}s for {len(embedded)} rows.")
+    total_embedded = 0
+    total_embed_seconds = 0.0
+    total_write_seconds = 0.0
+    total_checkpoints = 0
+
+    for chunk_start in range(0, len(to_embed), checkpoint_size):
+        chunk_rows = to_embed[chunk_start : chunk_start + checkpoint_size]
+        chunk_end = chunk_start + len(chunk_rows)
+
+        embed_started = time.perf_counter()
+        embedded_chunk = embed_all(
+            chunk_rows,
+            mdl,
+            tok,
+            cfg.device,
+            cfg.batch_size,
+            cfg.max_length,
+            cfg.text_fields,
+            cfg.separator,
+            model_version,
+        )
+        total_embed_seconds += time.perf_counter() - embed_started
+
+        write_started = time.perf_counter()
+        st.upsert_rows(conn, embedded_chunk, mode=cfg.write_mode)
+        total_write_seconds += time.perf_counter() - write_started
+
+        total_embedded += len(embedded_chunk)
+        total_checkpoints += 1
+        typer.echo(
+            "Checkpoint "
+            f"{total_checkpoints}: wrote rows {chunk_start + 1}-{chunk_end} "
+            f"({total_embedded}/{len(to_embed)} total embedded)."
+        )
+
+    typer.echo(f"Embedding phase: {total_embed_seconds:.2f}s for {total_embedded} rows.")
+    typer.echo(f"Write phase: {total_write_seconds:.2f}s for {total_embedded} rows.")
 
     total = st.count_rows(conn, model_version)
     typer.echo(
-        f"Done. Embedded {len(embedded)} concepts. "
+        f"Done. Embedded {total_embedded} concepts. "
         f"Total stored for this model version: {total}."
     )
 

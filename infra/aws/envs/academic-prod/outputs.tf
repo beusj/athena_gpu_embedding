@@ -1,16 +1,16 @@
 output "bucket_name" {
   description = "Artifact bucket name"
-  value       = module.storage.bucket_name
+  value       = local.resolved_bucket_name
 }
 
 output "bucket_arn" {
   description = "Artifact bucket ARN"
-  value       = module.storage.bucket_arn
+  value       = local.resolved_bucket_arn
 }
 
 output "prefix_scope" {
   description = "Environment-scoped prefix root"
-  value       = module.storage.prefix_scope
+  value       = local.resolved_prefix_scope
 }
 
 output "batch_job_queue_arn" {

@@ -47,6 +47,7 @@ class EmbedConfig(BaseSettings):
     max_length: int = 128
     ingest_engine: Literal["duckdb", "python"] = "duckdb"
     write_mode: Literal["ndjson", "direct"] = "ndjson"
+    upsert_every_batches: int = 250
 
     # Text construction
     text_fields: Annotated[list[str], NoDecode] = ["concept_name"]
@@ -55,7 +56,7 @@ class EmbedConfig(BaseSettings):
     # Behaviour
     force: bool = False
 
-    @field_validator("log_max_bytes", "log_max_files")
+    @field_validator("log_max_bytes", "log_max_files", "upsert_every_batches")
     @classmethod
     def validate_positive_int(cls, v: int) -> int:
         if v <= 0:

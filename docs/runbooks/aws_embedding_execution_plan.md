@@ -131,6 +131,212 @@ Note on partial `embeddings.duckdb`:
 - Prefer artifact-first shard outputs + manifest/checkpoint over sharing a mutable DuckDB file across workers.
 - If carrying forward a local partial state is necessary, upload it to an S3 checkpoint prefix as a snapshot input to a single merge/import step, not as a concurrently written shared DB.
 
+## Implementation lessons learned (sanitized)
+
+This section captures deployment findings from iterative infrastructure bring-up.
+It intentionally omits account identifiers, URLs, and organization-specific details.
+
+### IAM and role model
+
+- AWS Batch on EC2 requires distinct trust principals and cannot be collapsed to one role.
+- Practical minimum is three IAM roles plus one instance profile:
+  - Batch service role (trusted by `batch.amazonaws.com`)
+  - EC2 instance role (trusted by `ec2.amazonaws.com`)
+  - Job/container role (trusted by `ecs-tasks.amazonaws.com`)
+  - Instance profile associated to the EC2 instance role
+- Task execution role can be optional in this workload when container behavior and image access allow it.
+- Spot-specific role can be avoided by disabling Spot during bootstrap.
+
+### Permission pitfalls observed
+
+- Control-plane provisioning requires `iam:PassRole` for the service/instance/job roles.
+- Batch setup requires create/register permissions for compute environments, queues, and job definitions.
+- Missing CloudWatch Logs permissions on the Batch service role can cause compute environment state `INVALID`.
+- Terraform state operations may require IAM read/list permissions (for example role/policy introspection), even when resources already exist.
+- Terraform execution roles also need S3 bucket configuration read permissions when storage resources are in scope.
+  At minimum, include `s3:GetEncryptionConfiguration` and `s3:GetLifecycleConfiguration` on the target bucket ARN.
+
+### Incident-specific lessons (Batch compute environment recovery)
+
+- Role ARN path precision matters. A role created under a non-root path (for example `/customroles/`) has a different ARN than
+  the root-path form, and Batch fails with `sts:AssumeRole` if the ARN is wrong.
+- Existing trust policy correctness is not sufficient if the compute environment references a different ARN string.
+- Batch compute environments can retain stale `INVALID` status reasons during IAM propagation and may require explicit delete/recreate.
+- Pre-created role + instance profile names should be verified from live IAM before first apply in restricted environments.
+
+### Minimal policy snippet for Terraform execution role
+
+Use this as a baseline inline or managed policy for the Terraform execution role when applying this stack.
+Replace `<bucket-name>` and scope further if your environment allows.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BatchControlPlane",
+      "Effect": "Allow",
+      "Action": [
+        "batch:CreateComputeEnvironment",
+        "batch:UpdateComputeEnvironment",
+        "batch:DeleteComputeEnvironment",
+        "batch:DescribeComputeEnvironments",
+        "batch:CreateJobQueue",
+        "batch:UpdateJobQueue",
+        "batch:DeleteJobQueue",
+        "batch:DescribeJobQueues",
+        "batch:RegisterJobDefinition",
+        "batch:DeregisterJobDefinition",
+        "batch:DescribeJobDefinitions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassBatchRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/*embed-batch-service*",
+        "arn:aws:iam::*:role/*embed-batch-instance*",
+        "arn:aws:iam::*:role/*embed-batch-job*",
+        "arn:aws:iam::*:role/*gpu-embed-batch-*"
+      ]
+    },
+    {
+      "Sid": "ReadBucketConfigForTerraform",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:GetBucketVersioning",
+        "s3:GetPublicAccessBlock",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::<bucket-name>"
+    }
+  ]
+}
+```
+
+### Terraform and state behavior
+
+- Interrupted applies can leave partial resources in AWS and stale/tainted state entries.
+- After interruption, reconcile state deliberately (refresh/import/remove stale entries) before retrying apply.
+- Avoid repeated `Ctrl+C` during long create operations unless clearly hung.
+
+### S3 provisioning behavior
+
+- Bucket adjunct resources (versioning, encryption, public access block, lifecycle) may complete at different speeds.
+- Lifecycle configuration can take noticeably longer than other bucket sub-resources.
+- If bucket existence checks return access errors, verify whether this is a true non-existence case vs policy/read restriction.
+
+### Practical rollout strategy
+
+- Use pre-created IAM resources in restricted environments (`use_precreated_iam_roles=true`).
+- Reference existing role/profile ARNs through environment tfvars instead of creating IAM from Terraform.
+- Start with on-demand (Spot disabled) to minimize role and policy complexity.
+- Promote to Spot only after baseline apply is stable.
+
+### Operating model for restricted IAM organizations
+
+This model is functional and should be treated as the default for orgs where IAM roles/permission sets are managed outside Terraform.
+
+Responsibility split:
+
+- Platform/IAM admin portal (manual):
+  - Create and update permission sets.
+  - Create and update IAM roles and instance profiles.
+  - Provision permission sets to target AWS accounts.
+  - Approve any SCP exceptions needed for `sso-admin` actions.
+- Project Terraform operators (automated):
+  - Manage Batch, queue, job definition, networking, and storage resources.
+  - Reference pre-created IAM ARNs in environment tfvars.
+  - Run plan/apply and day-2 infrastructure changes.
+
+Manual steps expected through GUI/admin portal:
+
+- Initial environment bootstrap (roles, trust policies, instance profile associations).
+- Permission-set changes for execution roles (including S3 read/list actions used by Terraform refresh).
+- Re-provisioning permission-set updates to target accounts.
+
+What remains fully automated after bootstrap:
+
+- Regular Terraform applies for non-IAM infrastructure.
+- Batch environment updates, queue/job-definition revisions, and storage updates within granted permissions.
+
+Pre-apply preflight checklist (recommended before every environment apply):
+
+- Confirm `use_precreated_iam_roles=true` for restricted environments.
+- Confirm tfvars role/profile ARNs exactly match live IAM ARNs (including any path segments).
+- Confirm instance profile exists and contains the expected EC2 instance role.
+- Confirm execution permission set includes:
+  - Batch control-plane actions used by this stack.
+  - `iam:PassRole` for referenced Batch roles.
+  - S3 bucket config reads (`GetEncryptionConfiguration`, `GetLifecycleConfiguration`, and related bucket reads).
+- Run `terraform plan` with the execution profile before opening change windows.
+
+Admin request template for new environment onboarding:
+
+- Request type: Terraform execution role entitlement update.
+- Environment: `<env-name>`.
+- Target account: `<account-id>`.
+- Required pre-created resources:
+  - Batch service role ARN.
+  - Batch EC2 role ARN + instance profile ARN.
+  - Batch job role ARN.
+- Required execution permissions:
+  - Batch create/update/delete/describe for compute env, queues, and job definitions.
+  - `iam:PassRole` for the above Batch roles.
+  - S3 bucket configuration read actions for the environment artifact bucket.
+- Validation criteria:
+  - `aws sts get-caller-identity` succeeds under execution profile.
+  - `terraform plan` completes without IAM or S3 access-denied errors.
+
+### Implementation pattern in this repository (workload-only mode)
+
+For `infra/aws/envs/academic-dev` and `infra/aws/envs/academic-prod`, use these settings to keep Terraform focused on workload resources only:
+
+- `use_precreated_iam_roles=true`
+- `manage_storage_resources=false`
+
+Behavior in this mode:
+
+- `module.storage` is not managed by Terraform in the environment stack.
+- Environment outputs (`bucket_name`, `bucket_arn`, `prefix_scope`) resolve from pre-created values.
+- Batch resources (compute environment, queue, job definition, security group) remain Terraform-managed.
+
+Migration checklist for an existing state:
+
+1. Confirm pre-created bucket and prefix values are set in env tfvars.
+2. Run a one-time state cleanup (admin-operated) to remove storage resources from this env state.
+3. Re-run `terraform plan` using execution profile and confirm no S3 config read failures.
+
+Example state cleanup commands (run from env directory, once):
+
+```bash
+terraform state rm module.storage.aws_s3_bucket.artifacts
+terraform state rm module.storage.aws_s3_bucket_versioning.artifacts
+terraform state rm module.storage.aws_s3_bucket_public_access_block.artifacts
+terraform state rm module.storage.aws_s3_bucket_server_side_encryption_configuration.artifacts
+terraform state rm module.storage.aws_s3_bucket_lifecycle_configuration.artifacts
+```
+
+### Operational commands
+
+Operational AWS command flows are intentionally separated from this planning runbook.
+
+Use:
+
+- `docs/runbooks/aws_interaction_guide.md`
+
+### Security and documentation hygiene
+
+- Keep environment-specific identifiers in local tfvars and out of committed docs.
+- Do not document account numbers, SSO URLs, or internal portal links in runbooks.
+- Use generic role/policy naming conventions and repository-relative guidance.
+
 ---
 
 ## Price-to-performance strategy
