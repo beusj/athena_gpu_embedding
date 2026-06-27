@@ -1,5 +1,25 @@
 # gpu-embedder
 
+> [!IMPORTANT]
+> **Deprecated — consolidated into `llm_concept_mapping` (`concept-mapper`).**
+> The GPU SapBERT bulk-embed capability now lives in `concept-mapper` as an
+> optional backend behind its shared `Embedder` interface, so there is one repo,
+> one CLI, and one copy of the SapBERT inference + `model_version` logic.
+>
+> Migrate to the two-step bridge (no machine needs both a GPU and Snowflake):
+>
+> ```bash
+> # GPU host (install the gpu extra): CONCEPT.csv -> portable DuckDB artifact
+> uv run --extra gpu concept-mapper embeddings build-gpu \
+>     --vocab-csv CONCEPT.csv --out vectors.duckdb
+> # Snowflake host: load the artifact into concept_embeddings (idempotent)
+> uv run concept-mapper embeddings load --from vectors.duckdb
+> ```
+>
+> GPU vectors are namespaced `sapbert-torch-fp32-<digest>`, distinct from the
+> in-Snowflake ONNX build. See `concept-mapper`'s README, section
+> "GPU bulk-embed off Snowflake, then load". This repo is no longer developed.
+
 Batch-embed OHDSI Athena concept CSVs with SapBERT (FP32, GPU) and persist the
 vectors to DuckDB. Already-embedded concepts are skipped unless `--force` is
 passed, so runs are safe to restart or extend incrementally.
