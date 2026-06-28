@@ -504,6 +504,235 @@ def cpt4_cmd(
 
 
 # ---------------------------------------------------------------------------
+# export subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("export")
+def export_cmd(
+    output_dir: Annotated[
+        Path,
+        typer.Argument(help="Destination root directory for parquet export"),
+    ],
+    db: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_DB", help="DuckDB file to export from"),
+    ] = None,
+    model_version_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--model-version",
+            help=(
+                "Export only rows for model versions starting with this prefix "
+                "(default: most recent)"
+            ),
+        ),
+    ] = None,
+    vocabulary_id: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--vocabulary-id",
+            help="Limit export to these vocabulary IDs (repeatable or comma-delimited)",
+        ),
+    ] = None,
+    shard_rows: Annotated[
+        int,
+        typer.Option(
+            "--shard-rows",
+            min=1,
+            help="Maximum rows per parquet file shard",
+        ),
+    ] = 50_000,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing parquet shard files if present",
+        ),
+    ] = False,
+    compression: Annotated[
+        str,
+        typer.Option(
+            "--compression",
+            help="Parquet compression codec (for example zstd or snappy)",
+        ),
+    ] = "zstd",
+) -> None:
+    """Export embeddings from DuckDB to sharded parquet files by vocabulary directory."""
+    from gpu_embedder import store as st
+    from gpu_embedder.report import list_model_versions
+
+    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+    if not cfg.db.exists():
+        typer.echo(f"ERROR: database not found: {cfg.db}", err=True)
+        raise typer.Exit(1)
+
+    allowed_compressions = {"zstd", "snappy", "gzip", "brotli", "lz4", "uncompressed"}
+    normalized_compression = compression.lower()
+    if normalized_compression not in allowed_compressions:
+        typer.echo(
+            "ERROR: unsupported compression codec. "
+            f"Choose one of: {', '.join(sorted(allowed_compressions))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    versions = list_model_versions(conn)
+    if not versions:
+        typer.echo("No embeddings found in the database.")
+        raise typer.Exit(0)
+
+    selected_model_version: str
+    if model_version_prefix:
+        matched = [v for v in versions if v.model_version.startswith(model_version_prefix)]
+        if not matched:
+            typer.echo(
+                f"No model version starting with '{model_version_prefix}' found.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        selected_model_version = matched[0].model_version
+    else:
+        selected_model_version = versions[0].model_version
+
+    normalized_vocabulary_ids = _split_multi_values(vocabulary_id)
+
+    vocab_sql = """
+        SELECT DISTINCT vocabulary_id
+        FROM concept_embeddings
+        WHERE model_version = ?
+        ORDER BY vocabulary_id NULLS LAST
+    """
+    vocab_rows = conn.execute(vocab_sql, [selected_model_version]).fetchall()
+    available_vocabularies = [row[0] for row in vocab_rows]
+
+    if normalized_vocabulary_ids:
+        requested_vocab_set = set(normalized_vocabulary_ids)
+        available_vocab_set = {v for v in available_vocabularies if v is not None}
+        missing = sorted(requested_vocab_set - available_vocab_set)
+        if missing:
+            typer.echo(
+                "Requested vocabulary_id values not found for this model version: "
+                + ", ".join(missing),
+                err=True,
+            )
+            raise typer.Exit(1)
+        vocabularies_to_export: list[str | None] = [
+            v for v in available_vocabularies if v is not None and v in requested_vocab_set
+        ]
+    else:
+        vocabularies_to_export = available_vocabularies
+
+    if not vocabularies_to_export:
+        typer.echo("No rows match the requested export filters.")
+        raise typer.Exit(0)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    typer.echo(f"Export root: {output_dir}")
+    typer.echo(f"model_version={selected_model_version[:16]}…")
+    typer.echo(
+        f"Sharding by up to {shard_rows:,} row(s) per file with {normalized_compression} "
+        "compression."
+    )
+
+    total_rows_exported = 0
+    total_files_written = 0
+    total_files_skipped = 0
+
+    count_sql = """
+        SELECT COUNT(*)
+        FROM concept_embeddings
+        WHERE model_version = ?
+          AND ((? IS NULL AND vocabulary_id IS NULL) OR vocabulary_id = ?)
+    """
+
+    for vocab in vocabularies_to_export:
+        vocab_value = vocab
+        vocab_label = vocab_value if vocab_value is not None else "_null"
+        vocab_dir = output_dir / vocab_label
+        vocab_dir.mkdir(parents=True, exist_ok=True)
+
+        count_row = conn.execute(
+            count_sql,
+            [selected_model_version, vocab_value, vocab_value],
+        ).fetchone()
+        vocab_count = int(count_row[0]) if count_row else 0
+        if vocab_count == 0:
+            continue
+
+        file_count = (vocab_count + shard_rows - 1) // shard_rows
+        typer.echo(
+            f"Exporting vocabulary_id={vocab_value or '(null)'}: "
+            f"{vocab_count:,} row(s) -> {file_count} file(s)"
+        )
+
+        for shard_index in range(file_count):
+            start_rn = shard_index * shard_rows + 1
+            end_rn = min((shard_index + 1) * shard_rows, vocab_count)
+            shard_path = vocab_dir / f"part-{shard_index:05d}.parquet"
+
+            if shard_path.exists() and not overwrite:
+                total_files_skipped += 1
+                continue
+
+            escaped_output_path = shard_path.as_posix().replace("'", "''")
+            export_sql = f"""
+                COPY (
+                    SELECT
+                        concept_id,
+                        concept_name,
+                        domain_id,
+                        vocabulary_id,
+                        concept_class_id,
+                        standard_concept,
+                        concept_code,
+                        invalid_reason,
+                        embedding,
+                        embed_text,
+                        model_version,
+                        embedded_at
+                    FROM (
+                        SELECT
+                            concept_id,
+                            concept_name,
+                            domain_id,
+                            vocabulary_id,
+                            concept_class_id,
+                            standard_concept,
+                            concept_code,
+                            invalid_reason,
+                            embedding,
+                            embed_text,
+                            model_version,
+                            embedded_at,
+                            row_number() OVER (ORDER BY concept_id) AS rn
+                        FROM concept_embeddings
+                        WHERE model_version = ?
+                          AND ((? IS NULL AND vocabulary_id IS NULL) OR vocabulary_id = ?)
+                    ) ranked
+                    WHERE rn BETWEEN ? AND ?
+                ) TO '{escaped_output_path}'
+                (FORMAT PARQUET, COMPRESSION {normalized_compression})
+            """
+            conn.execute(
+                export_sql,
+                [selected_model_version, vocab_value, vocab_value, start_rn, end_rn],
+            )
+            total_files_written += 1
+            total_rows_exported += end_rn - start_rn + 1
+
+    typer.echo(
+        "Export complete. "
+        f"Wrote {total_rows_exported:,} row(s) across {total_files_written} file(s)."
+    )
+    if total_files_skipped:
+        typer.echo(f"Skipped {total_files_skipped} existing file(s) (use --overwrite to replace).")
+
+
+# ---------------------------------------------------------------------------
 # status subcommand
 # ---------------------------------------------------------------------------
 

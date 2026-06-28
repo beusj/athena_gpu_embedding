@@ -137,6 +137,20 @@ class TestUpsertAndExistence:
         ensure_schema(conn)
         upsert_rows(conn, [])  # should be a no-op
 
+    def test_upsert_ndjson_preserves_numeric_like_concept_code_as_text(self) -> None:
+        conn = _mem_conn()
+        ensure_schema(conn)
+        row = _make_row(concept_id=42)
+        row.concept.concept_code = "2764601000001104"
+
+        upsert_rows(conn, [row], mode="ndjson")
+
+        result = conn.execute(
+            "SELECT concept_code FROM concept_embeddings WHERE concept_id = 42"
+        ).fetchone()
+        assert result is not None
+        assert result[0] == "2764601000001104"
+
 
 # ---------------------------------------------------------------------------
 # count_rows

@@ -40,7 +40,7 @@ gpu_embedding/
 │   └── ...                 # other Athena vocab files
 ├── src/
 │   └── gpu_embedder/
-│       ├── cli.py          # Typer app: `embed` + `cpt4` subcommands
+│       ├── cli.py          # Typer app: `embed`, `export`, `status`, `coverage`, `cpt4`
 │       ├── config.py       # Settings (Pydantic BaseSettings + env)
 │       ├── models.py       # Pydantic row models + DuckDB schema DDL
 │       ├── ingest.py       # DuckDB-backed CSV scan + filter → ConceptRow records
@@ -153,10 +153,11 @@ The `cpt4` subcommand will:
 
 ## CLI usage
 
-The tool has four subcommands:
+The tool has five subcommands:
 
 ```
 gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
+gpu-embed export    [OPTIONS] OUTPUT_DIR      — export DB rows to sharded parquet
 gpu-embed status    [OPTIONS]                — show what is stored in the DB
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
 gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
@@ -227,6 +228,28 @@ breakdown of embedded concept counts. No source CSV is required.
 |------|---------|-------------|
 | `--db` | `embeddings.duckdb` | DuckDB file to inspect |
 | `--model-version` | _(most recent)_ | Show breakdown for the version starting with this prefix |
+
+### `export` — write sharded parquet by vocabulary directory
+
+```
+gpu-embed export [OPTIONS] OUTPUT_DIR
+```
+
+Exports rows from `concept_embeddings` into parquet files under:
+
+`OUTPUT_DIR/<vocabulary_id>/part-00000.parquet`
+
+Sharding is controlled by `--shard-rows` (rows per file).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `OUTPUT_DIR` | _(required)_ | Destination directory for parquet output |
+| `--db` | `embeddings.duckdb` | DuckDB file to export from |
+| `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
+| `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
+| `--shard-rows` | `50000` | Max rows per parquet shard |
+| `--compression` | `zstd` | Parquet codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `uncompressed` |
+| `--overwrite` | false | Replace existing shard files if present |
 
 ### `coverage` — identify unembedded concepts
 
@@ -302,6 +325,15 @@ gpu-embed embed /data/vocab/CONCEPT.csv \
 # Show what model versions are stored and concept counts by vocabulary/domain
 gpu-embed status
 
+# Export most recent model version into sharded parquet by vocabulary directory
+gpu-embed export exports/parquet --shard-rows 50000
+
+# Export only SNOMED and LOINC for a specific model version prefix
+gpu-embed export exports/parquet \
+  --model-version abc12345 \
+  --vocabulary-id SNOMED,LOINC \
+  --shard-rows 50000
+
 # Show only the breakdown for a specific model version (prefix match)
 gpu-embed status --model-version abc12345
 
@@ -316,6 +348,42 @@ gpu-embed coverage /data/vocab/CONCEPT.csv --db /data/embeddings/omop.duckdb
 
 # Write coverage results to CSV for follow-up workflows
 gpu-embed coverage --csv coverage_report.csv
+```
+
+---
+
+## Copy parquet export to S3
+
+After export, copy the full output tree to S3 recursively so vocabulary
+directories are preserved.
+
+```bash
+# 1) Export from DuckDB
+uv run gpu-embed export exports/parquet --db embeddings.duckdb --shard-rows 50000
+
+# 2) Copy to S3 (preserves vocabulary subdirectories)
+AWS_PAGER="" aws s3 cp \
+  --profile emory-embedding \
+  --recursive exports/parquet \
+  s3://<your-bucket>/concept_embeddings/
+```
+
+For repeat runs, `sync` only transfers new or changed shards:
+
+```bash
+AWS_PAGER="" aws s3 sync \
+  --profile emory-embedding \
+  exports/parquet \
+  s3://<your-bucket>/concept_embeddings/
+```
+
+Resulting layout example:
+
+```
+s3://<your-bucket>/concept_embeddings/
+  SNOMED/part-00000.parquet
+  SNOMED/part-00001.parquet
+  LOINC/part-00000.parquet
 ```
 
 ---

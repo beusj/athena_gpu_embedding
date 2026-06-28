@@ -19,6 +19,24 @@ from gpu_embedder.models import SCHEMA_DDL, EmbeddedRow
 logger = logging.getLogger(__name__)
 
 
+NDJSON_COLUMNS_SQL = """
+{
+    concept_id: 'BIGINT',
+    concept_name: 'VARCHAR',
+    domain_id: 'VARCHAR',
+    vocabulary_id: 'VARCHAR',
+    concept_class_id: 'VARCHAR',
+    standard_concept: 'VARCHAR',
+    concept_code: 'VARCHAR',
+    invalid_reason: 'VARCHAR',
+    embedding: 'DOUBLE[]',
+    embed_text: 'VARCHAR',
+    model_version: 'VARCHAR',
+    embedded_at: 'VARCHAR'
+}
+"""
+
+
 def open_db(path: Path) -> duckdb.DuckDBPyConnection:
     """Open (or create) the DuckDB database at *path*."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,22 +172,22 @@ def _upsert_rows_ndjson(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]
         try:
             conn.execute("DROP TABLE IF EXISTS temp_embeddings")
             conn.execute(
-                """
+                f"""
                 CREATE TEMP TABLE temp_embeddings AS
                 SELECT
-                    concept_id::BIGINT AS concept_id,
-                    concept_name::VARCHAR AS concept_name,
-                    domain_id::VARCHAR AS domain_id,
-                    vocabulary_id::VARCHAR AS vocabulary_id,
-                    concept_class_id::VARCHAR AS concept_class_id,
-                    standard_concept::VARCHAR AS standard_concept,
-                    concept_code::VARCHAR AS concept_code,
-                    invalid_reason::VARCHAR AS invalid_reason,
+                    concept_id,
+                    concept_name,
+                    domain_id,
+                    vocabulary_id,
+                    concept_class_id,
+                    standard_concept,
+                    concept_code,
+                    invalid_reason,
                     embedding::FLOAT[768] AS embedding,
-                    embed_text::VARCHAR AS embed_text,
-                    model_version::VARCHAR AS model_version,
+                    embed_text,
+                    model_version,
                     CAST(embedded_at AS TIMESTAMP) AS embedded_at
-                FROM read_ndjson_auto(?)
+                FROM read_ndjson(?, columns = {NDJSON_COLUMNS_SQL})
                 """,
                 [str(ndjson_path)],
             )

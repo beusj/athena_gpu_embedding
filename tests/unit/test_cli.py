@@ -325,3 +325,130 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
 
     assert result.exit_code == 0
     assert captured["vocabulary_ids"] == ["LOINC", "SNOMED", "RxNorm"]
+
+
+def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    out_dir = tmp_path / "parquet"
+
+    conn = duckdb.connect(str(db_path))
+    conn.execute(SCHEMA_DDL)
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        EmbeddedRow(
+            concept=ConceptRow(
+                concept_id=1,
+                concept_name="SNOMED A",
+                domain_id="Condition",
+                vocabulary_id="SNOMED",
+            ),
+            embedding=[0.1] * 768,
+            embed_text="SNOMED A",
+            model_version="v1",
+            embedded_at=now,
+        ),
+        EmbeddedRow(
+            concept=ConceptRow(
+                concept_id=2,
+                concept_name="SNOMED B",
+                domain_id="Condition",
+                vocabulary_id="SNOMED",
+            ),
+            embedding=[0.2] * 768,
+            embed_text="SNOMED B",
+            model_version="v1",
+            embedded_at=now,
+        ),
+        EmbeddedRow(
+            concept=ConceptRow(
+                concept_id=3,
+                concept_name="SNOMED C",
+                domain_id="Condition",
+                vocabulary_id="SNOMED",
+            ),
+            embedding=[0.3] * 768,
+            embed_text="SNOMED C",
+            model_version="v1",
+            embedded_at=now,
+        ),
+        EmbeddedRow(
+            concept=ConceptRow(
+                concept_id=4,
+                concept_name="LOINC A",
+                domain_id="Measurement",
+                vocabulary_id="LOINC",
+            ),
+            embedding=[0.4] * 768,
+            embed_text="LOINC A",
+            model_version="v1",
+            embedded_at=now,
+        ),
+    ]
+
+    conn.executemany(
+        """
+        INSERT INTO concept_embeddings (
+            concept_id, concept_name, domain_id, vocabulary_id,
+            concept_class_id, standard_concept, concept_code,
+            invalid_reason, embedding, embed_text, model_version, embedded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row.concept.concept_id,
+                row.concept.concept_name,
+                row.concept.domain_id,
+                row.concept.vocabulary_id,
+                row.concept.concept_class_id,
+                row.concept.standard_concept,
+                row.concept.concept_code,
+                row.concept.invalid_reason,
+                row.embedding,
+                row.embed_text,
+                row.model_version,
+                row.embedded_at,
+            )
+            for row in rows
+        ],
+    )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            str(out_dir),
+            "--db",
+            str(db_path),
+            "--model-version",
+            "v1",
+            "--shard-rows",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0
+
+    snomed_files = sorted((out_dir / "SNOMED").glob("*.parquet"))
+    loinc_files = sorted((out_dir / "LOINC").glob("*.parquet"))
+
+    assert len(snomed_files) == 2
+    assert len(loinc_files) == 1
+
+    verify_conn = duckdb.connect()
+    snomed_count = verify_conn.execute(
+        "SELECT COUNT(*) FROM read_parquet(?)",
+        [str(out_dir / "SNOMED" / "*.parquet")],
+    ).fetchone()
+    loinc_count = verify_conn.execute(
+        "SELECT COUNT(*) FROM read_parquet(?)",
+        [str(out_dir / "LOINC" / "*.parquet")],
+    ).fetchone()
+    verify_conn.close()
+
+    assert snomed_count is not None
+    assert loinc_count is not None
+    assert snomed_count[0] == 3
+    assert loinc_count[0] == 1
