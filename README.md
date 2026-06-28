@@ -6,6 +6,13 @@ passed, so runs are safe to restart or extend incrementally.
 
 ---
 
+## Runbooks
+
+- `docs/runbooks/aws_interaction_guide.md` — AWS Batch and infrastructure interaction guide
+- `docs/runbooks/s3_to_snowflake_load.md` — export parquet, copy to S3, and load to Snowflake
+
+---
+
 ## What it does
 
 1. **Reads** `CONCEPT.csv` from the `athena_vocab/` directory (configurable via
@@ -352,38 +359,19 @@ gpu-embed coverage --csv coverage_report.csv
 
 ---
 
-## Copy parquet export to S3
+## Deployment runbook
 
-After export, copy the full output tree to S3 recursively so vocabulary
-directories are preserved.
+Operational steps for export → AWS auth → S3 copy/sync → Snowflake `COPY INTO`
+and idempotent `MERGE` are documented in:
+
+- `docs/runbooks/s3_to_snowflake_load.md`
+
+Quick start:
 
 ```bash
-# 1) Export from DuckDB
 uv run gpu-embed export exports/parquet --db embeddings.duckdb --shard-rows 50000
-
-# 2) Copy to S3 (preserves vocabulary subdirectories)
-AWS_PAGER="" aws s3 cp \
-  --profile emory-embedding \
-  --recursive exports/parquet \
-  s3://<your-bucket>/concept_embeddings/
-```
-
-For repeat runs, `sync` only transfers new or changed shards:
-
-```bash
-AWS_PAGER="" aws s3 sync \
-  --profile emory-embedding \
-  exports/parquet \
-  s3://<your-bucket>/concept_embeddings/
-```
-
-Resulting layout example:
-
-```
-s3://<your-bucket>/concept_embeddings/
-  SNOMED/part-00000.parquet
-  SNOMED/part-00001.parquet
-  LOINC/part-00000.parquet
+AWS_PAGER="" aws s3 sync exports/parquet s3://<your-bucket>/concept_embeddings/
+# Optional named profile: add --profile <aws-profile> or set AWS_PROFILE
 ```
 
 ---

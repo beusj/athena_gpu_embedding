@@ -15,19 +15,37 @@ Planning and architecture context remains in:
 
 - `docs/runbooks/aws_embedding_execution_plan.md`
 
+Data export and warehouse loading steps remain in:
+
+- `docs/runbooks/s3_to_snowflake_load.md`
+
 ## Prerequisites
 
 - Environment configured for workload-only mode:
   - `use_precreated_iam_roles=true`
   - `manage_storage_resources=false`
-- AWS CLI profile available (examples below use `emory-embedding`)
+- AWS CLI configured with usable credentials (default profile or named profile)
 - Run commands from `infra/aws/envs/academic-dev` unless noted otherwise
 
 ## 1) Authenticate and select profile
 
+Credential precedence (highest to lowest): explicit command flags,
+environment variables, then default profile/config files.
+
+- `--profile <name>` on a command
+- `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
+- Default profile in `~/.aws/config` and `~/.aws/credentials`
+
 ```bash
-aws sso login --profile emory-embedding
-export AWS_PROFILE=emory-embedding
+# Default profile flow
+aws sso login
+```
+
+If you use a named profile, either set it once for the shell session or append
+`--profile <aws-profile>` to each AWS CLI command:
+
+```bash
+export AWS_PROFILE=<aws-profile>
 ```
 
 ## 2) Ensure infrastructure is current
