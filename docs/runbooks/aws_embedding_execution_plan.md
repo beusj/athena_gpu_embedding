@@ -126,10 +126,10 @@ Note on CPT-4:
 - If CPT-4 name population has already been done, only the resulting `CONCEPT.csv` content is needed for embedding.
 - If CPT-4 enrichment has not been run yet, do that upstream first; do not couple Java/UMLS enrichment into AWS embedding workers.
 
-Note on partial `embeddings.duckdb`:
+Note on partial local store (`embeddings.lance` / `embeddings.duckdb`):
 
-- Prefer artifact-first shard outputs + manifest/checkpoint over sharing a mutable DuckDB file across workers.
-- If carrying forward a local partial state is necessary, upload it to an S3 checkpoint prefix as a snapshot input to a single merge/import step, not as a concurrently written shared DB.
+- Prefer artifact-first shard outputs + manifest/checkpoint over sharing a mutable store file across workers.
+- If carrying forward a local partial state is necessary, upload it to an S3 checkpoint prefix as a snapshot input to a single merge/import step, not as a concurrently written shared store.
 
 ## Implementation lessons learned (sanitized)
 
@@ -418,7 +418,7 @@ Example:
 - `s3://<bucket>/gpu-embed/<env>/outputs/<run_id>/shards/part-00000.ndjson.gz`
 - `s3://<bucket>/gpu-embed/<env>/outputs/<run_id>/manifests/completion.json`
 - `s3://<bucket>/gpu-embed/<env>/outputs/<run_id>/metrics/summary.json`
-- `s3://<bucket>/gpu-embed/<env>/checkpoints/<run_id>/embeddings.duckdb` (optional snapshot only)
+- `s3://<bucket>/gpu-embed/<env>/checkpoints/<run_id>/embeddings.lance` (optional snapshot only)
 - `s3://<bucket>/gpu-embed/<env>/logs/<run_id>/worker-<job_id>.log`
 
 Naming guidance:
