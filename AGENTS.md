@@ -261,12 +261,16 @@ from `cli.py`.
   enforcement, stale-view bugs, and startup cost proportional to total table
   size. See `docs/adr_parquet_store_rejected.md` for the full post-mortem.
   Parquet is for `gpu-embed export` (Snowflake handoff) only.
-- **Live write backends:** `.duckdb` (default; fast, but an exclusive file lock
-  means no cross-process concurrency) and `.lance` (opt-in via a `.lance` store
-  path + `--extra lance`; ACID, cross-process readers, O(changes) `merge_insert`
-  upserts). Lance is the adopted answer to the ACID + concurrency requirement —
-  see `docs/adr_lance_store_proposal.md`. Both keep `gpu-embed export` → plain
-  parquet as the unchanged Snowflake contract.
+- **Live write backends:** `.lance` (**default**; ACID, cross-process readers,
+  O(changes) `merge_insert` upserts — the adopted answer to the ACID +
+  concurrency requirement, see `docs/adr_lance_store_proposal.md`) and `.duckdb`
+  (native single-writer table; fast, but an exclusive file lock means no
+  cross-process concurrency). `pylance` is a base dependency. The lance backend's
+  fingerprint and weight-hash caches persist in a `<store>.lance/_meta/meta.duckdb`
+  sidecar (its main query connection is in-memory) — route them through
+  `store._meta_conn`, which returns the main connection for `.duckdb` and `None`
+  for parquet (still a no-op there). Both keep `gpu-embed export` → plain parquet
+  as the unchanged Snowflake contract.
 
 ---
 
@@ -291,7 +295,7 @@ other dir → parquet), not a separate `--backend` flag. To add another backend:
    `upsert_rows`, `count_rows`, `delete_embeddings`, and the registry/meta
    functions. File backends expose `concept_embeddings` as a DuckDB view so all
    readers and `export` work unchanged.
-2. Keep it opt-in (a new path suffix) so the default `.duckdb` behaviour is
+2. Keep it opt-in (a new path suffix) so the default `.lance` behaviour is
    untouched; gate any heavy dependency behind an optional extra + lazy import.
 3. Do not modify `embed.py` or `ingest.py`.
 

@@ -33,7 +33,11 @@ class EmbedConfig(BaseSettings):
     # Paths
     vocab_dir: Path = Path("athena_vocab")
     source_parquet: Path | None = None
-    db: Path = Path("embeddings.duckdb")
+    # Default store backend is Lance: ACID snapshots, cross-process readers, and
+    # O(changes) merge_insert upserts for scattered re-embeds. A ``.duckdb`` path
+    # still selects the native DuckDB table backend (see store._resolve_paths);
+    # migrate an existing one with ``gpu-embed migrate-lance``.
+    db: Path = Path("embeddings.lance")
     log_dir: Path = Path("logs")
     log_max_bytes: int = 2 * 1024 * 1024
     log_max_files: int = 5

@@ -207,7 +207,7 @@ def embed_cmd(
         Path | None,
         typer.Option(
             envvar="GPU_EMBED_DB",
-            help="Embedding store path: .duckdb (default), .lance, or a parquet directory",
+            help="Embedding store path: .lance (default), .duckdb, or a parquet directory",
         ),
     ] = None,
     model: Annotated[

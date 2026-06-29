@@ -4,36 +4,44 @@
 **Status:** **Accepted** (2026-06-29) — Lance is adopted as the live store for
 the ACID + cross-process-concurrency requirement; **delta-rs is rejected** (its
 `MERGE` amplifies on scattered re-embeds, and its append mode offers no native
-upsert/dedup, only the parquet backend's discipline plus an ACID log). DuckDB
-remains the default backend; Lance is opt-in via a `.lance` store path.
-Supersedes the delta-rs lean in `adr_parquet_store_rejected.md` (2026-06
-addendum). A flag-gated prototype now exists (see "Implementation" below).
+upsert/dedup, only the parquet backend's discipline plus an ACID log).
+**Lance is now the default backend** (`embeddings.lance`); the native DuckDB
+table remains fully supported via a `.duckdb` store path. Supersedes the
+delta-rs lean in `adr_parquet_store_rejected.md` (2026-06 addendum). See
+"Implementation" below.
 
 ---
 
-## Implementation (prototype, 2026-06-29)
+## Implementation (2026-06-29)
 
-Behind the existing `store.open_db` path dispatch — a `.lance` store path selects
-the Lance backend, so nothing changes unless that path is chosen:
+Backend selection is by `store.open_db` path suffix; `.lance` is the default
+(`config.EmbedConfig.db = embeddings.lance`):
 
 - **Backend in `store.py`:** `merge_insert` upsert (O(changes)), DuckDB-as-query
   layer (`concept_embeddings` is a view over the registered Lance dataset, so all
   readers/`export` are unchanged), `delete` by predicate, and the model registry
-  reused from the parquet `_meta/model_registry` layout. csv-fingerprint and
-  model-version caches are no-ops (as for parquet — re-hash/re-read rather than
-  risk a stale hit).
-- **CLI:** `gpu-embed migrate-lance` (streaming, re-runnable `duckdb → lance`),
-  `gpu-embed compact` (`compact_files` + `cleanup_old_versions`), and `export`
-  works unchanged (`lance → parquet` via the view).
-- **Dependency:** optional `pylance` extra (`uv sync --extra lance`); imported
-  lazily so the default backends do not require it. Tests in
-  `tests/unit/test_store_lance.py` cover upsert/merge, classify, delete,
-  registry, compaction, migration, and `lance → parquet` export.
+  reused from the parquet `_meta/model_registry` layout.
+- **Metadata sidecar (hardened default):** the csv-fingerprint and weight-hash
+  caches persist in a `<store>.lance/_meta/meta.duckdb` DuckDB sidecar, reusing
+  the duckdb-backend DDL/SQL verbatim. The lance store's own query connection is
+  `:memory:`, so without the sidecar these caches would vanish each run — making
+  the default `embed` path re-hash the ~440 MB weights and re-read the source
+  CSVs every time. `store._meta_conn` routes them (main connection for `.duckdb`,
+  sidecar for `.lance`, `None`/no-op for parquet). This is what lets Lance be the
+  default without a per-run regression.
+- **CLI:** `gpu-embed migrate-lance` (streaming, re-runnable `duckdb → lance`;
+  the cutover for existing DuckDB data), `gpu-embed compact` (`compact_files` +
+  `cleanup_old_versions`), and `export` works unchanged (`lance → parquet`).
+- **Dependency:** `pylance` is a base dependency now that lance is the default;
+  still imported lazily so the module loads if it is somehow absent. Tests in
+  `tests/unit/test_store_lance.py` cover upsert/merge, classify, delete, registry,
+  sidecar fingerprint/version-cache persistence (incl. across reopen), compaction,
+  migration, and `lance → parquet` export.
 - **Layout:** a `.lance` store is a container dir — dataset at
-  `<store>.lance/concept_embeddings.lance/`, registry at `<store>.lance/_meta/`
-  — so Lance maintenance never touches the metadata and vice versa. Migration
-  casts to the canonical Arrow schema so a post-migration `embed` merges without
-  a schema clash.
+  `<store>.lance/concept_embeddings.lance/`, registry + meta sidecar under
+  `<store>.lance/_meta/` — so Lance maintenance never touches the metadata and
+  vice versa. Migration casts to the canonical Arrow schema so a post-migration
+  `embed` merges without a schema clash.
 
 Open validation items remain in "Caveats" (compaction memory at 12M; a concrete
 retention policy; export-to-parquet throughput at scale).

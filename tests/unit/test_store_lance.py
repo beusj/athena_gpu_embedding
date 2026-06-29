@@ -17,7 +17,9 @@ pytest.importorskip("lance")
 from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow  # noqa: E402
 from gpu_embedder.store import (  # noqa: E402
     LANCE_DATASET_SUBDIR,
+    LANCE_META_DB_SUBDIR,
     classify_rows_requiring_embedding,
+    close_store,
     compact,
     count_embeddings,
     count_rows,
@@ -235,7 +237,7 @@ class TestDelete:
 
 
 # ---------------------------------------------------------------------------
-# model registry + no-op meta tables
+# model registry + sidecar meta tables
 # ---------------------------------------------------------------------------
 
 
@@ -270,29 +272,83 @@ class TestRegistryAndMeta:
         upsert_model_registry(
             conn, model_version="v2", model_id="m2", model_revision=None
         )
+        # Cache a weight digest for v1 too; delete_model_metadata must clear it
+        # from the sidecar so a later embed re-hashes instead of reusing v1.
+        upsert_model_version_cache(conn, "m1", None, "cls", "v1")
         delete_model_metadata(conn, "v1")
         assert {e.model_version for e in list_model_registry(conn)} == {"v2"}
+        assert get_cached_model_version(conn, "m1", None, "cls") is None
         conn.close()
 
-    def test_fingerprint_and_version_cache_are_noops(self, tmp_path: Path) -> None:
-        # Lance, like parquet, has no fingerprint/version-cache tables; these are
-        # safe no-ops (force re-hash / re-read rather than returning stale data).
+    def test_sidecar_meta_db_created_lazily(self, tmp_path: Path) -> None:
+        # The sidecar is NOT opened by ensure_schema: only writers touch it, and
+        # opening it read-write eagerly would block concurrent readers (export,
+        # status) while an embed holds the lock. It appears on first meta access.
+        conn = _open(tmp_path)
+        sidecar = tmp_path / "embeddings.lance" / LANCE_META_DB_SUBDIR
+        assert not sidecar.exists()
+        upsert_model_version_cache(conn, "m", None, "cls", "sha")
+        assert sidecar.exists()
+        conn.close()
+
+    def test_csv_fingerprint_roundtrip_in_sidecar(self, tmp_path: Path) -> None:
+        # Unlike parquet, lance persists fingerprints (in its sidecar) so embed
+        # can skip unchanged CSVs on the default backend.
         conn = _open(tmp_path)
         upsert_csv_fingerprint(
             conn,
             csv_path="/x.csv",
             model_version="v1",
             filter_hash="h",
-            size_bytes=1,
-            mtime_ns=1,
-            sha256="s",
-            row_count=1,
+            size_bytes=10,
+            mtime_ns=20,
+            sha256="abc",
+            row_count=5,
         )
+        stored = get_csv_fingerprint(conn, "/x.csv", "v1", "h")
+        assert stored is not None
+        assert stored["size_bytes"] == 10
+        assert stored["mtime_ns"] == 20
+        assert stored["sha256"] == "abc"
+        assert stored["row_count"] == 5
+        # A different model_version is a miss (key includes it).
+        assert get_csv_fingerprint(conn, "/x.csv", "v2", "h") is None
+        # Deletion removes it and reports the count.
+        assert delete_csv_fingerprints(conn, "v1") == 1
         assert get_csv_fingerprint(conn, "/x.csv", "v1", "h") is None
-        assert delete_csv_fingerprints(conn, "v1") == 0
-        upsert_model_version_cache(conn, "m", None, "cls", "sha")
-        assert get_cached_model_version(conn, "m", None, "cls") is None
         conn.close()
+
+    def test_model_version_cache_roundtrip_in_sidecar(self, tmp_path: Path) -> None:
+        conn = _open(tmp_path)
+        upsert_model_version_cache(conn, "m", None, "cls", "sha-cls")
+        assert get_cached_model_version(conn, "m", None, "cls") == "sha-cls"
+        # pooling is part of the key: a cls hit must never be reused for mean.
+        assert get_cached_model_version(conn, "m", None, "mean") is None
+        conn.close()
+
+    def test_meta_survives_reopen(self, tmp_path: Path) -> None:
+        # The crux of the hardened default: fingerprints and weight digests must
+        # survive across runs (separate connections to the same .lance store),
+        # else every default run re-hashes the weights and re-reads the CSVs.
+        conn = _open(tmp_path)
+        upsert_csv_fingerprint(
+            conn,
+            csv_path="/x.csv",
+            model_version="v1",
+            filter_hash="h",
+            size_bytes=10,
+            mtime_ns=20,
+            sha256="abc",
+            row_count=5,
+        )
+        upsert_model_version_cache(conn, "m", None, "cls", "sha-cls")
+        close_store(conn)  # release the sidecar's file lock before reopening
+
+        reopened = _open(tmp_path)
+        stored = get_csv_fingerprint(reopened, "/x.csv", "v1", "h")
+        assert stored is not None and stored["sha256"] == "abc"
+        assert get_cached_model_version(reopened, "m", None, "cls") == "sha-cls"
+        close_store(reopened)
 
 
 # ---------------------------------------------------------------------------

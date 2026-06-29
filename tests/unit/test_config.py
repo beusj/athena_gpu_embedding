@@ -15,7 +15,7 @@ class TestEmbedConfigDefaults:
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.vocab_dir == Path("athena_vocab")
         assert cfg.source_parquet is None
-        assert cfg.db == Path("embeddings.duckdb")
+        assert cfg.db == Path("embeddings.lance")
         assert cfg.log_dir == Path("logs")
         assert cfg.log_max_bytes == 2 * 1024 * 1024
         assert cfg.log_max_files == 5

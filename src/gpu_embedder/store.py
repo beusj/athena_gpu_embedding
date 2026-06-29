@@ -3,10 +3,12 @@
 The DuckDB connection is opened once per CLI invocation and passed down.
 Backend selection is by path suffix:
 
-- ``*.duckdb``  → native DuckDB table (the default live write store).
 - ``*.lance``   → a Lance dataset (ACID + cross-process readers, O(changes)
-  ``merge_insert`` upserts via deletion vectors). Opt-in: nothing uses it unless
-  ``--db`` points at a ``.lance`` path. Requires the optional ``pylance`` extra.
+  ``merge_insert`` upserts via deletion vectors). The **default** backend. Its
+  embeddings live in the dataset; its metadata tables (fingerprints, weight-hash
+  cache) live in a sidecar ``_meta/meta.duckdb`` (see ``_meta_conn``).
+- ``*.duckdb``  → native DuckDB table. Opt-in now (point ``--db`` at a
+  ``.duckdb`` path); the prior default, still fully supported.
 - any other directory → parquet shards (a demoted migration/export artifact).
 
 For the parquet and lance backends DuckDB is an in-memory query layer: the
@@ -52,6 +54,13 @@ EMBEDDING_DIM = 768
 # subdir means Lance maintenance (compaction, version cleanup) never sees the
 # metadata files, and vice versa.
 LANCE_DATASET_SUBDIR = "concept_embeddings.lance"
+# Sidecar DuckDB file (inside the .lance container's _meta dir) that persists the
+# lance backend's metadata tables — csv_fingerprints and model_version_cache —
+# across runs. The lance store's own DuckDB connection is :memory:, so without a
+# sidecar those tables would vanish each run, re-hashing the weights file and
+# re-reading the source CSVs every time. Kept under _meta alongside the model
+# registry; reuses the exact duckdb-backend DDL/SQL.
+LANCE_META_DB_SUBDIR = Path("_meta") / "meta.duckdb"
 # Name the registered Lance dataset is exposed under inside the in-memory DuckDB
 # connection; the ``concept_embeddings`` view selects from it.
 _LANCE_REGISTERED_NAME = "_lance_concept_embeddings"
@@ -154,9 +163,17 @@ class ModelRegistryEntry:
 # entries are reclaimed automatically when a connection is garbage collected.
 # A plain dict keyed by id(conn) leaks entries and can alias a stale, closed
 # connection because CPython recycles id() values after collection.
-_CONTEXTS: "weakref.WeakKeyDictionary[duckdb.DuckDBPyConnection, _StoreContext]" = (
+_CONTEXTS: weakref.WeakKeyDictionary[duckdb.DuckDBPyConnection, _StoreContext] = (
     weakref.WeakKeyDictionary()
 )
+
+# Sidecar metadata connections for the lance backend, keyed weakly by the main
+# (in-memory) store connection so each sidecar is opened once per store and
+# reclaimed when its store connection is collected (mirroring _CONTEXTS, and the
+# fact that the CLI never explicitly closes the main connection either).
+_META_CONNS: weakref.WeakKeyDictionary[
+    duckdb.DuckDBPyConnection, duckdb.DuckDBPyConnection
+] = weakref.WeakKeyDictionary()
 
 
 def _resolve_paths(path: Path) -> _StoreContext:
@@ -557,19 +574,20 @@ def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContex
 
 
 def _import_lance() -> Any:
-    """Import pylance lazily so the module loads without the optional extra.
+    """Import pylance lazily so the module imports even if the dep is missing.
 
-    The lance backend is opt-in (a ``.lance`` store path), so ``pylance`` is an
-    optional dependency. Importing it lazily keeps the duckdb/parquet backends
-    usable without it and turns a missing install into a clear, actionable error
-    only when a lance path is actually used.
+    ``pylance`` is a base dependency now that lance is the default backend, so a
+    normal install always has it. The lazy import keeps the module loadable (and
+    the duckdb/parquet backends usable) if it is somehow absent — a broken or
+    partial install — turning that into a clear, actionable error only when a
+    lance path is actually used.
     """
     try:
         import lance
-    except ImportError as exc:  # pragma: no cover - exercised only without extra
+    except ImportError as exc:  # pragma: no cover - only without pylance installed
         raise RuntimeError(
-            "The lance store backend requires the optional 'pylance' dependency. "
-            "Install it with `uv sync --extra lance` (or `uv pip install pylance`)."
+            "The lance store backend requires the 'pylance' dependency, which is "
+            "missing. Reinstall the project (`uv sync`) or run `uv pip install pylance`."
         ) from exc
     return lance
 
@@ -696,6 +714,56 @@ def _lance_delete(
     _lance_refresh_view(conn, ctx.lance_root)
 
 
+def _lance_meta_db_path(lance_root: Path) -> Path:
+    """Filesystem path of the sidecar metadata DuckDB inside the container dir."""
+    return lance_root / LANCE_META_DB_SUBDIR
+
+
+def _ensure_meta_schema(meta: duckdb.DuckDBPyConnection) -> None:
+    """Create the metadata tables in a sidecar connection (idempotent).
+
+    Reuses the exact DuckDB-backend DDL so the lance sidecar's fingerprint and
+    model-version-cache tables are byte-identical to a native duckdb store's.
+    The DDL already carries the ``pooling`` column (with the composite key), so a
+    freshly created sidecar needs none of the duckdb path's ALTER backfills.
+    """
+    meta.execute(CSV_FINGERPRINTS_DDL)
+    meta.execute(MODEL_VERSION_CACHE_DDL)
+
+
+def _meta_conn(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection | None:
+    """Return the connection that persists *conn*'s metadata tables, or None.
+
+    The metadata tables (``csv_fingerprints``, ``model_version_cache``) let
+    ``embed`` skip unchanged CSVs and avoid re-hashing the weights file:
+
+    - **duckdb** backend → the main connection (tables live in the ``.duckdb``
+      file itself).
+    - **lance** backend → a sidecar ``<lance_root>/_meta/meta.duckdb``, opened
+      lazily and cached in ``_META_CONNS``. The lance store's own connection is
+      ``:memory:``, so the sidecar is what makes these tables survive across runs
+      — the crux of making lance the default without a per-run regression.
+    - **parquet** backend → ``None``. Parquet is a demoted export/migration
+      artifact, so it keeps the historical no-op: callers force a re-hash /
+      re-read, which is correct, only redundant.
+    """
+    ctx = _get_context(conn)
+    if ctx.backend == "duckdb":
+        return conn
+    if ctx.backend != "lance":
+        return None
+    existing = _META_CONNS.get(conn)
+    if existing is not None:
+        return existing
+    assert ctx.lance_root is not None
+    meta_path = _lance_meta_db_path(ctx.lance_root)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta = duckdb.connect(str(meta_path))
+    _ensure_meta_schema(meta)
+    _META_CONNS[conn] = meta
+    return meta
+
+
 def open_db(path: Path) -> duckdb.DuckDBPyConnection:
     """Open storage backend for *path*.
 
@@ -723,6 +791,21 @@ def open_db(path: Path) -> duckdb.DuckDBPyConnection:
 
     _CONTEXTS[conn] = ctx
     return conn
+
+
+def close_store(conn: duckdb.DuckDBPyConnection) -> None:
+    """Close a store connection and any backend sidecar it owns.
+
+    Optional in a one-shot CLI process — interpreter exit releases the DuckDB
+    file locks either way. Call it when a *single* process opens the same store
+    more than once (tests, or a migrate-then-embed in-process) so the lance
+    metadata sidecar's file lock is released before the store is reopened;
+    closing only the main connection leaves the cached sidecar holding it.
+    """
+    meta = _META_CONNS.pop(conn, None)
+    if meta is not None:
+        meta.close()
+    conn.close()
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -821,6 +904,12 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         # migration into Lance is an explicit command, not an open-time side
         # effect (see migrate_duckdb_to_lance).
         _lance_refresh_view(conn, ctx.lance_root)
+        # The metadata sidecar is opened lazily (on the first fingerprint /
+        # model-version-cache access), NOT here: only writers — embed, cleanup —
+        # touch those tables, and the sidecar is a single-writer DuckDB file. An
+        # eager open in read-write mode would make every reader (export, status,
+        # coverage) take its lock and fail while a concurrent embed holds it —
+        # defeating the cross-process concurrency Lance is the default for.
         logger.debug("Lance-backed schema ensured")
         return
 
@@ -1191,16 +1280,16 @@ def delete_csv_fingerprints(
     for a model version.  No-op (returns 0) for the parquet backend, which has
     no fingerprint table.
     """
-    ctx = _get_context(conn)
-    if ctx.backend != "duckdb":
+    meta = _meta_conn(conn)
+    if meta is None:
         return 0
-    before = conn.execute(
+    before = meta.execute(
         "SELECT COUNT(*) FROM csv_fingerprints WHERE model_version = ?",
         [model_version],
     ).fetchone()
     removed = int(before[0]) if before else 0
     if removed:
-        conn.execute(
+        meta.execute(
             "DELETE FROM csv_fingerprints WHERE model_version = ?",
             [model_version],
         )
@@ -1285,7 +1374,13 @@ def delete_model_metadata(
         conn.execute("DELETE FROM model_registry WHERE model_version = ?", [model_version])
         conn.execute("DELETE FROM model_version_cache WHERE sha256 = ?", [model_version])
         return
+    # File backends store the registry as parquet under the container dir.
     _delete_parquet_registry_entry(conn, model_version)
+    # Lance also persists the weight-hash cache in its sidecar; drop it so a
+    # later embed re-hashes instead of reusing a digest with no embeddings left.
+    meta = _meta_conn(conn)
+    if meta is not None:
+        meta.execute("DELETE FROM model_version_cache WHERE sha256 = ?", [model_version])
 
 
 def upsert_model_registry(
@@ -1567,10 +1662,10 @@ def get_csv_fingerprint(
     filter_hash: str,
 ) -> dict[str, object] | None:
     """Return the stored fingerprint for *(csv_path, model_version, filter_hash)*, or None."""
-    ctx = _get_context(conn)
-    if ctx.backend != "duckdb":
+    meta = _meta_conn(conn)
+    if meta is None:
         return None  # parquet backend has no fingerprint table
-    row = conn.execute(
+    row = meta.execute(
         """
         SELECT size_bytes, mtime_ns, sha256, row_count, completed_at
         FROM csv_fingerprints
@@ -1601,10 +1696,10 @@ def upsert_csv_fingerprint(
     row_count: int,
 ) -> None:
     """Record a successful ingest fingerprint for *(csv_path, model_version, filter_hash)*."""
-    ctx = _get_context(conn)
-    if ctx.backend != "duckdb":
+    meta = _meta_conn(conn)
+    if meta is None:
         return  # no-op for parquet backend
-    conn.execute(
+    meta.execute(
         """
         INSERT OR REPLACE INTO csv_fingerprints
             (csv_path, model_version, filter_hash, size_bytes, mtime_ns, sha256, row_count, completed_at)
@@ -1647,10 +1742,10 @@ def get_cached_model_version(
     the digest — a cls hit must never be reused for a mean run. A miss simply
     triggers a re-hash, so this is always safe (never returns a wrong digest).
     """
-    ctx = _get_context(conn)
-    if ctx.backend != "duckdb":
+    meta = _meta_conn(conn)
+    if meta is None:
         return None
-    row = conn.execute(
+    row = meta.execute(
         "SELECT sha256 FROM model_version_cache "
         "WHERE model_id = ? AND revision = ? AND pooling = ?",
         [model_id, revision or "", pooling],
@@ -1666,10 +1761,10 @@ def upsert_model_version_cache(
     sha256: str,
 ) -> None:
     """Persist the model_version for *(model_id, revision, pooling)*."""
-    ctx = _get_context(conn)
-    if ctx.backend != "duckdb":
+    meta = _meta_conn(conn)
+    if meta is None:
         return
-    conn.execute(
+    meta.execute(
         """
         INSERT OR REPLACE INTO model_version_cache (model_id, revision, pooling, sha256)
         VALUES (?, ?, ?, ?)
