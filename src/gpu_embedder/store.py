@@ -53,6 +53,8 @@ _EMBEDDING_COLUMNS = (
     "embed_text",
     "model_version",
     "embedded_at",
+    "source_id",
+    "mapping_wave",
 )
 
 
@@ -101,6 +103,8 @@ def _embedded_rows_to_arrow(rows: list[EmbeddedRow]) -> pa.Table:
             "embed_text": pa.array([r.embed_text for r in rows], type=pa.string()),
             "model_version": pa.array([r.model_version for r in rows], type=pa.string()),
             "embedded_at": pa.array(embedded_at, type=pa.timestamp("us")),
+            "source_id": pa.array([r.concept.source_id for r in rows], type=pa.string()),
+            "mapping_wave": pa.array([r.concept.mapping_wave for r in rows], type=pa.string()),
         }
     )
 
@@ -196,7 +200,9 @@ def _create_empty_view(conn: duckdb.DuckDBPyConnection) -> None:
             CAST(NULL AS FLOAT[768]) AS embedding,
             CAST(NULL AS VARCHAR) AS embed_text,
             CAST(NULL AS VARCHAR) AS model_version,
-            CAST(NULL AS TIMESTAMP) AS embedded_at
+            CAST(NULL AS TIMESTAMP) AS embedded_at,
+            CAST(NULL AS VARCHAR) AS source_id,
+            CAST(NULL AS VARCHAR) AS mapping_wave
         WHERE FALSE
         """
     )
@@ -236,7 +242,9 @@ def _refresh_view(conn: duckdb.DuckDBPyConnection, parquet_root: Path) -> None:
             CAST(embedding AS FLOAT[768]) AS embedding,
             embed_text,
             model_version,
-            CAST(embedded_at AS TIMESTAMP) AS embedded_at
+            CAST(embedded_at AS TIMESTAMP) AS embedded_at,
+            source_id,
+            mapping_wave
         FROM (
             SELECT
                 *,
@@ -275,6 +283,19 @@ def _copy_relation_to_partitioned_shards(
 
     if not partitions:
         return 0
+
+    # Shards must carry the full current schema so the dedup view can reference
+    # every column.  A source relation predating the source-provenance columns
+    # (e.g. a legacy duckdb table being migrated) lacks them, so reference them
+    # defensively: emit NULL when the column is absent.
+    source_columns = {
+        str(row[0])
+        for row in conn.execute(f"DESCRIBE SELECT * FROM {source_relation}").fetchall()
+    }
+    source_id_expr = "source_id" if "source_id" in source_columns else "NULL AS source_id"
+    mapping_wave_expr = (
+        "mapping_wave" if "mapping_wave" in source_columns else "NULL AS mapping_wave"
+    )
 
     total_rows = sum(int(row_count) for _, _, _, row_count in partitions)
     total_partitions = len(partitions)
@@ -333,6 +354,8 @@ def _copy_relation_to_partitioned_shards(
                 embed_text,
                 model_version,
                 embedded_at,
+                {source_id_expr},
+                {mapping_wave_expr},
                 ROW_NUMBER() OVER (ORDER BY concept_id) AS rn
             FROM {source_relation}
             WHERE model_version = ?
@@ -374,7 +397,9 @@ def _copy_relation_to_partitioned_shards(
                             embedding,
                             embed_text,
                             model_version,
-                            embedded_at
+                            embedded_at,
+                            source_id,
+                            mapping_wave
                         FROM temp_partition_ranked
                         WHERE rn BETWEEN ? AND ?
                     ) TO '{escaped_shard}'
@@ -524,6 +549,15 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         conn.execute(
             "UPDATE concept_embeddings SET namespace = 'athena' WHERE namespace IS NULL"
+        )
+        # Source-dataset provenance columns; NULL for Athena concepts.  Added to
+        # pre-existing stores so embedded source rows round-trip back to
+        # concept-mapper on (mapping_wave, source_id).
+        conn.execute(
+            "ALTER TABLE concept_embeddings ADD COLUMN IF NOT EXISTS source_id TEXT"
+        )
+        conn.execute(
+            "ALTER TABLE concept_embeddings ADD COLUMN IF NOT EXISTS mapping_wave TEXT"
         )
         conn.execute(
             """

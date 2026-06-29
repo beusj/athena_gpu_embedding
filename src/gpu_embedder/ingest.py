@@ -246,9 +246,24 @@ def read_source_parquet(
         raise FileNotFoundError(path)
 
     source_text_fields = _normalize_source_text_fields(text_fields or ["source_name"])
-    sql = "SELECT " + ", ".join(_SOURCE_PARQUET_COLUMNS) + " FROM read_parquet(?)"
+
+    # ``mapping_wave`` is not an embed-text field but must round-trip so the
+    # vectors can be rejoined to concept-mapper's ``source_concepts`` on
+    # ``(mapping_wave, source_id)``.  Select it alongside the embed columns,
+    # guarding against source parquets that predate the column (NULL fallback).
+    scan_columns = [*_SOURCE_PARQUET_COLUMNS, "mapping_wave"]
 
     with duckdb.connect() as conn:
+        available = {
+            str(row[0])
+            for row in conn.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]
+            ).fetchall()
+        }
+        select_list = ", ".join(
+            col if col in available else f"NULL AS {col}" for col in scan_columns
+        )
+        sql = f"SELECT {select_list} FROM read_parquet(?)"
         records = conn.execute(sql, [str(path)]).fetchall()
 
     rows: list[ConceptRow] = []
@@ -257,7 +272,7 @@ def read_source_parquet(
     skipped = 0
 
     for record in records:
-        raw = dict(zip(_SOURCE_PARQUET_COLUMNS, record, strict=True))
+        raw = dict(zip(scan_columns, record, strict=True))
         source_id = raw["source_id"]
         if not isinstance(source_id, str) or not source_id.strip():
             skipped += 1
@@ -281,6 +296,10 @@ def read_source_parquet(
         )
         data_type = _nullish_to_none(raw["data_type"] if isinstance(raw["data_type"], str) else None)
 
+        mapping_wave = _nullish_to_none(
+            raw["mapping_wave"] if isinstance(raw["mapping_wave"], str) else None
+        )
+
         row = ConceptRow(
             concept_id=concept_id,
             concept_name=source_name or source_id,
@@ -293,6 +312,8 @@ def read_source_parquet(
             valid_end_date=None,
             invalid_reason=None,
             namespace=namespace,
+            source_id=source_id,
+            mapping_wave=mapping_wave,
         )
         rows.append(row)
         embed_texts.setdefault(

@@ -44,6 +44,13 @@ class ConceptRow:
     invalid_reason: str | None = None  # None means valid
     # Provenance/identity dimension; part of the embedding primary key.
     namespace: str = DEFAULT_NAMESPACE
+    # Source-dataset provenance (NULL for Athena concepts).  These round-trip the
+    # concept-mapper ``source_concepts`` natural key so embedded source rows can
+    # be rejoined on ``(mapping_wave, source_id)``.  ``concept_id`` for a source
+    # row is only a hashed surrogate (see ``ingest._stable_source_concept_id``)
+    # and cannot reconstruct ``source_id``, so it is carried explicitly here.
+    source_id: str | None = None
+    mapping_wave: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +138,12 @@ CREATE TABLE IF NOT EXISTS concept_embeddings (
     embed_text          TEXT      NOT NULL,
     model_version       TEXT      NOT NULL,
     embedded_at         TIMESTAMP NOT NULL,
+    -- Source-dataset provenance; NULL for Athena concepts.  Carries the
+    -- concept-mapper source_concepts key so embedded source rows round-trip
+    -- back on (mapping_wave, source_id).  Not part of the primary key (the
+    -- hashed concept_id surrogate already disambiguates within a namespace).
+    source_id           TEXT,
+    mapping_wave        TEXT,
     PRIMARY KEY (namespace, concept_id, model_version)
 );
 """

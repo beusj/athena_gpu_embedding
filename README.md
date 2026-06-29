@@ -306,6 +306,25 @@ Source-parquet mode does not use the Athena filter flags (`--vocabulary-id`,
 Instead, adapt the source parquet and choose the embed text with
 `--source-text-field`.
 
+#### Round-tripping source provenance
+
+A Stage 0 `source_concepts` parquet is keyed by `(mapping_wave, source_id)` in
+concept-mapper. When `embed` adapts it, the string `source_id` is hashed into a
+BIGINT `concept_id` surrogate (so it fits the embedding identity key and cannot
+collide with Athena `concept_id`s under a distinct `--namespace`). That hash is
+one-way, so the original `source_id` — and the `mapping_wave` — would otherwise
+be lost, and the resulting vectors could not be rejoined to `source_concepts`.
+
+To prevent that, `embed` carries both keys through unchanged as the nullable
+`source_id` / `mapping_wave` columns (NULL for Athena concepts, populated for
+source rows). They survive ingest, the DuckDB store, and the parquet `export`,
+so the downstream load can `MERGE` embedded source vectors back into
+concept-mapper's `source_concepts` on `(mapping_wave, source_id)`. The
+Snowflake target table and MERGE that do this are in
+[`docs/runbooks/s3_to_snowflake_load.md`](docs/runbooks/s3_to_snowflake_load.md).
+If a source parquet predates the `mapping_wave` column, ingest substitutes NULL
+rather than failing.
+
 #### Default vocabularies (highest-yield set)
 
 A full Athena `CONCEPT.csv` spans dozens of vocabularies, many of which add
@@ -592,12 +611,22 @@ CREATE TABLE concept_embeddings (
     embed_text          TEXT      NOT NULL,    -- exact string that was embedded
     model_version       TEXT      NOT NULL,    -- SHA-256 digest of model weights
     embedded_at         TIMESTAMP NOT NULL,
+    source_id           TEXT,                  -- source-dataset key (NULL for Athena)
+    mapping_wave        TEXT,                  -- concept-mapper wave (NULL for Athena)
     PRIMARY KEY (namespace, concept_id, model_version)
 );
 ```
 
 The `model_version` digest ensures that embeddings from different model
 checkpoints (or different models entirely) are never silently mixed.
+
+The nullable `source_id` / `mapping_wave` columns are populated only for
+`--source-parquet` runs (NULL for Athena concepts). They carry the
+concept-mapper `source_concepts` natural key through embedding so the vectors
+can be rejoined on `(mapping_wave, source_id)` — see
+[Round-tripping source provenance](#round-tripping-source-provenance) below.
+They are intentionally **not** part of the primary key: the hashed `concept_id`
+surrogate already disambiguates source rows within their namespace.
 
 ---
 

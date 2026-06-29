@@ -1142,7 +1142,9 @@ def export_cmd(
                         embedding,
                         embed_text,
                         model_version,
-                        embedded_at
+                        embedded_at,
+                        source_id,
+                        mapping_wave
                     FROM (
                         SELECT
                             namespace,
@@ -1158,6 +1160,8 @@ def export_cmd(
                             embed_text,
                             model_version,
                             embedded_at,
+                            source_id,
+                            mapping_wave,
                             row_number() OVER (ORDER BY concept_id) AS rn
                         FROM concept_embeddings
                         WHERE model_version = ?

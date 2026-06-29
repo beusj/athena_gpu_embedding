@@ -137,6 +137,13 @@ AWS_PAGER="" aws s3 sync \
 > exported under a distinct namespace load into the same table without colliding
 > with Athena standard concepts. `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` picks
 > the column up automatically.
+>
+> Exported parquet also includes nullable `source_id` and `mapping_wave` columns.
+> These are NULL for Athena concepts and populated for source-concept datasets so
+> embedded source rows can be rejoined to the concept-mapper `source_concepts`
+> table on `(mapping_wave, source_id)`. The hashed `concept_id` is only a dedupe
+> surrogate for source rows and cannot reconstruct `source_id`, so both columns
+> must survive the handoff.
 
 ```sql
 -- One-time file format
@@ -163,7 +170,9 @@ CREATE TABLE IF NOT EXISTS concept_embeddings (
   embedding ARRAY,
   embed_text STRING,
   model_version STRING,
-  embedded_at TIMESTAMP_NTZ
+  embedded_at TIMESTAMP_NTZ,
+  source_id STRING,
+  mapping_wave STRING
 );
 
 -- Bulk load all vocabulary directories
@@ -210,7 +219,9 @@ WHEN MATCHED THEN UPDATE SET
   invalid_reason = s.invalid_reason,
   embedding = s.embedding,
   embed_text = s.embed_text,
-  embedded_at = s.embedded_at
+  embedded_at = s.embedded_at,
+  source_id = s.source_id,
+  mapping_wave = s.mapping_wave
 WHEN NOT MATCHED THEN INSERT (
   namespace,
   concept_id,
@@ -224,7 +235,9 @@ WHEN NOT MATCHED THEN INSERT (
   embedding,
   embed_text,
   model_version,
-  embedded_at
+  embedded_at,
+  source_id,
+  mapping_wave
 ) VALUES (
   s.namespace,
   s.concept_id,
@@ -238,7 +251,9 @@ WHEN NOT MATCHED THEN INSERT (
   s.embedding,
   s.embed_text,
   s.model_version,
-  s.embedded_at
+  s.embedded_at,
+  s.source_id,
+  s.mapping_wave
 );
 
 TRUNCATE TABLE concept_embeddings_stage;
