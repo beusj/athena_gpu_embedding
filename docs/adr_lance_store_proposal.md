@@ -43,8 +43,11 @@ Backend selection is by `store.open_db` path suffix; `.lance` is the default
   vice versa. Migration casts to the canonical Arrow schema so a post-migration
   `embed` merges without a schema clash.
 
-Open validation items remain in "Caveats" (compaction memory at 12M; a concrete
-retention policy; export-to-parquet throughput at scale).
+The earlier open validation items — compaction memory at 12M, a concrete
+retention policy, and export-to-parquet throughput — were benchmarked and
+resolved in "Caveats" (2026-06-29): compaction memory is sub-linear and a
+non-issue, export runs ~21K rows/s with per-partition (spillable) memory, and a
+~2-day scheduled-cleanup retention window is recommended.
 
 ---
 
@@ -108,16 +111,45 @@ Lance, measured:
 4. Slot a `lance` backend behind the existing `store.open_db` path dispatch
    (e.g. a `.lance` directory), alongside `duckdb`/`parquet`.
 
-## Caveats (validate before committing)
+## Caveats — measured 2026-06-29
 
-- Synthetic data, single process, 1M rows (≈1/12 of production), local SSD.
-  `merge_insert` being O(changes) is structural and should hold at 12M; but
-  compaction cost grows with dataset size (scheduled, off the write path).
-- **Version retention**: Lance keeps old versions for time-travel until cleaned
-  up; compaction transiently doubled disk (3.1 GB → 6.8 GB pre-vacuum). Set a
-  retention/cleanup policy or disk grows.
-- Heavy analytical scan / export-to-Parquet throughput was not stress-tested
-  beyond `count_rows`; validate export throughput at scale.
+Benchmarked on a 4-core / 16 GB box: real 768-dim float32 vectors, a fragmented
++ deletion-vector state from scattered `merge_insert`s, each op in a fresh
+process (import+open RSS floor ≈ 220 MB). The original open validation items are
+resolved below.
+
+- **Compaction memory — not a concern (resolved).** `compact_files` streams
+  adjacent fragments into `target_rows_per_fragment`-sized outputs (default
+  1,048,576), so peak RSS is **sub-linear** in dataset size: 500K rows → 1.13 GB,
+  1.5M → 1.43 GB (3× the rows, 1.34× the memory). Bounding
+  `target_rows_per_fragment` / `num_threads` barely moves it (200K-target,
+  1-thread ≈ 1.17 GB) — the ~1 GB working set is fixed Lance/Arrow read-buffer
+  overhead, not fragment-size × threads. Extrapolated to 12M: ~1.5–2.5 GB, fine
+  on any ≥4 GB box. The real compaction cost at scale is **time + transient
+  disk** (old fragments stay referenced by old versions until cleanup — the
+  3.1 → 6.8 GB doubling), not RAM. Run it scheduled, off the write path.
+- **Export-to-Parquet — ~21K rows/s, memory bounded per partition (resolved).**
+  1.5M rows → sharded parquet (Snappy) in 71.8 s ≈ 20,900 rows/s, peak 3.5 GB —
+  a conservative floor (the benchmark rescanned per partition; the production
+  path materializes one partition per scan). ⇒ ~10 min for 12M on 4 cores, less
+  on a bigger box. Peak memory is bounded by the largest single
+  `(model_version, vocabulary_id)` partition's DuckDB temp table, which **spills
+  to disk** under `memory_limit` — it slows rather than OOMs. Setting a DuckDB
+  `memory_limit` during export makes spill predictable on the largest partitions.
+- **Version retention — a disk-vs-rollback dial; reader-safety is free
+  (resolved).** Every commit (each `merge_insert` checkpoint, `delete`,
+  `compact`) is a new version; retained versions pin their data files until
+  `cleanup_old_versions` reclaims them. The window must exceed (a) the longest
+  concurrent reader — a 12M export is ~10–30 min, so any day-scale window clears
+  this by orders of magnitude — and (b) your operational rollback horizon (~1–2
+  days for nightly jobs). **Policy:** run `gpu-embed compact` (with cleanup) as
+  scheduled maintenance after each embed job, never concurrently; a **~2-day**
+  window balances rollback headroom against disk. `--no-cleanup` preserves a
+  checkpoint; `--cleanup-older-than-days 0` reclaims all but the current version
+  when disk is tight. (The `compact` CLI default is currently 7 days; lowering to
+  ~2 is a follow-up if disk pressure warrants.)
+- **`merge_insert` O(changes)** is structural and holds at 12M — the property
+  that disqualified Delta MERGE here.
 - New dependency (`pylance`). If its maturity/ops are a concern, **Delta-rs in
   append mode is the fallback** — same ACID + concurrency, but requires the
   append + scheduled-compaction discipline (never MERGE) to avoid amplification.
