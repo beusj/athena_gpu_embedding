@@ -131,6 +131,13 @@ AWS_PAGER="" aws s3 sync \
 
 ## 4) Load from S3 into Snowflake (`COPY INTO`)
 
+> Exported parquet includes a `namespace` column (default `athena`). It is part
+> of the embedding identity, so the target table carries it and the idempotent
+> load keys on `(namespace, concept_id, model_version)`. Source-concept datasets
+> exported under a distinct namespace load into the same table without colliding
+> with Athena standard concepts. `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` picks
+> the column up automatically.
+
 ```sql
 -- One-time file format
 CREATE OR REPLACE FILE FORMAT omop_parquet_ff
