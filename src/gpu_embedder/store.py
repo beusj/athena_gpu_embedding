@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from glob import glob
@@ -18,13 +19,89 @@ from pathlib import Path
 from typing import Literal
 
 import duckdb
+import numpy as np
+import pyarrow as pa
 
-from gpu_embedder.models import ConceptRow, EmbeddedRow, SCHEMA_DDL, CSV_FINGERPRINTS_DDL, MODEL_VERSION_CACHE_DDL
+from gpu_embedder.models import (
+    CSV_FINGERPRINTS_DDL,
+    MODEL_VERSION_CACHE_DDL,
+    SCHEMA_DDL,
+    ConceptRow,
+    EmbeddedRow,
+)
 
 logger = logging.getLogger(__name__)
 TARGET_ROWS_PER_SHARD = 250_000
 NULL_VOCAB_PARTITION = "_null"
 MODEL_REGISTRY_SUBDIR = Path("_meta") / "model_registry"
+EMBEDDING_DIM = 768
+
+# Column order shared by the concept_embeddings table, the parquet shards, and
+# the Arrow tables we build for bulk loading.  Keep these in lockstep.
+_EMBEDDING_COLUMNS = (
+    "namespace",
+    "concept_id",
+    "concept_name",
+    "domain_id",
+    "vocabulary_id",
+    "concept_class_id",
+    "standard_concept",
+    "concept_code",
+    "invalid_reason",
+    "embedding",
+    "embed_text",
+    "model_version",
+    "embedded_at",
+)
+
+
+def _embedded_rows_to_arrow(rows: list[EmbeddedRow]) -> pa.Table:
+    """Build a columnar Arrow table from EmbeddedRow objects for bulk loading.
+
+    DuckDB ingests Arrow tables natively (zero-copy, fully vectorised), which is
+    dramatically faster than ``executemany`` for the wide ``FLOAT[768]`` column
+    — the per-row Python→DuckDB binding is the dominant cost otherwise.  The
+    embedding is encoded as a fixed-size list of float32 so it maps directly to
+    the ``FLOAT[768]`` column type.
+    """
+    embeddings = np.asarray([r.embedding for r in rows], dtype=np.float32)
+    if embeddings.shape != (len(rows), EMBEDDING_DIM):
+        raise ValueError(
+            f"Expected embeddings of shape ({len(rows)}, {EMBEDDING_DIM}), "
+            f"got {embeddings.shape}"
+        )
+    embedding_arr = pa.FixedSizeListArray.from_arrays(
+        pa.array(embeddings.reshape(-1)), EMBEDDING_DIM
+    )
+    # DuckDB TIMESTAMP is timezone-naive; drop tzinfo (values are UTC) so the
+    # Arrow timestamp maps cleanly without an implicit conversion.
+    embedded_at = [
+        r.embedded_at.replace(tzinfo=None) if r.embedded_at.tzinfo else r.embedded_at
+        for r in rows
+    ]
+    return pa.table(
+        {
+            "namespace": pa.array([r.concept.namespace for r in rows], type=pa.string()),
+            "concept_id": pa.array([r.concept.concept_id for r in rows], type=pa.int64()),
+            "concept_name": pa.array([r.concept.concept_name for r in rows], type=pa.string()),
+            "domain_id": pa.array([r.concept.domain_id for r in rows], type=pa.string()),
+            "vocabulary_id": pa.array([r.concept.vocabulary_id for r in rows], type=pa.string()),
+            "concept_class_id": pa.array(
+                [r.concept.concept_class_id for r in rows], type=pa.string()
+            ),
+            "standard_concept": pa.array(
+                [r.concept.standard_concept for r in rows], type=pa.string()
+            ),
+            "concept_code": pa.array([r.concept.concept_code for r in rows], type=pa.string()),
+            "invalid_reason": pa.array(
+                [r.concept.invalid_reason for r in rows], type=pa.string()
+            ),
+            "embedding": embedding_arr,
+            "embed_text": pa.array([r.embed_text for r in rows], type=pa.string()),
+            "model_version": pa.array([r.model_version for r in rows], type=pa.string()),
+            "embedded_at": pa.array(embedded_at, type=pa.timestamp("us")),
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -44,7 +121,13 @@ class ModelRegistryEntry:
     recorded_at: datetime
 
 
-_CONTEXTS: dict[int, _StoreContext] = {}
+# Keyed by the connection object itself (not id(conn)) via weak references so
+# entries are reclaimed automatically when a connection is garbage collected.
+# A plain dict keyed by id(conn) leaks entries and can alias a stale, closed
+# connection because CPython recycles id() values after collection.
+_CONTEXTS: "weakref.WeakKeyDictionary[duckdb.DuckDBPyConnection, _StoreContext]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _resolve_paths(path: Path) -> _StoreContext:
@@ -58,7 +141,7 @@ def _resolve_paths(path: Path) -> _StoreContext:
 
 
 def _get_context(conn: duckdb.DuckDBPyConnection) -> _StoreContext:
-    ctx = _CONTEXTS.get(id(conn))
+    ctx = _CONTEXTS.get(conn)
     if ctx is None:
         raise RuntimeError("Store connection context not found")
     return ctx
@@ -100,6 +183,7 @@ def _create_empty_view(conn: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE OR REPLACE VIEW concept_embeddings AS
         SELECT
+            CAST(NULL AS VARCHAR) AS namespace,
             CAST(NULL AS BIGINT) AS concept_id,
             CAST(NULL AS VARCHAR) AS concept_name,
             CAST(NULL AS VARCHAR) AS domain_id,
@@ -139,6 +223,7 @@ def _refresh_view(conn: duckdb.DuckDBPyConnection, parquet_root: Path) -> None:
         """
         CREATE OR REPLACE VIEW concept_embeddings AS
         SELECT
+            COALESCE(namespace, 'athena') AS namespace,
             concept_id,
             concept_name,
             domain_id,
@@ -155,7 +240,7 @@ def _refresh_view(conn: duckdb.DuckDBPyConnection, parquet_root: Path) -> None:
             SELECT
                 *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY concept_id, model_version
+                    PARTITION BY COALESCE(namespace, 'athena'), concept_id, model_version
                     ORDER BY CAST(embedded_at AS TIMESTAMP) DESC, filename DESC
                 ) AS _rownum
             FROM (
@@ -194,6 +279,13 @@ def _copy_relation_to_partitioned_shards(
     total_partitions = len(partitions)
     estimated_total_files = sum(ceil(int(row_count) / TARGET_ROWS_PER_SHARD) for *_, row_count in partitions)
 
+    # Zero-padded nanosecond stamp used as the leading filename component so a
+    # lexical ``filename DESC`` sort is chronological.  The dedup view breaks
+    # equal-``embedded_at`` ties by ``filename DESC``; a random UUID would pick
+    # an arbitrary (possibly stale) shard, whereas this guarantees the most
+    # recently written shard for a concept wins.
+    write_seq = f"{time.time_ns():020d}"
+
     total_files = 0
     completed_rows = 0
     completed_partitions = 0
@@ -227,6 +319,7 @@ def _copy_relation_to_partitioned_shards(
             f"""
             CREATE TEMP TABLE temp_partition_ranked AS
             SELECT
+                namespace,
                 concept_id,
                 concept_name,
                 domain_id,
@@ -259,12 +352,16 @@ def _copy_relation_to_partitioned_shards(
             for shard_idx in range(shard_count):
                 start_rn = shard_idx * TARGET_ROWS_PER_SHARD + 1
                 end_rn = min((shard_idx + 1) * TARGET_ROWS_PER_SHARD, partition_row_count)
-                shard_path = partition_dir / f"part-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
+                shard_path = (
+                    partition_dir
+                    / f"part-{write_seq}-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
+                )
                 escaped_shard = shard_path.as_posix().replace("'", "''")
                 conn.execute(
                     f"""
                     COPY (
                         SELECT
+                            namespace,
                             concept_id,
                             concept_name,
                             domain_id,
@@ -352,9 +449,29 @@ def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContex
             logger.info("Legacy concept_embeddings is empty; skipping migration")
             return
 
+        # Legacy tables predating the namespace column need it synthesised as
+        # 'athena' so the partition copy (which selects namespace) succeeds.
+        has_namespace = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_catalog = 'legacy'
+              AND table_schema = 'main'
+              AND table_name = 'concept_embeddings'
+              AND column_name = 'namespace'
+            """
+        ).fetchone()
+        if has_namespace and int(has_namespace[0]) > 0:
+            legacy_source = "legacy.concept_embeddings"
+        else:
+            legacy_source = (
+                "(SELECT *, 'athena' AS namespace "
+                "FROM legacy.concept_embeddings) AS legacy_src"
+            )
+
         migrated_files = _copy_relation_to_partitioned_shards(
             conn,
-            "legacy.concept_embeddings",
+            legacy_source,
             ctx.parquet_root,
             log_progress=True,
         )
@@ -383,7 +500,7 @@ def open_db(path: Path) -> duckdb.DuckDBPyConnection:
         conn = duckdb.connect(":memory:")
         logger.info("Opened parquet-backed store at %s", ctx.parquet_root)
 
-    _CONTEXTS[id(conn)] = ctx
+    _CONTEXTS[conn] = ctx
     return conn
 
 
@@ -393,6 +510,20 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     if ctx.backend == "duckdb":
         conn.execute(SCHEMA_DDL)
+        # Backfill the namespace column on tables created before it existed.
+        # (A DuckDB table's PRIMARY KEY cannot be widened in place; pre-existing
+        # DBs keep the old (concept_id, model_version) key, which is still
+        # correct as long as they only hold athena-namespace concepts. Mixing in
+        # source concepts requires a rebuilt DB.)
+        conn.execute(
+            """
+            ALTER TABLE concept_embeddings
+            ADD COLUMN IF NOT EXISTS namespace TEXT DEFAULT 'athena'
+            """
+        )
+        conn.execute(
+            "UPDATE concept_embeddings SET namespace = 'athena' WHERE namespace IS NULL"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS model_registry (
@@ -438,58 +569,18 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     logger.debug("Parquet-backed schema ensured")
 
 
-def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set[int]:
-    """Return concept_ids that already have an embedding for *model_version*."""
-    rows = conn.execute(
-        "SELECT concept_id FROM concept_embeddings WHERE model_version = ?",
-        [model_version],
-    ).fetchall()
-    ids = {r[0] for r in rows}
-    logger.info("Found %d existing concept_ids for model_version=%s", len(ids), model_version[:8])
-    return ids
+def refresh_view(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild the logical concept_embeddings view over the parquet shards.
 
-
-def filter_unembedded_rows(
-    conn: duckdb.DuckDBPyConnection,
-    rows: list[ConceptRow],
-    model_version: str,
-) -> list[ConceptRow]:
-    """Return only the rows whose concept_id has no embedding for *model_version*.
-
-    Performs the anti-join inside DuckDB rather than materialising all existing
-    IDs into a Python set.  This is significantly faster when the store already
-    contains millions of rows and only a small fraction remain to embed.
+    Call after writing shards with ``refresh_view=False`` so the view reflects
+    them. No-op for the duckdb backend, which writes a real table rather than a
+    view (so there is nothing to refresh).
     """
-    if not rows:
-        return []
-
-    candidate_ids = [r.concept_id for r in rows]
-    conn.execute("DROP TABLE IF EXISTS _candidate_ids")
-    conn.execute("CREATE TEMP TABLE _candidate_ids (concept_id BIGINT)")
-    conn.executemany("INSERT INTO _candidate_ids VALUES (?)", [(i,) for i in candidate_ids])
-    result = conn.execute(
-        """
-        SELECT concept_id
-        FROM _candidate_ids
-        WHERE concept_id NOT IN (
-            SELECT concept_id
-            FROM concept_embeddings
-            WHERE model_version = ?
-        )
-        """,
-        [model_version],
-    ).fetchall()
-    conn.execute("DROP TABLE IF EXISTS _candidate_ids")
-    unembedded = {r[0] for r in result}
-    logger.info(
-        "filter_unembedded_rows: %d candidates, %d already embedded, %d to embed "
-        "(model_version=%s)",
-        len(candidate_ids),
-        len(candidate_ids) - len(unembedded),
-        len(unembedded),
-        model_version[:8],
-    )
-    return [r for r in rows if r.concept_id in unembedded]
+    ctx = _get_context(conn)
+    if ctx.backend != "parquet":
+        return
+    assert ctx.parquet_root is not None
+    _refresh_view(conn, ctx.parquet_root)
 
 
 def classify_rows_requiring_embedding(
@@ -501,57 +592,63 @@ def classify_rows_requiring_embedding(
     """Return rows requiring embedding plus (new_count, changed_count, unchanged_count).
 
     A row requires embedding when either:
-    - `(concept_id, model_version)` has no stored embedding, or
+    - `(namespace, concept_id, model_version)` has no stored embedding, or
     - stored `embed_text` differs from the current candidate text.
     """
     if not rows:
         return ([], 0, 0, 0)
 
-    concept_ids = [row.concept_id for row in rows]
-    embed_texts = [candidate_texts[row.concept_id] for row in rows]
-    conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
-    conn.execute(
-        """
-        CREATE TEMP TABLE _candidate_embed_texts (
-            concept_id BIGINT,
-            embed_text VARCHAR
-        )
-        """
+    # Register the candidate (namespace, concept_id, embed_text) columns as an
+    # Arrow table and join directly.  Passing the columns as `unnest(?::T[])`
+    # array params is ~quadratic in DuckDB (tens of seconds at a few hundred
+    # thousand rows); Arrow registration is columnar and near-instant.
+    logger.info("classify_rows_requiring_embedding: building candidate table (%d rows)", len(rows))
+    candidate_arrow = pa.table(
+        {
+            "namespace": pa.array([row.namespace for row in rows], type=pa.string()),
+            "concept_id": pa.array([row.concept_id for row in rows], type=pa.int64()),
+            "embed_text": pa.array(
+                [candidate_texts[row.concept_id] for row in rows], type=pa.string()
+            ),
+        }
     )
-    # Use array unnest instead of executemany to avoid per-row Python→DuckDB
-    # overhead, which is severe for millions of concepts.
-    conn.execute(
-        "INSERT INTO _candidate_embed_texts"
-        " SELECT unnest(?::BIGINT[]), unnest(?::VARCHAR[])",
-        [concept_ids, embed_texts],
+    conn.register("_candidate_embed_texts", candidate_arrow)
+    logger.info(
+        "classify_rows_requiring_embedding: joining candidates against stored "
+        "embeddings (model_version=%s)…",
+        model_version[:8],
     )
-    result = conn.execute(
-        """
-        SELECT
-            c.concept_id,
-            CASE
-                WHEN e.concept_id IS NULL THEN 'new'
-                WHEN e.embed_text IS DISTINCT FROM c.embed_text THEN 'changed'
-                ELSE 'unchanged'
-            END AS status
-        FROM _candidate_embed_texts c
-        LEFT JOIN concept_embeddings e
-          ON e.concept_id = c.concept_id
-         AND e.model_version = ?
-        """,
-        [model_version],
-    ).fetchall()
-    conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
+    try:
+        result = conn.execute(
+            """
+            SELECT
+                c.namespace,
+                c.concept_id,
+                CASE
+                    WHEN e.concept_id IS NULL THEN 'new'
+                    WHEN e.embed_text IS DISTINCT FROM c.embed_text THEN 'changed'
+                    ELSE 'unchanged'
+                END AS status
+            FROM _candidate_embed_texts c
+            LEFT JOIN concept_embeddings e
+              ON e.namespace = c.namespace
+             AND e.concept_id = c.concept_id
+             AND e.model_version = ?
+            """,
+            [model_version],
+        ).fetchall()
+    finally:
+        conn.unregister("_candidate_embed_texts")
 
-    status_by_id = {int(row[0]): str(row[1]) for row in result}
+    status_by_key = {(str(row[0]), int(row[1])): str(row[2]) for row in result}
     need_embed = {
-        concept_id
-        for concept_id, status in status_by_id.items()
+        key
+        for key, status in status_by_key.items()
         if status in {"new", "changed"}
     }
-    new_count = sum(1 for status in status_by_id.values() if status == "new")
-    changed_count = sum(1 for status in status_by_id.values() if status == "changed")
-    unchanged_count = sum(1 for status in status_by_id.values() if status == "unchanged")
+    new_count = sum(1 for status in status_by_key.values() if status == "new")
+    changed_count = sum(1 for status in status_by_key.values() if status == "changed")
+    unchanged_count = sum(1 for status in status_by_key.values() if status == "unchanged")
     logger.info(
         "classify_rows_requiring_embedding: %d candidates, %d new, %d changed, %d unchanged "
         "(model_version=%s)",
@@ -561,23 +658,12 @@ def classify_rows_requiring_embedding(
         unchanged_count,
         model_version[:8],
     )
-    return ([row for row in rows if row.concept_id in need_embed], new_count, changed_count, unchanged_count)
-
-
-def filter_rows_requiring_embedding(
-    conn: duckdb.DuckDBPyConnection,
-    rows: list[ConceptRow],
-    model_version: str,
-    candidate_texts: dict[int, str],
-) -> list[ConceptRow]:
-    """Backward-compatible wrapper returning only rows requiring embedding."""
-    to_embed, _, _, _ = classify_rows_requiring_embedding(
-        conn,
-        rows,
-        model_version,
-        candidate_texts,
+    return (
+        [row for row in rows if (row.namespace, row.concept_id) in need_embed],
+        new_count,
+        changed_count,
+        unchanged_count,
     )
-    return to_embed
 
 
 def _append_rows_as_parquet_shards(
@@ -592,72 +678,21 @@ def _append_rows_as_parquet_shards(
     ctx = _get_context(conn)
     if ctx.parquet_root is None:
         raise RuntimeError("Parquet root not available for parquet append")
-    conn.execute("DROP TABLE IF EXISTS temp_embeddings")
-    conn.execute(
-        """
-        CREATE TEMP TABLE temp_embeddings (
-            concept_id BIGINT,
-            concept_name VARCHAR,
-            domain_id VARCHAR,
-            vocabulary_id VARCHAR,
-            concept_class_id VARCHAR,
-            standard_concept VARCHAR,
-            concept_code VARCHAR,
-            invalid_reason VARCHAR,
-            embedding FLOAT[768],
-            embed_text VARCHAR,
-            model_version VARCHAR,
-            embedded_at TIMESTAMP
+
+    # Register the batch as an Arrow table and let DuckDB read it directly,
+    # avoiding per-row executemany binding of the FLOAT[768] embedding column.
+    arrow_batch = _embedded_rows_to_arrow(rows)
+    conn.register("temp_embeddings", arrow_batch)
+    try:
+        _copy_relation_to_partitioned_shards(
+            conn,
+            "temp_embeddings",
+            ctx.parquet_root,
+            log_progress=False,
         )
-        """
-    )
+    finally:
+        conn.unregister("temp_embeddings")
 
-    records = [
-        (
-            r.concept.concept_id,
-            r.concept.concept_name,
-            r.concept.domain_id,
-            r.concept.vocabulary_id,
-            r.concept.concept_class_id,
-            r.concept.standard_concept,
-            r.concept.concept_code,
-            r.concept.invalid_reason,
-            r.embedding,
-            r.embed_text,
-            r.model_version,
-            r.embedded_at,
-        )
-        for r in rows
-    ]
-
-    conn.executemany(
-        """
-        INSERT INTO temp_embeddings (
-            concept_id,
-            concept_name,
-            domain_id,
-            vocabulary_id,
-            concept_class_id,
-            standard_concept,
-            concept_code,
-            invalid_reason,
-            embedding,
-            embed_text,
-            model_version,
-            embedded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        records,
-    )
-
-    _copy_relation_to_partitioned_shards(
-        conn,
-        "temp_embeddings",
-        ctx.parquet_root,
-        log_progress=False,
-    )
-
-    conn.execute("DROP TABLE IF EXISTS temp_embeddings")
     if refresh_view:
         _refresh_view(conn, ctx.parquet_root)
 
@@ -686,58 +721,22 @@ def upsert_rows(
     ctx = _get_context(conn)
 
     if ctx.backend == "duckdb":
-        records = [
-            (
-                r.concept.concept_id,
-                r.concept.concept_name,
-                r.concept.domain_id,
-                r.concept.vocabulary_id,
-                r.concept.concept_class_id,
-                r.concept.standard_concept,
-                r.concept.concept_code,
-                r.concept.invalid_reason,
-                r.embedding,
-                r.embed_text,
-                r.model_version,
-                r.embedded_at,
+        # Register the batch as an Arrow table and merge in one SQL statement.
+        # DuckDB reads Arrow natively, so this avoids both per-row executemany
+        # binding (catastrophically slow for the FLOAT[768] column) and the
+        # primary-key index maintenance of a row-by-row insert.
+        arrow_batch = _embedded_rows_to_arrow(rows)
+        columns = ", ".join(_EMBEDDING_COLUMNS)
+        conn.register("_upsert_batch", arrow_batch)
+        try:
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO concept_embeddings ({columns})
+                SELECT {columns} FROM _upsert_batch
+                """
             )
-            for r in rows
-        ]
-        # Bulk-load into a temp table (no PK index) then merge in one SQL
-        # statement.  This avoids per-row primary key lookup overhead that
-        # makes executemany slow on large tables.
-        conn.execute("DROP TABLE IF EXISTS _upsert_batch")
-        conn.execute(
-            """
-            CREATE TEMP TABLE _upsert_batch (
-                concept_id BIGINT,
-                concept_name VARCHAR,
-                domain_id VARCHAR,
-                vocabulary_id VARCHAR,
-                concept_class_id VARCHAR,
-                standard_concept VARCHAR,
-                concept_code VARCHAR,
-                invalid_reason VARCHAR,
-                embedding FLOAT[768],
-                embed_text VARCHAR,
-                model_version VARCHAR,
-                embedded_at TIMESTAMP
-            )
-            """
-        )
-        conn.executemany(
-            """
-            INSERT INTO _upsert_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            records,
-        )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO concept_embeddings
-            SELECT * FROM _upsert_batch
-            """
-        )
-        conn.execute("DROP TABLE IF EXISTS _upsert_batch")
+        finally:
+            conn.unregister("_upsert_batch")
         logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
         return
 
@@ -746,12 +745,26 @@ def upsert_rows(
     logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
 
 
-def count_rows(conn: duckdb.DuckDBPyConnection, model_version: str) -> int:
-    """Return the number of stored embeddings for *model_version*."""
-    result = conn.execute(
-        "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ?",
-        [model_version],
-    ).fetchone()
+def count_rows(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+    namespace: str | None = None,
+) -> int:
+    """Return the number of stored embeddings for *model_version*.
+
+    When *namespace* is given, count only that namespace; otherwise count across
+    all namespaces.
+    """
+    if namespace is None:
+        result = conn.execute(
+            "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ?",
+            [model_version],
+        ).fetchone()
+    else:
+        result = conn.execute(
+            "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ? AND namespace = ?",
+            [model_version, namespace],
+        ).fetchone()
     return int(result[0]) if result else 0
 
 

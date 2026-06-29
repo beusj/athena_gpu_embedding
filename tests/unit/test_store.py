@@ -9,18 +9,25 @@ import duckdb
 
 from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow
 from gpu_embedder.store import (
+    classify_rows_requiring_embedding,
     count_rows,
     ensure_schema,
-    filter_rows_requiring_embedding,
-    filter_unembedded_rows,
     get_csv_fingerprint,
-    get_existing_ids,
     list_model_registry,
     open_db,
     upsert_csv_fingerprint,
     upsert_model_registry,
     upsert_rows,
 )
+
+
+def _embedded_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set[int]:
+    """Test helper: concept_ids stored for *model_version* (via the public view)."""
+    rows = conn.execute(
+        "SELECT concept_id FROM concept_embeddings WHERE model_version = ?",
+        [model_version],
+    ).fetchall()
+    return {r[0] for r in rows}
 
 
 def _make_row(concept_id: int = 1, vocabulary_id: str = "SNOMED") -> EmbeddedRow:
@@ -124,14 +131,14 @@ class TestEnsureSchema:
 
         conn = open_db(legacy_path.with_suffix(""))
         ensure_schema(conn)
-        assert get_existing_ids(conn, "v1") == {101}
+        assert _embedded_ids(conn, "v1") == {101}
         migrated_files = list((legacy_path.with_suffix("")).glob("model_version=*/**/*.parquet"))
         assert migrated_files
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# upsert_rows + get_existing_ids
+# upsert_rows + existence
 # ---------------------------------------------------------------------------
 
 class TestUpsertAndExistence:
@@ -141,8 +148,7 @@ class TestUpsertAndExistence:
         ensure_schema(conn)
         rows = [_make_row(i) for i in range(1, 4)]
         upsert_rows(conn, rows)
-        ids = get_existing_ids(conn, "v1")
-        assert ids == {1, 2, 3}
+        assert _embedded_ids(conn, "v1") == {1, 2, 3}
         shards = list(store_root.glob("model_version=*/vocabulary_id=*/*.parquet"))
         assert shards
 
@@ -159,9 +165,9 @@ class TestUpsertAndExistence:
         )
         upsert_rows(conn, [row_v1])
         upsert_rows(conn, [row_v2])
-        assert get_existing_ids(conn, "v1") == {10}
-        assert get_existing_ids(conn, "v2") == {10}
-        assert get_existing_ids(conn, "v3") == set()
+        assert _embedded_ids(conn, "v1") == {10}
+        assert _embedded_ids(conn, "v2") == {10}
+        assert _embedded_ids(conn, "v3") == set()
 
     def test_upsert_replaces_existing_row(self, tmp_path: Path) -> None:
         conn = open_db(tmp_path / "embeddings")
@@ -212,61 +218,22 @@ class TestUpsertAndExistence:
 
 
 # ---------------------------------------------------------------------------
-# filter_unembedded_rows
+# classify_rows_requiring_embedding
 # ---------------------------------------------------------------------------
 
-class TestFilterUnembeddedRows:
-    def test_returns_all_when_none_embedded(self, tmp_path: Path) -> None:
-        conn = open_db(tmp_path / "embeddings.duckdb")
-        ensure_schema(conn)
-        rows = [_make_concept_row(i) for i in range(1, 4)]
-        result = filter_unembedded_rows(conn, rows, "v1")
-        assert [r.concept_id for r in result] == [1, 2, 3]
-
-    def test_returns_only_missing(self, tmp_path: Path) -> None:
-        conn = open_db(tmp_path / "embeddings.duckdb")
-        ensure_schema(conn)
-        embed_rows = [_make_row(i) for i in range(1, 4)]
-        upsert_rows(conn, [embed_rows[0]])  # embed concept_id=1 only
-        concept_rows = [r.concept for r in embed_rows]
-        result = filter_unembedded_rows(conn, concept_rows, "v1")
-        assert {r.concept_id for r in result} == {2, 3}
-
-    def test_returns_empty_when_all_embedded(self, tmp_path: Path) -> None:
-        conn = open_db(tmp_path / "embeddings.duckdb")
-        ensure_schema(conn)
-        embed_rows = [_make_row(i) for i in range(1, 4)]
-        upsert_rows(conn, embed_rows)
-        concept_rows = [r.concept for r in embed_rows]
-        result = filter_unembedded_rows(conn, concept_rows, "v1")
-        assert result == []
-
-    def test_scoped_to_model_version(self, tmp_path: Path) -> None:
-        conn = open_db(tmp_path / "embeddings.duckdb")
-        ensure_schema(conn)
-        embed_row = _make_row(concept_id=7)
-        upsert_rows(conn, [embed_row])  # embedded under "v1"
-        # should still appear as unembedded under "v2"
-        result = filter_unembedded_rows(conn, [embed_row.concept], "v2")
-        assert len(result) == 1
-
-    def test_empty_candidates(self, tmp_path: Path) -> None:
-        conn = open_db(tmp_path / "embeddings.duckdb")
-        ensure_schema(conn)
-        result = filter_unembedded_rows(conn, [], "v1")
-        assert result == []
-
-
-class TestFilterRowsRequiringEmbedding:
+class TestClassifyRowsRequiringEmbedding:
     def test_new_rows_require_embedding(self, tmp_path: Path) -> None:
         conn = open_db(tmp_path / "embeddings.duckdb")
         ensure_schema(conn)
         rows = [_make_concept_row(1), _make_concept_row(2)]
         candidate_texts = {1: "Concept 1", 2: "Concept 2"}
 
-        result = filter_rows_requiring_embedding(conn, rows, "v1", candidate_texts)
+        to_embed, new, changed, unchanged = classify_rows_requiring_embedding(
+            conn, rows, "v1", candidate_texts
+        )
 
-        assert {r.concept_id for r in result} == {1, 2}
+        assert {r.concept_id for r in to_embed} == {1, 2}
+        assert (new, changed, unchanged) == (2, 0, 0)
 
     def test_unchanged_rows_are_skipped(self, tmp_path: Path) -> None:
         conn = open_db(tmp_path / "embeddings.duckdb")
@@ -275,9 +242,12 @@ class TestFilterRowsRequiringEmbedding:
         rows = [_make_concept_row(7)]
         candidate_texts = {7: "Concept 7"}
 
-        result = filter_rows_requiring_embedding(conn, rows, "v1", candidate_texts)
+        to_embed, new, changed, unchanged = classify_rows_requiring_embedding(
+            conn, rows, "v1", candidate_texts
+        )
 
-        assert result == []
+        assert to_embed == []
+        assert (new, changed, unchanged) == (0, 0, 1)
 
     def test_changed_embed_text_requires_reembed(self, tmp_path: Path) -> None:
         conn = open_db(tmp_path / "embeddings.duckdb")
@@ -286,9 +256,12 @@ class TestFilterRowsRequiringEmbedding:
         rows = [_make_concept_row(9)]
         candidate_texts = {9: "Concept 9 (updated)"}
 
-        result = filter_rows_requiring_embedding(conn, rows, "v1", candidate_texts)
+        to_embed, new, changed, unchanged = classify_rows_requiring_embedding(
+            conn, rows, "v1", candidate_texts
+        )
 
-        assert [r.concept_id for r in result] == [9]
+        assert [r.concept_id for r in to_embed] == [9]
+        assert (new, changed, unchanged) == (0, 1, 0)
 
 
 # ---------------------------------------------------------------------------

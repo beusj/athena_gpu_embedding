@@ -266,6 +266,18 @@ def embed_cmd(
             help="Separator between concatenated text fields",
         ),
     ] = None,
+    namespace: Annotated[
+        str | None,
+        typer.Option(
+            "--namespace",
+            envvar="GPU_EMBED_NAMESPACE",
+            help=(
+                "Identity namespace for these concepts (default 'athena'). Use a "
+                "distinct value for source-concept datasets so their concept_ids "
+                "do not collide with Athena standard concepts."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Batch-embed Athena CONCEPT.csv rows with SapBERT and store in parquet shards."""
     # Build config, allowing CLI overrides
@@ -294,6 +306,8 @@ def embed_cmd(
         cfg_overrides["text_fields"] = text_field
     if separator is not None:
         cfg_overrides["separator"] = separator
+    if namespace is not None:
+        cfg_overrides["namespace"] = namespace
 
     cfg = EmbedConfig(**cfg_overrides)
 
@@ -364,9 +378,14 @@ def embed_cmd(
         )
         model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
         st.upsert_model_version_cache(conn, cfg.model, cfg.model_revision, model_version)
-    filter_hash = filter_spec_hash(spec)
+    filter_hash = filter_spec_hash(spec, cfg.namespace)
 
-    # Load only CSVs that changed for this (model_version, filter_hash)
+    # Load only CSVs that changed for this (model_version, filter_hash).
+    # Each ingested_fingerprints entry is (path, fingerprint, row_count) where
+    # row_count is this file's *post-filter, pre-dedup* row count. Cross-file
+    # concept_id de-duplication happens later, so the summed skipped/loaded row
+    # counts below are reporting figures only — they can exceed the number of
+    # distinct concepts actually stored and must not be treated as authoritative.
     filtered = []
     ingested_fingerprints: list[tuple[Path, dict[str, object], int]] = []
     skipped_unchanged = 0
@@ -405,7 +424,7 @@ def embed_cmd(
                 )
                 continue
 
-            loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine)
+            loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine, namespace=cfg.namespace)
             filtered.extend(loaded)
             ingested_fingerprints.append((p, current_fp, len(loaded)))
             continue
@@ -413,7 +432,7 @@ def embed_cmd(
         # Read CSV first so the file is warm in the OS page cache, then hash
         # it.  Computing the SHA-256 on a cold file before read_csv caused two
         # sequential full scans of CONCEPT.csv (~500 MB) on every first run.
-        loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine)
+        loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine, namespace=cfg.namespace)
         current_fp = compute_csv_fingerprint(p)
         filtered.extend(loaded)
         ingested_fingerprints.append((p, current_fp, len(loaded)))
@@ -424,6 +443,34 @@ def embed_cmd(
             f"Skipped {skipped_unchanged} unchanged CSV file(s) "
             f"({skipped_unchanged_rows} filtered rows)."
         )
+
+    fingerprints_persisted = False
+
+    def persist_ingested_fingerprints() -> None:
+        """Record fingerprints for every CSV read this run (idempotent).
+
+        Safe to call at any point where the concepts contributed by these CSVs
+        are already fully represented in the store — i.e. the normal completion
+        path *and* the early-exit paths where nothing remains to embed.  This
+        ensures a CSV whose bytes changed but yields no new/changed embeddings
+        (or zero rows after filtering) still gets its fingerprint updated, so we
+        do not re-read and re-hash the same large file on every subsequent run.
+        """
+        nonlocal fingerprints_persisted
+        if fingerprints_persisted:
+            return
+        for path_obj, fingerprint, row_count in ingested_fingerprints:
+            st.upsert_csv_fingerprint(
+                conn,
+                csv_path=str(path_obj.resolve()),
+                model_version=model_version,
+                filter_hash=filter_hash,
+                size_bytes=int(fingerprint["size_bytes"]),
+                mtime_ns=int(fingerprint["mtime_ns"]),
+                sha256=str(fingerprint["sha256"]),
+                row_count=row_count,
+            )
+        fingerprints_persisted = True
 
     # Deduplicate by concept_id before model loading/embedding. Keep first-seen row.
     seen_concept_ids: set[int] = set()
@@ -444,11 +491,14 @@ def embed_cmd(
     filtered = deduped
 
     if not filtered:
+        # CSVs read this run produced no rows to embed; persist their
+        # fingerprints so they are not re-read and re-hashed next time.
+        persist_ingested_fingerprints()
         typer.echo("Nothing to embed.")
         raise typer.Exit(0)
 
     if not cfg.force:
-        existing_for_model = st.count_rows(conn, model_version)
+        existing_for_model = st.count_rows(conn, model_version, namespace=cfg.namespace)
         registry_rows = st.list_model_registry(conn)
         has_other_model_versions = any(
             row.model_version != model_version for row in registry_rows
@@ -493,13 +543,25 @@ def embed_cmd(
         quantization_scheme="none",
     )
 
+    # Texts to feed the tokenizer, keyed by concept_id; reused for change
+    # detection and embedding so build_embed_text runs at most once per row.
+    texts_for_embed: dict[int, str] | None = None
     if cfg.force:
         to_embed = filtered
     else:
-        candidate_texts = {
-            row.concept_id: build_embed_text(row, cfg.text_fields, cfg.separator)
-            for row in filtered
-        }
+        typer.echo(
+            f"Detecting which of {len(filtered)} concept(s) need embedding "
+            f"(namespace={cfg.namespace}) …"
+        )
+        # Fast path for the common single-field default avoids the per-row
+        # build_embed_text call overhead across millions of rows.
+        if cfg.text_fields == ["concept_name"]:
+            candidate_texts = {row.concept_id: row.concept_name for row in filtered}
+        else:
+            candidate_texts = {
+                row.concept_id: build_embed_text(row, cfg.text_fields, cfg.separator)
+                for row in filtered
+            }
         to_embed, new_count, changed_count, unchanged_count = st.classify_rows_requiring_embedding(
             conn,
             filtered,
@@ -510,10 +572,17 @@ def embed_cmd(
             "Embedding delta: "
             f"{new_count} new, {changed_count} changed-text, {unchanged_count} unchanged."
         )
+        # Keep only the texts we will actually embed, then release the rest.
+        texts_for_embed = {row.concept_id: candidate_texts[row.concept_id] for row in to_embed}
+        del candidate_texts
     skipped = len(filtered) - len(to_embed)
     typer.echo(f"Skipping {skipped} already-embedded, embedding {len(to_embed)} …")
 
     if not to_embed:
+        # Every concept from these CSVs is already embedded with current text,
+        # so the store is complete for them; record the (possibly updated)
+        # fingerprints to avoid re-reading unchanged-result files each run.
+        persist_ingested_fingerprints()
         typer.echo("Nothing new to embed. Use --force to re-embed.")
         raise typer.Exit(0)
 
@@ -543,6 +612,7 @@ def embed_cmd(
             cfg.text_fields,
             cfg.separator,
             model_version,
+            precomputed_texts=texts_for_embed,
         )
         total_embed_seconds += time.perf_counter() - embed_started
 
@@ -566,26 +636,17 @@ def embed_cmd(
     typer.echo(f"Embedding phase: {total_embed_seconds:.2f}s for {total_embedded} rows.")
     typer.echo(f"Write phase: {total_write_seconds:.2f}s for {total_embedded} rows.")
 
-    # Refresh logical view once after all checkpoint shards are written.
-    st.ensure_schema(conn)
+    # Refresh logical view once after all checkpoint shards are written
+    # (no-op for the duckdb backend).
+    st.refresh_view(conn)
 
-    total = st.count_rows(conn, model_version)
+    total = st.count_rows(conn, model_version, namespace=cfg.namespace)
     typer.echo(
         f"Done. Embedded {total_embedded} concepts. "
-        f"Total stored for this model version: {total}."
+        f"Total stored for this model version (namespace={cfg.namespace}): {total}."
     )
 
-    for path_obj, fingerprint, row_count in ingested_fingerprints:
-        st.upsert_csv_fingerprint(
-            conn,
-            csv_path=str(path_obj.resolve()),
-            model_version=model_version,
-            filter_hash=filter_hash,
-            size_bytes=int(fingerprint["size_bytes"]),
-            mtime_ns=int(fingerprint["mtime_ns"]),
-            sha256=str(fingerprint["sha256"]),
-            row_count=row_count,
-        )
+    persist_ingested_fingerprints()
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +811,13 @@ def export_cmd(
             help="Limit export to these vocabulary IDs (repeatable or comma-delimited)",
         ),
     ] = None,
+    namespace: Annotated[
+        str | None,
+        typer.Option(
+            "--namespace",
+            help="Export only this identity namespace (default: all namespaces)",
+        ),
+    ] = None,
     shard_rows: Annotated[
         int,
         typer.Option(
@@ -853,11 +921,16 @@ def export_cmd(
     total_files_written = 0
     total_files_skipped = 0
 
-    count_sql = """
+    # Optional namespace filter, applied to both the count and the COPY.
+    ns_predicate = "" if namespace is None else " AND namespace = ?"
+    ns_param: list[object] = [] if namespace is None else [namespace]
+
+    count_sql = f"""
         SELECT COUNT(*)
         FROM concept_embeddings
         WHERE model_version = ?
           AND ((? IS NULL AND vocabulary_id IS NULL) OR vocabulary_id = ?)
+          {ns_predicate}
     """
 
     for vocab in vocabularies_to_export:
@@ -868,7 +941,7 @@ def export_cmd(
 
         count_row = conn.execute(
             count_sql,
-            [selected_model_version, vocab_value, vocab_value],
+            [selected_model_version, vocab_value, vocab_value, *ns_param],
         ).fetchone()
         vocab_count = int(count_row[0]) if count_row else 0
         if vocab_count == 0:
@@ -893,6 +966,7 @@ def export_cmd(
             export_sql = f"""
                 COPY (
                     SELECT
+                        namespace,
                         concept_id,
                         concept_name,
                         domain_id,
@@ -907,6 +981,7 @@ def export_cmd(
                         embedded_at
                     FROM (
                         SELECT
+                            namespace,
                             concept_id,
                             concept_name,
                             domain_id,
@@ -923,6 +998,7 @@ def export_cmd(
                         FROM concept_embeddings
                         WHERE model_version = ?
                           AND ((? IS NULL AND vocabulary_id IS NULL) OR vocabulary_id = ?)
+                          {ns_predicate}
                     ) ranked
                     WHERE rn BETWEEN ? AND ?
                 ) TO '{escaped_output_path}'
@@ -930,7 +1006,7 @@ def export_cmd(
             """
             conn.execute(
                 export_sql,
-                [selected_model_version, vocab_value, vocab_value, start_rn, end_rn],
+                [selected_model_version, vocab_value, vocab_value, *ns_param, start_rn, end_rn],
             )
             total_files_written += 1
             total_rows_exported += end_rn - start_rn + 1

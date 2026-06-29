@@ -53,6 +53,10 @@ class EmbedConfig(BaseSettings):
     text_fields: Annotated[list[str], NoDecode] = ["concept_name"]
     separator: str = " "
 
+    # Identity: namespace separates source-concept datasets from Athena standard
+    # concepts so their concept_ids cannot collide on the primary key.
+    namespace: str = "athena"
+
     # Behaviour
     force: bool = False
 

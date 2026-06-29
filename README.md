@@ -200,6 +200,29 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 - If progress appears stalled, prefer `gpu-embed migrate-store --db ...`
   over `status` for migration-only workflows to avoid extra summary queries.
 
+#### Upgrading an existing store (`namespace` column)
+
+The embedding identity key is `(namespace, concept_id, model_version)`, where
+`namespace` defaults to `athena`. Upgrading a store created before `namespace`
+existed needs **no manual DDL**:
+
+- `ensure_schema` (run automatically by `embed`) adds the `namespace` column to
+  an existing table via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` and backfills
+  existing rows to `athena`. Just re-run `gpu-embed embed` as usual.
+- The first post-upgrade run re-reads and re-hashes each input CSV once (the
+  change-detection fingerprint now includes the namespace). Nothing is
+  re-embedded — already-stored concepts are detected as unchanged — and
+  subsequent runs skip unchanged files again. `model_version` is unchanged for
+  FP32 runs, so no re-embedding is triggered by the upgrade.
+- **Caveat — mixing namespaces in an existing file.** DuckDB cannot widen a
+  table's PRIMARY KEY in place, so a pre-existing DB keeps its old
+  `(concept_id, model_version)` key. That is fully correct for Athena-only use
+  (every row is `namespace=athena`). But if you want to ingest **source
+  concepts under a different `--namespace`** alongside existing data, start a
+  **fresh DB file** (e.g. `--db embeddings_v2.duckdb`) so it gets the
+  three-column key — otherwise a source `concept_id` that collides with an
+  Athena one is not kept separate. Athena-only workflows need no action.
+
 ### `embed` — batch embed concepts
 
 ```
@@ -237,6 +260,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--invalid-reason` | _(all)_ | Keep only rows with this invalid_reason; use `valid` as a shorthand for NULL/empty (repeatable) |
 | `--text-field` | `concept_name` | Column(s) to concatenate as embedding input (repeatable) |
 | `--separator` | `" "` | Separator between concatenated text fields |
+| `--namespace` | `athena` | Identity namespace; use a distinct value for source-concept datasets so their `concept_id`s don't collide with Athena |
 
 ### `cpt4` — populate CPT-4 names via Athena Java tool
 
@@ -300,6 +324,7 @@ Sharding is controlled by `--shard-rows` (rows per file).
 | `--db` | `embeddings.duckdb` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
+| `--namespace` | _(all)_ | Export only this identity namespace |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
 | `--compression` | `snappy` | Parquet codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `uncompressed` |
 | `--overwrite` | false | Replace existing shard files if present |

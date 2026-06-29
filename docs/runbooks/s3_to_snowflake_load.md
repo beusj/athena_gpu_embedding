@@ -131,6 +131,13 @@ AWS_PAGER="" aws s3 sync \
 
 ## 4) Load from S3 into Snowflake (`COPY INTO`)
 
+> Exported parquet includes a `namespace` column (default `athena`). It is part
+> of the embedding identity, so the target table carries it and the idempotent
+> load keys on `(namespace, concept_id, model_version)`. Source-concept datasets
+> exported under a distinct namespace load into the same table without colliding
+> with Athena standard concepts. `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` picks
+> the column up automatically.
+
 ```sql
 -- One-time file format
 CREATE OR REPLACE FILE FORMAT omop_parquet_ff
@@ -144,6 +151,7 @@ CREATE OR REPLACE STAGE omop_embed_stage
 
 -- Target table (example)
 CREATE TABLE IF NOT EXISTS concept_embeddings (
+  namespace STRING,
   concept_id BIGINT,
   concept_name STRING,
   domain_id STRING,
@@ -177,7 +185,7 @@ ON_ERROR = ABORT_STATEMENT;
 ## 5) Idempotent load with staging + `MERGE` (recommended)
 
 If you rerun loads often, use a staging table and upsert on
-`(concept_id, model_version)`.
+`(namespace, concept_id, model_version)`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS concept_embeddings_stage LIKE concept_embeddings;
@@ -189,7 +197,8 @@ ON_ERROR = ABORT_STATEMENT;
 
 MERGE INTO concept_embeddings t
 USING concept_embeddings_stage s
-  ON t.concept_id = s.concept_id
+  ON t.namespace = s.namespace
+ AND t.concept_id = s.concept_id
  AND t.model_version = s.model_version
 WHEN MATCHED THEN UPDATE SET
   concept_name = s.concept_name,
@@ -203,6 +212,7 @@ WHEN MATCHED THEN UPDATE SET
   embed_text = s.embed_text,
   embedded_at = s.embedded_at
 WHEN NOT MATCHED THEN INSERT (
+  namespace,
   concept_id,
   concept_name,
   domain_id,
@@ -216,6 +226,7 @@ WHEN NOT MATCHED THEN INSERT (
   model_version,
   embedded_at
 ) VALUES (
+  s.namespace,
   s.concept_id,
   s.concept_name,
   s.domain_id,

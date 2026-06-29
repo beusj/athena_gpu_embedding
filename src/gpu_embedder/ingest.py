@@ -15,7 +15,7 @@ from pathlib import Path
 
 import duckdb
 
-from gpu_embedder.models import ConceptRow, FilterSpec
+from gpu_embedder.models import DEFAULT_NAMESPACE, ConceptRow, FilterSpec
 
 logger = logging.getLogger(__name__)
 
@@ -95,15 +95,57 @@ def _build_where_clause(spec: FilterSpec | None) -> str:
     return " WHERE " + " AND ".join(predicates)
 
 
-def _records_to_concepts(records: list[tuple[object, ...]]) -> list[ConceptRow]:
-    """Validate raw row tuples into ConceptRow objects, skipping malformed rows."""
+def _nullish_to_none(value: str | None) -> str | None:
+    """Treat empty strings and the literal string 'NULL' (any case) as None."""
+    if value is None or value == "" or value.upper() == "NULL":
+        return None
+    return value
+
+
+def _coerced_scan_columns() -> str:
+    """SELECT list that coerces a raw all-varchar Athena scan to typed columns.
+
+    Replaces the old per-row Pydantic validators: ``concept_id`` is cast to
+    BIGINT (uncastable → NULL → row dropped) and the nullable string columns
+    map empty/``"NULL"`` to SQL NULL.  Doing this in DuckDB lets the row objects
+    be built from already-typed values, which is far cheaper than validating
+    millions of rows in Python.
+    """
+    parts: list[str] = []
+    for col in _ATHENA_COLUMNS:
+        if col == "concept_id":
+            parts.append("TRY_CAST(concept_id AS BIGINT) AS concept_id")
+        elif col == "concept_name":
+            parts.append("concept_name")
+        else:
+            parts.append(
+                f"CASE WHEN {col} IS NULL OR {col} = '' OR upper({col}) = 'NULL' "
+                f"THEN NULL ELSE {col} END AS {col}"
+            )
+    return ", ".join(parts)
+
+
+def _records_to_concepts(
+    records: list[tuple[object, ...]],
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+) -> list[ConceptRow]:
+    """Build ConceptRow objects from pre-coerced row tuples.
+
+    Tuples are in ``_ATHENA_COLUMNS`` order with ``concept_id`` already an int
+    (or None) and nullable strings already None.  Rows with a null
+    ``concept_id`` or ``concept_name`` are dropped (they cannot satisfy the
+    NOT NULL store columns).
+    """
     rows: list[ConceptRow] = []
+    skipped = 0
     for record in records:
-        payload = dict(zip(_ATHENA_COLUMNS, record, strict=True))
-        try:
-            rows.append(ConceptRow.model_validate(payload))
-        except Exception:
-            logger.warning("Skipping malformed row: %s", payload)
+        if record[0] is None or record[1] is None:
+            skipped += 1
+            continue
+        rows.append(ConceptRow(*record, namespace=namespace))
+    if skipped:
+        logger.warning("Skipped %d malformed row(s) with null concept_id/concept_name", skipped)
     return rows
 
 
@@ -118,17 +160,39 @@ def count_csv_rows(path: Path) -> int:
     return int(result[0]) if result is not None else 0
 
 
-def _read_csv_python(path: Path) -> list[ConceptRow]:
+def _read_csv_python(path: Path, *, namespace: str = DEFAULT_NAMESPACE) -> list[ConceptRow]:
     """Read Athena TSV rows in pure Python as a fallback engine."""
     rows: list[ConceptRow] = []
+    skipped = 0
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         for record in reader:
-            payload = {column: record.get(column, "") or "" for column in _ATHENA_COLUMNS}
+            raw_id = record.get("concept_id")
             try:
-                rows.append(ConceptRow.model_validate(payload))
-            except Exception:
-                logger.warning("Skipping malformed row: %s", payload)
+                concept_id = int(raw_id) if raw_id not in (None, "") else None
+            except (TypeError, ValueError):
+                concept_id = None
+            concept_name = record.get("concept_name") or ""
+            if concept_id is None:
+                skipped += 1
+                continue
+            rows.append(
+                ConceptRow(
+                    concept_id=concept_id,
+                    concept_name=concept_name,
+                    domain_id=_nullish_to_none(record.get("domain_id")),
+                    vocabulary_id=_nullish_to_none(record.get("vocabulary_id")),
+                    concept_class_id=_nullish_to_none(record.get("concept_class_id")),
+                    standard_concept=_nullish_to_none(record.get("standard_concept")),
+                    concept_code=_nullish_to_none(record.get("concept_code")),
+                    valid_start_date=_nullish_to_none(record.get("valid_start_date")),
+                    valid_end_date=_nullish_to_none(record.get("valid_end_date")),
+                    invalid_reason=_nullish_to_none(record.get("invalid_reason")),
+                    namespace=namespace,
+                )
+            )
+    if skipped:
+        logger.warning("Skipped %d malformed row(s) with null concept_id", skipped)
     return rows
 
 
@@ -136,28 +200,30 @@ def read_csv(
     path: Path,
     spec: FilterSpec | None = None,
     engine: str = "duckdb",
+    namespace: str = DEFAULT_NAMESPACE,
 ) -> list[ConceptRow]:
-    """Read a single Athena CONCEPT.csv and return validated ConceptRow objects.
+    """Read a single Athena CONCEPT.csv and return ConceptRow objects.
 
-    DuckDB is used as the default scanner and filter engine. All columns are
-    loaded as strings first; type coercion happens inside `ConceptRow`
-    validators (empty / "NULL" → None, concept_id → int).
+    DuckDB is the default scanner/filter engine. Columns are loaded as strings
+    first; type coercion (concept_id → BIGINT, empty/"NULL" → NULL) happens in
+    the scan SELECT so the Python objects are built from typed values.
+    All rows are tagged with *namespace* (default ``athena``).
     """
     logger.info("Reading %s", path)
     if engine == "python":
-        rows = _read_csv_python(path)
+        rows = _read_csv_python(path, namespace=namespace)
         return filter_rows(rows, spec) if spec is not None else rows
 
     sql = (
         "SELECT "
-        + ", ".join(_ATHENA_COLUMNS)
+        + _coerced_scan_columns()
         + " FROM read_csv(?, delim='\\t', header=true, all_varchar=true)"
         + _build_where_clause(spec)
     )
     with duckdb.connect() as conn:
         records = conn.execute(sql, [str(path)]).fetchall()
 
-    rows = _records_to_concepts(records)
+    rows = _records_to_concepts(records, namespace=namespace)
     logger.info("Loaded %d rows from %s", len(rows), path)
     return rows
 
@@ -172,6 +238,10 @@ def filter_rows(rows: list[ConceptRow], spec: FilterSpec) -> list[ConceptRow]:
     if not rows or not where_clause:
         logger.info("filter_rows: %d → %d rows after filtering", len(rows), len(rows))
         return list(rows)
+
+    # Rows passed in already share one namespace (read_csv tags uniformly);
+    # preserve it through the DuckDB round-trip.
+    namespace = rows[0].namespace
 
     with duckdb.connect() as conn:
         conn.execute(
@@ -212,12 +282,12 @@ def filter_rows(rows: list[ConceptRow], spec: FilterSpec) -> list[ConceptRow]:
         )
         records = conn.execute(
             "SELECT "
-            + ", ".join(_ATHENA_COLUMNS)
+            + _coerced_scan_columns()
             + " FROM concept_rows"
             + where_clause
         ).fetchall()
 
-    result = _records_to_concepts(records)
+    result = _records_to_concepts(records, namespace=namespace)
     logger.info("filter_rows: %d → %d rows after filtering", len(rows), len(result))
     return result
 
@@ -244,14 +314,16 @@ def compute_csv_fingerprint(path: Path) -> dict[str, object]:
     }
 
 
-def filter_spec_hash(spec: FilterSpec | None) -> str:
-    """Return a stable SHA-256 hex digest of *spec*.
+def filter_spec_hash(spec: FilterSpec | None, namespace: str = DEFAULT_NAMESPACE) -> str:
+    """Return a stable SHA-256 hex digest of *(spec, namespace)*.
 
-    The digest changes whenever any filter value is added or removed, so
-    a fingerprint recorded under one filter spec will not suppress a run
-    that uses a different spec (e.g. adding a new --vocabulary-id).
+    The digest changes whenever any filter value or the namespace is added or
+    removed, so a fingerprint recorded under one filter spec (or namespace) will
+    not suppress a run that uses a different one (e.g. ingesting the same file
+    under a second namespace, or adding a new --vocabulary-id).
     """
-    canonical: dict[str, list[str]] = {
+    canonical: dict[str, object] = {
+        "namespace": namespace,
         "vocabulary_ids": sorted(spec.vocabulary_ids if spec else []),
         "domain_ids": sorted(spec.domain_ids if spec else []),
         "concept_class_ids": sorted(spec.concept_class_ids if spec else []),

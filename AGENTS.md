@@ -13,8 +13,11 @@ orchestration, no LLM calls, no network I/O beyond the initial HuggingFace
 model download.
 
 Key invariants:
-- **Idempotent by default.** `(concept_id, model_version)` is the unique key;
-  rows that already exist are silently skipped unless `--force` is passed.
+- **Idempotent by default.** `(namespace, concept_id, model_version)` is the
+  unique key; rows that already exist are silently skipped unless `--force` is
+  passed. `namespace` defaults to `athena` for Athena standard concepts; source
+  datasets pass a distinct namespace so their (possibly colliding) `concept_id`s
+  stay separate.
 - **FP32 only.** No fp16/bf16 quantization. The `embed.py` module must never
   call `.half()` or `.to(torch.bfloat16)` on the model or tensors.
 - **One embedding model at a time.** `model_version` is a SHA-256 digest of the
@@ -49,10 +52,10 @@ uv run gpu-embed --help   # CLI entry point
 src/gpu_embedder/
 ├── cli.py        # Typer app; `embed` + `cpt4` subcommands; thin — delegates to other modules
 ├── config.py     # EmbedConfig (Pydantic BaseSettings); env prefix GPU_EMBED_; loads .env
-├── models.py     # ConceptRow (Pydantic), DuckDB DDL constant, FilterSpec
+├── models.py     # ConceptRow / EmbeddedRow (slots dataclasses), DuckDB DDL constants, FilterSpec
 ├── ingest.py     # read_csv() → filter_rows(); pure, no I/O side effects
 ├── embed.py      # load_model(), compute_model_version(), embed_batch()
-└── store.py      # open_db(), ensure_schema(), get_existing_ids(), upsert_rows()
+└── store.py      # open_db(), ensure_schema(), classify_rows_requiring_embedding(), upsert_rows()
 ```
 
 `cli.py` is the only module allowed to call all others. No other module imports
@@ -68,8 +71,14 @@ from `cli.py`.
 - Line length **100**. Ruff with `py312` target.
 - All public functions have type annotations. No `Any` except in explicit shim
   code (mark with `# type: ignore[misc]` and a comment explaining why).
-- **Pydantic models are the contract between modules.** `ingest.py` returns
+- **Typed dataclasses are the contract between modules.** `ingest.py` returns
   `list[ConceptRow]`; `embed.py` consumes it. No raw dicts across boundaries.
+  `ConceptRow`/`EmbeddedRow` are `@dataclass(slots=True)` (not Pydantic) because
+  millions are built per run and Pydantic instantiation dominated CSV load. The
+  light coercion the old validators did (`concept_id`→int, empty/`"NULL"`→None)
+  now lives in the DuckDB scan SELECT (`ingest._coerced_scan_columns`); keep
+  validation/coercion there, not in per-row Python. `EmbedConfig` stays Pydantic
+  `BaseSettings` (it's config, not a hot path).
 - **`.env` is the single source of truth for local config.** `EmbedConfig`
   must call `model_config = SettingsConfigDict(env_file=".env", extra="ignore")`
   so that any `.env` present is loaded automatically. Never hard-code paths or
@@ -82,7 +91,8 @@ from `cli.py`.
   `athena_vocab/`). When no explicit `CSV_PATH` arguments are given, the CLI
   reads `<vocab_dir>/CONCEPT.csv`.
 - **DuckDB is the default CSV engine.** Read/filter Athena TSVs through DuckDB
-  before Pydantic validation so large files are narrowed early.
+  and coerce types in the scan SELECT so large files are narrowed and typed
+  before any Python-level row objects are built.
 - `ingest_engine` can be set to `python` for a pure-Python fallback, but the
   default path should remain DuckDB.
 - Athena CSVs use **tab-separated values** (`\t`) with a header row. Always
@@ -132,19 +142,50 @@ from `cli.py`.
 - `compute_model_version()` must hash the actual weights on disk (not the model
   name string) — use SHA-256 over the `pytorch_model.bin` or `model.safetensors`
   file. This should be stable across runs for the same checkpoint.
+- **Quantization belongs in the `model_version`, not a per-row column.** Runtime
+  quantization changes the embeddings but not the weights file, so it must be
+  folded into the digest or fp32 and quantized variants collide on the primary
+  key. `compute_model_version(..., precision=, quantization_scheme=)` does this
+  *only when non-default* (`fp32`/`none` returns the bare weights hash, so
+  existing stores are unaffected). When you add a real quantized path, thread
+  the same precision/quantization into `compute_model_version`,
+  `upsert_model_registry`, **and** the `model_version_cache` key
+  (`get_cached_model_version`), and keep `model_registry` as the human-readable
+  provenance. Today the project is FP32-only, so callers pass the defaults.
 
 ### DuckDB
 
 - Schema DDL lives in `models.py` as a module-level constant string
   `SCHEMA_DDL`. `store.py` calls `conn.execute(SCHEMA_DDL)` with `IF NOT
   EXISTS`; never drop or alter existing tables.
-- The embedding column is `FLOAT[768]` (DuckDB array type). Insert as a Python
-  `list[float]` — do not serialize to JSON or bytes.
-- `get_existing_ids(conn, model_version)` returns a `set[int]` of `concept_id`s
-  that already have an embedding for that model version. Check before embedding,
-  not after.
-- All writes use a single `executemany` / `INSERT OR REPLACE` per batch, not
-  row-by-row.
+- The embedding column is `FLOAT[768]` (DuckDB array type). `EmbeddedRow.embedding`
+  stays a Python `list[float]` across module boundaries — do not serialize to
+  JSON or bytes.
+- **Moving bulk Python data into DuckDB always goes through Arrow.** Build a
+  columnar `pyarrow.Table` and `conn.register(...)` it, then `INSERT ... SELECT`
+  or JOIN against the registered relation. This is the *only* approved path for
+  anything that scales with row count — embedding writes
+  (`_embedded_rows_to_arrow()` → `INSERT OR REPLACE ... SELECT`, ~100× faster
+  than the old `executemany` on the wide `FLOAT[768]` column) **and** the
+  change-detection candidate set in `classify_rows_requiring_embedding()`
+  (register `(namespace, concept_id, embed_text)`, then LEFT JOIN). Two
+  anti-patterns are **banned for large inputs** — both have bitten this project:
+  - `conn.executemany("INSERT ... VALUES (?)", rows)` — per-row Python→DuckDB
+    binding; pathological for the embedding column.
+  - `... unnest(?::T[])` with a big Python list bound as the array param —
+    DuckDB materialises the whole list as one value ~quadratically (tens of
+    seconds at a few hundred thousand rows; effectively hangs at millions).
+    `unnest(?::T[])` is fine only for *small, bounded* lists (e.g. a handful of
+    filter values); never for a per-concept column.
+- `classify_rows_requiring_embedding()` is the single entry point for deciding
+  what to embed: it returns the rows needing work plus `(new, changed, unchanged)`
+  counts, skipping rows already embedded for the model version *and* re-embedding
+  rows whose `embed_text` changed. (The older `get_existing_ids` /
+  `filter_unembedded_rows` helpers were removed — do not reintroduce parallel
+  variants.)
+- The store context is tracked in a `weakref.WeakKeyDictionary` keyed by the
+  connection object — not `id(conn)` (which leaks and can alias a closed
+  connection after the id is recycled).
 - DuckDB connection is opened **once** per CLI invocation and passed down;
   modules do not open their own connections.
 
@@ -177,8 +218,10 @@ from `cli.py`.
 - **Do not embed SQL in Python f-strings.** Any non-trivial SQL goes in a
   `.sql` file under `src/gpu_embedder/sql/` and is loaded via a helper.
 - **Do not pass lists directly as bind parameters to DuckDB `IN` clauses.**
-  Use `IN (SELECT unnest(?::BIGINT[]))` or build the filter in Python before
-  the query.
+  For a *small, bounded* list, `IN (SELECT unnest(?::BIGINT[]))` is fine. For
+  anything that scales with row count, register an Arrow table and JOIN/semi-join
+  against it — never bind a large list as an `unnest(?::T[])` param (quadratic;
+  see the bulk-data rule under "DuckDB").
 - **Do not silently swallow embedding errors.** Log and re-raise; a partial
   batch should not produce a partial write.
 - **Do not use Parquet as the primary write store.** A Parquet-backed backend
@@ -205,7 +248,7 @@ from `cli.py`.
 
 The only write abstraction is `store.py`. To add PostgreSQL or another backend:
 1. Create `store_pg.py` implementing the same interface:
-   `open_db`, `ensure_schema`, `get_existing_ids`, `upsert_rows`.
+   `open_db`, `ensure_schema`, `classify_rows_requiring_embedding`, `upsert_rows`.
 2. Select via a `--backend` CLI flag (default `duckdb`).
 3. Do not modify `embed.py` or `ingest.py`.
 
