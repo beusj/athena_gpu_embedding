@@ -104,6 +104,12 @@ from `cli.py`.
   a single column type (e.g. `--vocabulary-id LOINC --vocabulary-id SNOMED`
   keeps rows where vocabulary is LOINC _or_ SNOMED).
 - The shorthand `--invalid-reason valid` must map to `NULL / ""` (both).
+- **`--vocabulary-id` defaults to a curated highest-yield set, not "all".** When
+  no `--vocabulary-id` is given, `cli.py` materializes `DEFAULT_VOCABULARY_IDS`
+  (in `models.py`) into the `FilterSpec` so the filter, fingerprint, and
+  `filter_spec_hash` all stay consistent. The reserved sentinel
+  `--vocabulary-id all` clears the filter to embed every vocabulary. Keep the
+  default as exact, case-sensitive Athena `vocabulary_id` strings.
 
 ### CPT-4 population
 
@@ -174,6 +180,18 @@ from `cli.py`.
 - The embedding column is `FLOAT[768]` (DuckDB array type). `EmbeddedRow.embedding`
   stays a Python `list[float]` across module boundaries — do not serialize to
   JSON or bytes.
+- **Source provenance round-trips as nullable columns, not a hash reversal.**
+  `concept_embeddings` carries nullable `source_id` + `mapping_wave` (NULL for
+  Athena; populated for `--source-parquet` runs). For a source row the BIGINT
+  `concept_id` is only a one-way hash of `source_id`
+  (`ingest._stable_source_concept_id`), so the original key must be stored
+  explicitly to rejoin concept-mapper's `source_concepts` on
+  `(mapping_wave, source_id)`. These two columns are **not** in the primary key
+  (the hashed `concept_id` already disambiguates within a namespace) and must
+  stay threaded through `ConceptRow`, `SCHEMA_DDL`, `_EMBEDDING_COLUMNS`,
+  `_embedded_rows_to_arrow()`, both parquet view projections, the shard writer,
+  and the `export` COPY. `read_source_parquet` reads `mapping_wave` defensively
+  (NULL when a legacy source parquet lacks it).
 - **Moving bulk Python data into DuckDB always goes through Arrow.** Build a
   columnar `pyarrow.Table` and `conn.register(...)` it, then `INSERT ... SELECT`
   or JOIN against the registered relation. This is the *only* approved path for

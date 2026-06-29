@@ -16,6 +16,15 @@ dependencies = [
     "pyarrow>=16",
 ]
 
+[project.optional-dependencies]
+# Torch build selection — choose exactly one backend when syncing:
+#   uv sync --extra gpu   CUDA 13.0 on Linux/Windows (CPU/MPS wheels on macOS)
+#   uv sync --extra cpu   CPU-only wheels everywhere — small, GPU-free; CI/tests
+# torch is also listed in [project.dependencies]; these extras only route which
+# index it is resolved from (see [tool.uv.sources]).
+cpu = ["torch>=2.3"]
+gpu = ["torch>=2.3"]
+
 [project.scripts]
 gpu-embed = "gpu_embedder.cli:app"
 
@@ -60,8 +69,19 @@ python_version = "3.12"
 strict = true
 ignore_missing_imports = true
 
-# Route torch to the CUDA 13.0 index on Linux and Windows.
-# macOS has no CUDA builds; it resolves from PyPI (CPU/MPS).
+# Torch is routed to an index by the chosen extra (cpu vs gpu), which are
+# mutually exclusive. macOS has no CUDA builds, so the gpu extra resolves torch
+# from PyPI (CPU/MPS) there via the marker below.
+[tool.uv]
+conflicts = [
+  [{ extra = "cpu" }, { extra = "gpu" }],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
@@ -69,5 +89,6 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu130", extra = "gpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

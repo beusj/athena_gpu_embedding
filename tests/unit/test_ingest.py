@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gpu_embedder.ingest import compute_csv_fingerprint, count_csv_rows, filter_rows, filter_spec_hash, read_csv
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from gpu_embedder.ingest import (
+    compute_csv_fingerprint,
+    count_csv_rows,
+    filter_rows,
+    filter_spec_hash,
+    read_csv,
+    read_source_parquet,
+)
 from gpu_embedder.models import ConceptRow, FilterSpec
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
@@ -218,3 +228,76 @@ class TestCsvFingerprintHelpers:
         spec_b = FilterSpec(vocabulary_ids=["LOINC", "SNOMED"])
 
         assert filter_spec_hash(spec_a) != filter_spec_hash(spec_b)
+
+    def test_filter_spec_hash_changes_when_extra_changes(self) -> None:
+        spec = FilterSpec(vocabulary_ids=["LOINC"])
+
+        assert filter_spec_hash(spec, extra={"text_fields": ["concept_name"]}) != filter_spec_hash(
+            spec,
+            extra={"text_fields": ["concept_code", "concept_name"]},
+        )
+
+
+class TestReadSourceParquet:
+    def test_reads_source_parquet_and_builds_embed_text(self, tmp_path: Path) -> None:
+        parquet_path = tmp_path / "source.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "source_id": ["SRC_1", "SRC_2"],
+                    "source_name": ["Glucose", "mg/dL"],
+                    "source_description": ["Blood glucose", "milligram per deciliter"],
+                    "source_domain": ["lab_component", "unit"],
+                    "ehr_codes": [
+                        '[{"system":"LOINC","code":"2345-7"}]',
+                        '[{"system":"UCUM","code":"mg/dL"}]',
+                    ],
+                    "sample_units": ["mg/dL", ""],
+                    "sample_values": ["80,95", ""],
+                    "data_type": ["numeric", "text"],
+                }
+            ),
+            parquet_path,
+        )
+
+        result = read_source_parquet(
+            parquet_path,
+            namespace="stcm_source",
+            text_fields=["concept_name", "source_description", "ehr_codes"],
+            separator=" | ",
+        )
+
+        assert len(result.rows) == 2
+        assert all(isinstance(row, ConceptRow) for row in result.rows)
+        first = result.rows[0]
+        assert first.namespace == "stcm_source"
+        assert first.concept_name == "Glucose"
+        assert first.domain_id == "lab_component"
+        assert first.vocabulary_id == "LOINC"
+        assert first.concept_code == "2345-7"
+        assert result.embed_texts[first.concept_id] == "Glucose | Blood glucose | LOINC:2345-7"
+
+    def test_blank_source_name_falls_back_to_source_id(self, tmp_path: Path) -> None:
+        parquet_path = tmp_path / "source.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "source_id": ["SRC_1"],
+                    "source_name": [""],
+                    "source_description": [None],
+                    "source_domain": ["unknown"],
+                    "ehr_codes": ["[]"],
+                    "sample_units": [None],
+                    "sample_values": [None],
+                    "data_type": [None],
+                }
+            ),
+            parquet_path,
+        )
+
+        result = read_source_parquet(parquet_path, namespace="stcm_source")
+
+        assert len(result.rows) == 1
+        row = result.rows[0]
+        assert row.concept_name == "SRC_1"
+        assert result.embed_texts[row.concept_id] == "SRC_1"

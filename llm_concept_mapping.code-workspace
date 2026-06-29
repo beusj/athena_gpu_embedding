@@ -8,10 +8,5 @@
 			"name": "llm_concept_mapping",
 			"path": "../../llm_concept_mapping"
 		}
-	],
-	"settings": {
-		"chat.tools.terminal.autoApprove": {
-			"uv": true
-		}
-	}
+	]
 }

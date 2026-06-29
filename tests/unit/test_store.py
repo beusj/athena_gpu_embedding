@@ -10,13 +10,20 @@ import duckdb
 from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow
 from gpu_embedder.store import (
     classify_rows_requiring_embedding,
+    count_embeddings,
     count_rows,
+    delete_csv_fingerprints,
+    delete_embeddings,
+    delete_model_metadata,
     ensure_schema,
+    get_cached_model_version,
     get_csv_fingerprint,
     list_model_registry,
+    list_vocabulary_counts,
     open_db,
     upsert_csv_fingerprint,
     upsert_model_registry,
+    upsert_model_version_cache,
     upsert_rows,
 )
 
@@ -452,3 +459,194 @@ class TestCsvFingerprints:
         assert result["mtime_ns"] == 201
         assert result["sha256"] == "new"
         assert result["row_count"] == 301
+
+
+# ---------------------------------------------------------------------------
+# cleanup / deletion
+# ---------------------------------------------------------------------------
+
+
+def _make_row_mv(
+    concept_id: int,
+    vocabulary_id: str,
+    model_version: str,
+) -> EmbeddedRow:
+    return EmbeddedRow(
+        concept=ConceptRow(
+            concept_id=concept_id,
+            concept_name=f"Concept {concept_id}",
+            domain_id="Condition",
+            vocabulary_id=vocabulary_id,
+            concept_class_id="Clinical Finding",
+            standard_concept="S",
+            concept_code=str(concept_id),
+            invalid_reason=None,
+        ),
+        embedding=[0.0] * 768,
+        embed_text=f"Concept {concept_id}",
+        model_version=model_version,
+        embedded_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def _seed_multi(conn: duckdb.DuckDBPyConnection) -> None:
+    upsert_rows(
+        conn,
+        [
+            _make_row_mv(1, "SNOMED", "mvA"),
+            _make_row_mv(2, "SNOMED", "mvA"),
+            _make_row_mv(3, "LOINC", "mvA"),
+            _make_row_mv(4, "RxNorm", "mvA"),
+            _make_row_mv(5, "SNOMED", "mvB"),
+        ],
+    )
+
+
+class TestListVocabularyCounts:
+    def test_counts_per_vocabulary(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        counts = dict(list_vocabulary_counts(conn, "mvA"))
+
+        assert counts == {"SNOMED": 2, "LOINC": 1, "RxNorm": 1}
+        conn.close()
+
+    def test_empty_for_unknown_model(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        assert list_vocabulary_counts(conn, "does-not-exist") == []
+        conn.close()
+
+
+class TestCountEmbeddings:
+    def test_counts_whole_model(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        assert count_embeddings(conn, "mvA") == 4
+        conn.close()
+
+    def test_counts_selected_vocabularies(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        assert count_embeddings(conn, "mvA", ["SNOMED", "LOINC"]) == 3
+        conn.close()
+
+
+class TestDeleteEmbeddings:
+    def test_delete_selected_vocabularies_only(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        deleted = delete_embeddings(conn, model_version="mvA", vocabulary_ids=["SNOMED"])
+
+        assert deleted == 2
+        assert dict(list_vocabulary_counts(conn, "mvA")) == {"LOINC": 1, "RxNorm": 1}
+        # Other model versions are untouched.
+        assert count_rows(conn, "mvB") == 1
+        conn.close()
+
+    def test_delete_whole_model(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        deleted = delete_embeddings(conn, model_version="mvA", vocabulary_ids=None)
+
+        assert deleted == 4
+        assert count_rows(conn, "mvA") == 0
+        assert count_rows(conn, "mvB") == 1
+        conn.close()
+
+    def test_delete_no_match_returns_zero(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        assert delete_embeddings(conn, model_version="mvA", vocabulary_ids=["ICD10CM"]) == 0
+        assert count_rows(conn, "mvA") == 4
+        conn.close()
+
+    def test_delete_whole_model_parquet_backend(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        deleted = delete_embeddings(conn, model_version="mvA", vocabulary_ids=None)
+
+        assert deleted == 4
+        assert count_rows(conn, "mvA") == 0
+        assert count_rows(conn, "mvB") == 1
+        conn.close()
+
+    def test_delete_vocabularies_parquet_backend(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings")
+        ensure_schema(conn)
+        _seed_multi(conn)
+
+        deleted = delete_embeddings(conn, model_version="mvA", vocabulary_ids=["SNOMED"])
+
+        assert deleted == 2
+        assert dict(list_vocabulary_counts(conn, "mvA")) == {"LOINC": 1, "RxNorm": 1}
+        assert count_rows(conn, "mvB") == 1
+        conn.close()
+
+
+class TestDeleteCsvFingerprints:
+    def test_removes_only_matching_model(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        upsert_csv_fingerprint(
+            conn,
+            csv_path="/tmp/CONCEPT.csv",
+            model_version="mvA",
+            filter_hash="f1",
+            size_bytes=1,
+            mtime_ns=1,
+            sha256="a",
+            row_count=1,
+        )
+        upsert_csv_fingerprint(
+            conn,
+            csv_path="/tmp/CONCEPT.csv",
+            model_version="mvB",
+            filter_hash="f1",
+            size_bytes=1,
+            mtime_ns=1,
+            sha256="b",
+            row_count=1,
+        )
+
+        removed = delete_csv_fingerprints(conn, "mvA")
+
+        assert removed == 1
+        assert get_csv_fingerprint(conn, "/tmp/CONCEPT.csv", "mvA", "f1") is None
+        assert get_csv_fingerprint(conn, "/tmp/CONCEPT.csv", "mvB", "f1") is not None
+        conn.close()
+
+
+class TestDeleteModelMetadata:
+    def test_removes_registry_and_cache(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        upsert_model_registry(
+            conn,
+            model_version="mvA",
+            model_id="FremyCompany/BioLORD-2023",
+            model_revision=None,
+        )
+        upsert_model_version_cache(conn, "FremyCompany/BioLORD-2023", None, "cls", "mvA")
+
+        delete_model_metadata(conn, "mvA")
+
+        assert all(e.model_version != "mvA" for e in list_model_registry(conn))
+        assert get_cached_model_version(conn, "FremyCompany/BioLORD-2023", None) is None
+        conn.close()

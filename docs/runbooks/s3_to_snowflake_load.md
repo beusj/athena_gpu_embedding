@@ -26,26 +26,30 @@ Use `export` as the standard handoff path from the local store:
 uv run gpu-embed export exports/parquet --db embeddings.duckdb
 ```
 
-Export output is written as:
+Export output is written as Hive-partitioned parquet:
 
-`exports/parquet/<vocabulary_id>/part-*.parquet`
+`exports/parquet/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
 
-If you need to mirror the full store layout for platform portability, use:
+This matches the parquet store / `migrate-store` layout, so the S3 tree and
+Snowflake external stage use one uniform layout regardless of which tool wrote
+it. `export` is the curated path (a single model version, optionally filtered by
+vocabulary/namespace); `migrate-store` mirrors the **full** store (every model
+version and all rows) for platform portability:
 
 ```bash
 uv run gpu-embed migrate-store --db embeddings.duckdb
 ```
 
-which creates:
+which creates the same partition layout under `embeddings/`:
 
 `embeddings/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
 
-Model hash provenance for mirrored store layout is stored at:
+Model hash provenance for the mirrored store layout is stored at:
 
 `embeddings/_meta/model_registry/part-*.parquet`
 
 ```bash
-uv run python -c "from pathlib import Path; print(len(list(Path('exports/parquet').glob('*/*.parquet'))))"
+uv run python -c "from pathlib import Path; print(len(list(Path('exports/parquet').glob('model_version=*/vocabulary_id=*/*.parquet'))))"
 ```
 
 If you are using `migrate-store` on a large dataset, throughput may slow as
@@ -107,9 +111,10 @@ Expected layout (export flow):
 
 ```text
 s3://<your-bucket>/concept_embeddings/
-  SNOMED/part-00000.parquet
-  LOINC/part-00000.parquet
-  _null/part-00000.parquet
+  model_version=<sha256>/
+    vocabulary_id=SNOMED/part-00000.parquet
+    vocabulary_id=LOINC/part-00000.parquet
+    vocabulary_id=_null/part-00000.parquet
 ```
 
 ### Optional: curated export flow
@@ -137,6 +142,13 @@ AWS_PAGER="" aws s3 sync \
 > exported under a distinct namespace load into the same table without colliding
 > with Athena standard concepts. `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` picks
 > the column up automatically.
+>
+> Exported parquet also includes nullable `source_id` and `mapping_wave` columns.
+> These are NULL for Athena concepts and populated for source-concept datasets so
+> embedded source rows can be rejoined to the concept-mapper `source_concepts`
+> table on `(mapping_wave, source_id)`. The hashed `concept_id` is only a dedupe
+> surrogate for source rows and cannot reconstruct `source_id`, so both columns
+> must survive the handoff.
 
 ```sql
 -- One-time file format
@@ -163,7 +175,9 @@ CREATE TABLE IF NOT EXISTS concept_embeddings (
   embedding ARRAY,
   embed_text STRING,
   model_version STRING,
-  embedded_at TIMESTAMP_NTZ
+  embedded_at TIMESTAMP_NTZ,
+  source_id STRING,
+  mapping_wave STRING
 );
 
 -- Bulk load all vocabulary directories
@@ -210,7 +224,9 @@ WHEN MATCHED THEN UPDATE SET
   invalid_reason = s.invalid_reason,
   embedding = s.embedding,
   embed_text = s.embed_text,
-  embedded_at = s.embedded_at
+  embedded_at = s.embedded_at,
+  source_id = s.source_id,
+  mapping_wave = s.mapping_wave
 WHEN NOT MATCHED THEN INSERT (
   namespace,
   concept_id,
@@ -224,7 +240,9 @@ WHEN NOT MATCHED THEN INSERT (
   embedding,
   embed_text,
   model_version,
-  embedded_at
+  embedded_at,
+  source_id,
+  mapping_wave
 ) VALUES (
   s.namespace,
   s.concept_id,
@@ -238,7 +256,9 @@ WHEN NOT MATCHED THEN INSERT (
   s.embedding,
   s.embed_text,
   s.model_version,
-  s.embedded_at
+  s.embedded_at,
+  s.source_id,
+  s.mapping_wave
 );
 
 TRUNCATE TABLE concept_embeddings_stage;

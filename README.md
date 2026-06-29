@@ -72,12 +72,18 @@ gpu_embedding/
 cp .env.example .env
 # edit .env — set GPU_EMBED_VOCAB_DIR, GPU_EMBED_DEVICE, etc.
 
-# 2. Install project + dev deps (requires uv ≥ 0.4)
-uv sync --group dev
+# 2. Install project + dev deps (requires uv ≥ 0.4). Pick a torch backend:
+uv sync --group dev --extra gpu   # CUDA 13.0 (Linux/Windows); CPU/MPS on macOS
+#   or, for a GPU-free environment (CI, laptops, running the tests):
+uv sync --group dev --extra cpu   # CPU-only torch wheels — small and fast
 
 # 3. Place Athena vocabulary files in athena_vocab/
 #    (or set GPU_EMBED_VOCAB_DIR in .env to your download location)
 ```
+
+`cpu` and `gpu` are mutually exclusive extras (enforced by `[tool.uv].conflicts`);
+choose exactly one. The `cpu` extra is the right choice for running the test
+suite, which mocks the model and never needs CUDA.
 
 The embedding model is downloaded from Hugging Face on first run and cached
 locally via the normal `~/.cache/huggingface` path.
@@ -96,12 +102,13 @@ use `--ingest-engine python` to switch the ingest path.
 > recreate it:
 > ```bash
 > uv venv --python 3.13
-> uv sync --group dev
+> uv sync --group dev --extra gpu
 > ```
 
-`pyproject.toml` includes a `[tool.uv.sources]` entry that routes `torch` to
-the CUDA 13.0 index on Linux and Windows, so a plain `uv sync` automatically
-installs the CUDA build — no extra step needed after the initial sync.
+`pyproject.toml` routes `torch` to a backend-specific index via the `gpu` / `cpu`
+extras (see `[tool.uv.sources]`): `uv sync --extra gpu` installs the CUDA 13.0
+build on Linux/Windows (CPU/MPS on macOS), while `uv sync --extra cpu` installs
+small CPU-only wheels — ideal for CI and for running the test suite without a GPU.
 
 To install or upgrade torch independently (e.g. into a fresh venv or when
 testing a different backend), use uv's built-in `--torch-backend` flag:
@@ -192,7 +199,7 @@ The `cpt4` subcommand will:
 
 ## CLI usage
 
-The tool has seven subcommands:
+The tool has eight subcommands:
 
 ```
 gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
@@ -200,6 +207,7 @@ gpu-embed export    [OPTIONS] OUTPUT_DIR      — export DB rows to sharded parq
 gpu-embed status    [OPTIONS]                — show what is stored in the DB
 gpu-embed model-registry [OPTIONS]           — show hash -> model/revision mappings
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
+gpu-embed cleanup   [OPTIONS]                — delete embeddings for a model/vocabularies
 gpu-embed migrate-store [OPTIONS]            — materialize/initialize the parquet store
 gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 ```
@@ -240,7 +248,9 @@ existed needs **no manual DDL**:
 
 - `ensure_schema` (run automatically by `embed`) adds the `namespace` column to
   an existing table via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` and backfills
-  existing rows to `athena`. Just re-run `gpu-embed embed` as usual.
+  existing rows to `athena`. The same idempotent migration adds the nullable
+  `source_id` / `mapping_wave` provenance columns (left NULL on existing rows).
+  Just re-run `gpu-embed embed` as usual.
 - The first post-upgrade run re-reads and re-hashes each input CSV once (the
   change-detection fingerprint now includes the namespace). Nothing is
   re-embedded — already-stored concepts are detected as unchanged — and
@@ -264,6 +274,10 @@ gpu-embed embed [OPTIONS] [CSV_PATH...]
 When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 `GPU_EMBED_VOCAB_DIR` (default `athena_vocab/`).
 
+To embed source-side query concepts instead, pass `--source-parquet` pointing
+at a Stage 0 `source_concepts` parquet file (or a directory of parquet files).
+That path uses a source adapter rather than the Athena `CONCEPT.csv` ingest.
+
 #### Positional
 
 | Argument | Description |
@@ -275,6 +289,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` (used when no explicit path given) |
+| `--source-parquet` | _(none)_ | Source-concept parquet file or directory to embed instead of Athena CSV |
 | `--db` | `embeddings.duckdb` | Embedding store path (default fast local DuckDB file; directory enables parquet store mode) |
 | `--batch-size` | `256` | Rows per GPU forward pass |
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
@@ -286,14 +301,74 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
 | `--verbose` | false | Enable detailed logging and progress visibility |
 | `--force` | false | Re-embed rows that already exist in the store |
-| `--vocabulary-id` | _(all)_ | Keep only these vocabulary IDs (repeatable or comma-delimited) |
+| `--vocabulary-id` | _(highest-yield set)_ | Keep only these vocabulary IDs (repeatable or comma-delimited). When omitted, defaults to the curated highest-yield vocabularies (see below). Pass `--vocabulary-id all` to embed every vocabulary instead. |
 | `--domain-id` | _(all)_ | Keep only these domain IDs (repeatable) |
 | `--concept-class-id` | _(all)_ | Keep only these concept class IDs (repeatable) |
 | `--standard-concept` | _(all)_ | Keep only `S`, `C`, or _(blank)_ rows (repeatable) |
 | `--invalid-reason` | _(all)_ | Keep only rows with this invalid_reason; use `valid` as a shorthand for NULL/empty (repeatable) |
 | `--text-field` | `concept_name` | Column(s) to concatenate as embedding input (repeatable) |
+| `--source-text-field` | `source_name` | Source parquet field(s) to concatenate as embedding input (repeatable) |
 | `--separator` | `" "` | Separator between concatenated text fields |
 | `--namespace` | `athena` | Identity namespace; use a distinct value for source-concept datasets so their `concept_id`s don't collide with Athena |
+| `--source-namespace` | `source` | Default namespace used by `--source-parquet` runs unless `--namespace` is passed |
+
+Source-parquet mode does not use the Athena filter flags (`--vocabulary-id`,
+`--domain-id`, `--concept-class-id`, `--standard-concept`, `--invalid-reason`).
+Instead, adapt the source parquet and choose the embed text with
+`--source-text-field`.
+
+#### Round-tripping source provenance
+
+A Stage 0 `source_concepts` parquet is keyed by `(mapping_wave, source_id)` in
+concept-mapper. When `embed` adapts it, the string `source_id` is hashed into a
+BIGINT `concept_id` surrogate (so it fits the embedding identity key and cannot
+collide with Athena `concept_id`s under a distinct `--namespace`). That hash is
+one-way, so the original `source_id` — and the `mapping_wave` — would otherwise
+be lost, and the resulting vectors could not be rejoined to `source_concepts`.
+
+To prevent that, `embed` carries both keys through unchanged as the nullable
+`source_id` / `mapping_wave` columns (NULL for Athena concepts, populated for
+source rows). They survive ingest, the DuckDB store, and the parquet `export`,
+so the downstream load can `MERGE` embedded source vectors back into
+concept-mapper's `source_concepts` on `(mapping_wave, source_id)`. The
+Snowflake target table and MERGE that do this are in
+[`docs/runbooks/s3_to_snowflake_load.md`](docs/runbooks/s3_to_snowflake_load.md).
+If a source parquet predates the `mapping_wave` column, ingest substitutes NULL
+rather than failing.
+
+#### Default vocabularies (highest-yield set)
+
+A full Athena `CONCEPT.csv` spans dozens of vocabularies, many of which add
+little value for downstream concept mapping while inflating embedding time and
+store size. So when **no** `--vocabulary-id` is given, `embed` does **not**
+embed everything — it defaults to a curated set of the highest-yield Athena
+vocabularies:
+
+| Domain | `vocabulary_id`(s) |
+|--------|--------------------|
+| Conditions | `SNOMED`, `ICD9CM`, `ICD10CM` |
+| Procedures | `CPT4`, `ICD9Proc`, `ICD10PCS` |
+| Drugs | `RxNorm`, `RxNorm Extension`, `NDC` |
+| Labs / measurements | `LOINC` |
+| Demographics | `Race`, `Ethnicity` |
+| Providers | `ABMS`, `NUCC`, `Medicare Specialty` |
+
+To override:
+
+```bash
+# Embed every vocabulary present in the CSV (reserved sentinel "all"):
+gpu-embed embed --vocabulary-id all
+
+# Restrict to an explicit subset (disables the default):
+gpu-embed embed --vocabulary-id SNOMED,RxNorm
+```
+
+> **CPT-4 note:** Athena ships CPT-4 with blank concept names; run
+> `gpu-embed cpt4` (UMLS license required) to populate them *before* embedding,
+> otherwise the CPT4 rows embed degenerate text.
+
+The default list is the `DEFAULT_VOCABULARY_IDS` constant in
+`src/gpu_embedder/models.py`; edit it there to change the curated set.
 
 ### `cpt4` — populate CPT-4 names via Athena Java tool
 
@@ -339,30 +414,30 @@ Shows mappings between `model_version` hashes and model metadata, including
 | `--backfill-from-logs` | false | Parse `GPU_EMBED_LOG_DIR` logs for model/revision lines and upsert derived hash mappings |
 | `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
 
-### `export` — write sharded parquet by vocabulary directory
+### `export` — write Hive-partitioned parquet by model and vocabulary
 
 ```
 gpu-embed export [OPTIONS] OUTPUT_DIR
 ```
 
-Exports rows from `concept_embeddings` into parquet files under a per-model
-directory so different models — and different poolings of the same weights — never
-collide:
+Exports rows from `concept_embeddings` into Hive-partitioned parquet files:
 
-`OUTPUT_DIR/<model_id>__<pooling>/<vocabulary_id>/part-00000.parquet`
+`OUTPUT_DIR/model_version=<digest>/vocabulary_id=<value>/part-00000.parquet`
 
-The model directory is the model id slugified (`/` → `__`) with the pooling
-appended, e.g. `FremyCompany__BioLORD-2023__mean/` (falling back to
-`model-<version-prefix>__<pooling>/` for versions absent from the registry). A
-`_manifest.json` recording the resolved model version, pooling, filters, and row
-count is written at the model directory root. Sharding is controlled by
-`--shard-rows` (rows per file).
+This mirrors the parquet store / `migrate-store` layout, so a single uniform
+Hive-partitioned layout is used everywhere (S3, Snowflake external stages).
+Because the path includes `model_version=<digest>`, exporting more than one
+model version into the same `OUTPUT_DIR` is safe — different versions land in
+separate partitions instead of colliding on `part-*.parquet` filenames.
 
-Because a single set of weights can now produce both a `cls` and a `mean` version
-(see "Choosing an embedding model"), a selection that matches both poolings is
-**ambiguous**: the command lists the candidates and exits, asking you to add
-`--pooling`. Use `gpu-embed model-registry` to see which versions are `cls` vs
-`mean` before exporting.
+Pooling is folded into `model_version` (see "Choosing an embedding model"), so a
+`cls` and a `mean` export of the same weights automatically land under distinct
+`model_version=` partitions. When a `--model-version` prefix (or the default
+"most recent") matches **both** poolings, the selection is ambiguous: the command
+lists the candidates and exits, asking you to add `--pooling {cls,mean}`. Use
+`gpu-embed model-registry` to see which versions are `cls` vs `mean` first.
+
+Within each partition, sharding is controlled by `--shard-rows` (rows per file).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -401,6 +476,52 @@ When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
 | `--model-version` | _(most recent)_ | Limit comparison to the version starting with this prefix |
 | `--show-complete` / `--gaps-only` | `show-complete` | Include or hide fully-embedded groups |
 | `--csv`, `-o` | _(none)_ | Write the aggregated coverage report to a CSV file |
+
+### `cleanup` — delete embeddings for a model / vocabularies
+
+```
+gpu-embed cleanup [OPTIONS]
+```
+
+Permanently deletes stored embeddings for **one model version**, restricted to
+either **all** of its vocabularies or a chosen subset. It is cautious by design:
+
+- It previews exactly what will be removed (model, vocabularies, and the count)
+  before touching anything.
+- It requires confirmation. Deleting a *subset* of vocabularies asks a `y/N`
+  question; deleting an *entire* model version requires retyping the model
+  version's 16-character hash prefix.
+- `--dry-run` shows the plan and stops without deleting.
+- `--yes` / `-y` skips the prompt for scripted use.
+
+Run it with no options for a guided flow: it lists stored model versions (with
+their `model_id`, e.g. `FremyCompany/BioLORD-2023`), then lists that model's
+vocabularies with counts so you can pick numbers or choose `A` for all.
+
+After a delete it also invalidates the affected `csv_fingerprints` so a later
+`embed` run re-reads the source CSVs (the fingerprints otherwise claim the file
+was fully ingested). When a model version is left with zero embeddings, its
+`model_registry` and weight-hash cache entries are removed too.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db` | `embeddings.duckdb` | Embedding store path to clean up |
+| `--model-version` | _(interactive)_ | Model version hash prefix to delete (must match exactly one) |
+| `--vocabulary-id` | _(interactive)_ | Vocabulary IDs to delete (repeatable or comma-delimited) |
+| `--all-vocabularies` | `false` | Delete every vocabulary for the model version |
+| `--dry-run` | `false` | Show what would be deleted, then stop |
+| `--yes`, `-y` | `false` | Skip the confirmation prompt |
+
+```bash
+# Guided, fully interactive: choose model, then vocabularies
+gpu-embed cleanup
+
+# Delete just the BioLORD SNOMED + LOINC embeddings, no prompt
+gpu-embed cleanup --model-version 3f2a9c --vocabulary-id SNOMED,LOINC --yes
+
+# Preview removing an entire model version without deleting
+gpu-embed cleanup --model-version 3f2a9c --all-vocabularies --dry-run
+```
 
 ### Examples
 
@@ -450,7 +571,9 @@ gpu-embed embed /data/vocab/CONCEPT.csv \
 # Show what model versions are stored and concept counts by vocabulary/domain
 gpu-embed status
 
-# Export most recent model version into sharded parquet (errors if cls/mean are ambiguous)
+# Export most recent model version into Hive-partitioned parquet
+# (model_version=<digest>/vocabulary_id=<value>/part-*.parquet)
+# Errors and lists candidates if the selection matches both cls and mean.
 gpu-embed export exports/parquet --shard-rows 50000
 
 # Export the mean-pooled BioLORD-2023 embeddings (disambiguate by pooling)
@@ -518,12 +641,22 @@ CREATE TABLE concept_embeddings (
     embed_text          TEXT      NOT NULL,    -- exact string that was embedded
     model_version       TEXT      NOT NULL,    -- SHA-256 digest of model weights
     embedded_at         TIMESTAMP NOT NULL,
+    source_id           TEXT,                  -- source-dataset key (NULL for Athena)
+    mapping_wave        TEXT,                  -- concept-mapper wave (NULL for Athena)
     PRIMARY KEY (namespace, concept_id, model_version)
 );
 ```
 
 The `model_version` digest ensures that embeddings from different model
 checkpoints (or different models entirely) are never silently mixed.
+
+The nullable `source_id` / `mapping_wave` columns are populated only for
+`--source-parquet` runs (NULL for Athena concepts). They carry the
+concept-mapper `source_concepts` natural key through embedding so the vectors
+can be rejoined on `(mapping_wave, source_id)` — see
+[Round-tripping source provenance](#round-tripping-source-provenance) below.
+They are intentionally **not** part of the primary key: the hashed `concept_id`
+surrogate already disambiguates source rows within their namespace.
 
 ---
 
@@ -535,6 +668,7 @@ so an empty `.env` is valid for local GPU runs against `athena_vocab/`.
 ```dotenv
 # Paths
 GPU_EMBED_VOCAB_DIR=athena_vocab
+GPU_EMBED_SOURCE_PARQUET=source_concepts/
 GPU_EMBED_DB=embeddings.duckdb   # native DuckDB table (default); a directory path selects the parquet store
 
 # Model (see "Choosing an embedding model"; e.g. FremyCompany/BioLORD-2023)
@@ -545,7 +679,10 @@ GPU_EMBED_BATCH_SIZE=256
 GPU_EMBED_MAX_LENGTH=128
 GPU_EMBED_UPSERT_EVERY_BATCHES=250
 GPU_EMBED_TEXT_FIELDS=concept_name
+GPU_EMBED_SOURCE_TEXT_FIELDS=source_name,source_description
 GPU_EMBED_SEPARATOR=" "
+GPU_EMBED_NAMESPACE=athena
+GPU_EMBED_SOURCE_NAMESPACE=source
 
 # CPT-4 / UMLS
 UMLS_API_KEY=your-key-here

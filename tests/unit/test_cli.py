@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import csv
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
-from gpu_embedder.models import ConceptRow, EmbeddedRow
-from gpu_embedder.store import ensure_schema, open_db, upsert_model_registry, upsert_rows
+from gpu_embedder.ingest import SourceParquetRows
+from gpu_embedder.models import DEFAULT_VOCABULARY_IDS, ConceptRow, EmbeddedRow
+from gpu_embedder.store import (
+    ensure_schema,
+    list_model_registry,
+    open_db,
+    upsert_model_registry,
+    upsert_rows,
+)
 
 
 def _seed_embeddings_db(db_path: Path) -> None:
@@ -326,6 +332,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
     monkeypatch.setattr("gpu_embedder.store.get_cached_model_version", fake_get_cached_model_version)
     monkeypatch.setattr("gpu_embedder.store.upsert_model_version_cache", fake_upsert_model_version_cache)
+    monkeypatch.setattr("gpu_embedder.store.refresh_view", lambda conn: None)
 
     result = runner.invoke(
         app,
@@ -404,6 +411,9 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     def fake_upsert_csv_fingerprint(conn, *, csv_path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
         recorded_fingerprints.append(csv_path)
 
+    def fake_get_cached_model_version(conn, model_id: str, revision, pooling: str = "cls"):  # type: ignore[no-untyped-def]
+        return "test-model-version"
+
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
     monkeypatch.setattr("gpu_embedder.embed.load_model", fake_load_model)
     monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
@@ -416,6 +426,9 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     monkeypatch.setattr("gpu_embedder.store.upsert_model_registry", fake_upsert_model_registry)
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
+    monkeypatch.setattr("gpu_embedder.store.get_cached_model_version", fake_get_cached_model_version)
+    monkeypatch.setattr("gpu_embedder.store.count_rows", lambda conn, model_version, namespace=None: 0)
+    monkeypatch.setattr("gpu_embedder.store.list_model_registry", lambda conn: [])
 
     result = runner.invoke(app, ["embed", str(fixture), "--device", "cpu"])
 
@@ -430,11 +443,23 @@ def test_embed_accepts_comma_delimited_vocabulary_id(monkeypatch) -> None:
 
     captured: dict[str, object] = {}
 
+    class _FakeConn:
+        pass
+
     def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["path"] = path
         captured["vocabulary_ids"] = spec.vocabulary_ids
         captured["engine"] = engine
         return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
 
@@ -454,9 +479,21 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
 
     captured: dict[str, object] = {}
 
+    class _FakeConn:
+        pass
+
     def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["vocabulary_ids"] = spec.vocabulary_ids
         return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
 
@@ -474,6 +511,153 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
 
     assert result.exit_code == 0
     assert captured["vocabulary_ids"] == ["LOINC", "SNOMED", "RxNorm"]
+
+
+def test_embed_defaults_to_highest_yield_vocabularies(monkeypatch) -> None:
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    captured: dict[str, object] = {}
+
+    class _FakeConn:
+        pass
+
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
+        captured["vocabulary_ids"] = spec.vocabulary_ids
+        return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+
+    result = runner.invoke(app, ["embed", str(fixture)])
+
+    assert result.exit_code == 0
+    assert captured["vocabulary_ids"] == list(DEFAULT_VOCABULARY_IDS)
+    assert "defaulting to highest-yield vocabularies" in result.output
+
+
+def test_embed_all_sentinel_embeds_every_vocabulary(monkeypatch) -> None:
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    captured: dict[str, object] = {}
+
+    class _FakeConn:
+        pass
+
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
+        captured["vocabulary_ids"] = spec.vocabulary_ids
+        return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+
+    result = runner.invoke(app, ["embed", str(fixture), "--vocabulary-id", "all"])
+
+    assert result.exit_code == 0
+    assert captured["vocabulary_ids"] == []
+    assert "Embedding all vocabularies" in result.output
+
+
+def test_embed_source_parquet_uses_source_adapter_defaults(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    source_dir = tmp_path / "source_concepts"
+    source_dir.mkdir()
+    parquet_path = source_dir / "wave.parquet"
+    parquet_path.write_bytes(b"not-real-parquet")
+
+    captured: dict[str, object] = {}
+
+    class _FakeConn:
+        pass
+
+    def fake_open_db(path: Path):
+        return _FakeConn()
+
+    def fake_ensure_schema(conn) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_get_cached_model_version(conn, model_id: str, revision, pooling: str = "cls"):  # type: ignore[no-untyped-def]
+        return "test-model-version"
+
+    def fake_get_csv_fingerprint(conn, csv_path: str, model_version: str, filter_hash: str):  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_read_source_parquet(path: Path, *, namespace: str, text_fields, separator: str):  # type: ignore[no-untyped-def]
+        captured["path"] = path
+        captured["namespace"] = namespace
+        captured["text_fields"] = list(text_fields)
+        captured["separator"] = separator
+        return SourceParquetRows(rows=[], embed_texts={})
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", fake_open_db)
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", fake_ensure_schema)
+    monkeypatch.setattr("gpu_embedder.store.get_cached_model_version", fake_get_cached_model_version)
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
+    monkeypatch.setattr("gpu_embedder.cli.read_source_parquet", fake_read_source_parquet)
+
+    result = runner.invoke(
+        app,
+        [
+            "embed",
+            "--source-parquet",
+            str(source_dir),
+            "--source-namespace",
+            "stcm_source",
+            "--source-text-field",
+            "concept_name",
+            "--source-text-field",
+            "source_description",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["path"] == parquet_path
+    assert captured["namespace"] == "stcm_source"
+    assert captured["text_fields"] == ["concept_name", "source_description"]
+    assert "Loaded 0 rows from source parquet input." in result.output
+    assert "Nothing to embed." in result.output
+
+
+def test_embed_source_parquet_rejects_athena_filters(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    parquet_path = tmp_path / "wave.parquet"
+    parquet_path.write_bytes(b"not-real-parquet")
+
+    result = runner.invoke(
+        app,
+        [
+            "embed",
+            "--source-parquet",
+            str(parquet_path),
+            "--vocabulary-id",
+            "LOINC",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Athena filter options are not supported with --source-parquet" in result.output
 
 
 def test_migrate_store_invokes_store_initialization(monkeypatch, tmp_path: Path) -> None:
@@ -500,7 +684,7 @@ def test_migrate_store_invokes_store_initialization(monkeypatch, tmp_path: Path)
     assert "ensure" in calls
 
 
-def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
+def test_export_writes_sharded_parquet_by_model_and_vocabulary(tmp_path: Path) -> None:
     runner = CliRunner()
     db_path = tmp_path / "embeddings.duckdb"
     out_dir = tmp_path / "parquet"
@@ -579,25 +763,23 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
 
-    # No registry entry for "v1" -> treated as cls, slug falls back to model-<version>.
-    model_dir = out_dir / "model-v1__cls"
-    snomed_files = sorted((model_dir / "SNOMED").glob("*.parquet"))
-    loinc_files = sorted((model_dir / "LOINC").glob("*.parquet"))
+    model_dir = out_dir / "model_version=v1"
+    snomed_files = sorted((model_dir / "vocabulary_id=SNOMED").glob("*.parquet"))
+    loinc_files = sorted((model_dir / "vocabulary_id=LOINC").glob("*.parquet"))
 
     assert len(snomed_files) == 2
     assert len(loinc_files) == 1
-    assert (model_dir / "_manifest.json").exists()
 
     from duckdb import connect
 
     verify_conn = connect()
     snomed_count = verify_conn.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
-        [str(model_dir / "SNOMED" / "*.parquet")],
+        [str(model_dir / "vocabulary_id=SNOMED" / "*.parquet")],
     ).fetchone()
     loinc_count = verify_conn.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
-        [str(model_dir / "LOINC" / "*.parquet")],
+        [str(model_dir / "vocabulary_id=LOINC" / "*.parquet")],
     ).fetchone()
     verify_conn.close()
 
@@ -673,15 +855,12 @@ def test_export_pooling_selects_matching_version(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
 
-    mean_dir = out_dir / "FremyCompany__BioLORD-2023__mean"
-    cls_dir = out_dir / "FremyCompany__BioLORD-2023__cls"
-    assert (mean_dir / "SNOMED").is_dir()
+    # Pooling is folded into model_version, so the mean run lands under its own
+    # model_version= partition; the cls version is not exported.
+    mean_dir = out_dir / "model_version=vmean"
+    cls_dir = out_dir / "model_version=vcls"
+    assert (mean_dir / "vocabulary_id=SNOMED").is_dir()
     assert not cls_dir.exists()
-
-    manifest = json.loads((mean_dir / "_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["model_version"] == "vmean"
-    assert manifest["pooling"] == "mean"
-    assert manifest["model_id"] == model_id
 
 
 def test_export_rejects_invalid_pooling(tmp_path: Path) -> None:
@@ -756,3 +935,186 @@ def test_model_registry_backfills_from_logs(tmp_path: Path, monkeypatch) -> None
     assert "Backfill complete from logs" in result.output
     assert "FremyCompany/BioLORD-2023" in result.output
     assert "f8c969586cc6b0fd" in result.output
+
+
+# ---------------------------------------------------------------------------
+# cleanup subcommand
+# ---------------------------------------------------------------------------
+
+
+def _seed_cleanup_db(db_path: Path) -> None:
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    rows = []
+    for cid, vocab in [(1, "SNOMED"), (2, "SNOMED"), (3, "LOINC"), (4, "RxNorm")]:
+        rows.append(
+            EmbeddedRow(
+                concept=ConceptRow(
+                    concept_id=cid,
+                    concept_name=f"Concept {cid}",
+                    domain_id="Condition",
+                    vocabulary_id=vocab,
+                ),
+                embedding=[0.0] * 768,
+                embed_text=f"Concept {cid}",
+                model_version="abc123def456",
+                embedded_at=datetime.now(tz=UTC),
+            )
+        )
+    upsert_rows(conn, rows)
+    upsert_model_registry(
+        conn,
+        model_version="abc123def456",
+        model_id="FremyCompany/BioLORD-2023",
+        model_revision=None,
+    )
+    conn.close()
+
+
+def test_cleanup_deletes_selected_vocabulary_with_yes(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "cleanup",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "abc123",
+            "--vocabulary-id",
+            "SNOMED",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Deleted 2 embedding(s)." in result.output
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ?",
+        ["abc123def456"],
+    ).fetchone()
+    assert remaining[0] == 2
+    conn.close()
+
+
+def test_cleanup_dry_run_changes_nothing(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "cleanup",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "abc123",
+            "--all-vocabularies",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Dry run" in result.output
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    count = conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()
+    assert count[0] == 4
+    conn.close()
+
+
+def test_cleanup_whole_model_requires_hash_confirmation(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    # Wrong confirmation aborts and deletes nothing.
+    bad = runner.invoke(
+        app,
+        ["cleanup", "--db", str(db_path), "--model-version", "abc123", "--all-vocabularies"],
+        input="nope\n",
+    )
+    assert bad.exit_code == 1
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    assert conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()[0] == 4
+    conn.close()
+
+    # Correct hash prefix proceeds and removes the whole model + registry entry.
+    ok = runner.invoke(
+        app,
+        ["cleanup", "--db", str(db_path), "--model-version", "abc123", "--all-vocabularies"],
+        input="abc123def456\n",
+    )
+    assert ok.exit_code == 0, ok.output
+    assert "Deleted 4 embedding(s)." in ok.output
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    assert conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()[0] == 0
+    assert list_model_registry(conn) == []
+    conn.close()
+
+
+def test_cleanup_unknown_vocabulary_errors(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "cleanup",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "abc123",
+            "--vocabulary-id",
+            "NOTREAL",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "not present" in result.output
+
+
+def test_cleanup_interactive_selection(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    # One model version (select 1), then pick the LOINC row, then confirm y.
+    # SNOMED(2) sorts first by count, LOINC and RxNorm follow.
+    result = runner.invoke(
+        app,
+        ["cleanup", "--db", str(db_path)],
+        input="1\n2\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    remaining = conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()[0]
+    assert remaining == 3
+    conn.close()
+
+
+def test_cleanup_no_embeddings(tmp_path: Path) -> None:
+    db_path = tmp_path / "empty.duckdb"
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    conn.close()
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["cleanup", "--db", str(db_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert "nothing to clean up" in result.output

@@ -44,6 +44,13 @@ class ConceptRow:
     invalid_reason: str | None = None  # None means valid
     # Provenance/identity dimension; part of the embedding primary key.
     namespace: str = DEFAULT_NAMESPACE
+    # Source-dataset provenance (NULL for Athena concepts).  These round-trip the
+    # concept-mapper ``source_concepts`` natural key so embedded source rows can
+    # be rejoined on ``(mapping_wave, source_id)``.  ``concept_id`` for a source
+    # row is only a hashed surrogate (see ``ingest._stable_source_concept_id``)
+    # and cannot reconstruct ``source_id``, so it is carried explicitly here.
+    source_id: str | None = None
+    mapping_wave: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +66,42 @@ class EmbeddedRow:
     embed_text: str        # exact string passed to the tokenizer
     model_version: str     # SHA-256 digest of model weights
     embedded_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Default "highest-yield" vocabularies
+# ---------------------------------------------------------------------------
+
+# When `embed` is run without any `--vocabulary-id`, the filter would otherwise
+# match *every* vocabulary in CONCEPT.csv (millions of rows, much of it low-value
+# for downstream concept mapping). Instead we default to this curated set of the
+# highest-yield Athena vocabularies, covering conditions, procedures, drugs, labs,
+# demographics, and provider taxonomies.
+#
+# These are the exact, case-sensitive Athena ``vocabulary_id`` strings (DuckDB
+# string equality is case-sensitive). To bypass this default and embed every
+# vocabulary, pass the reserved sentinel ``--vocabulary-id all``.
+DEFAULT_VOCABULARY_IDS: tuple[str, ...] = (
+    "SNOMED",            # conditions, clinical findings (standard)
+    "ICD9CM",            # legacy US diagnoses
+    "ICD10CM",           # US diagnoses
+    "ICD9Proc",          # legacy US inpatient procedures
+    "ICD10PCS",          # US inpatient procedures
+    "CPT4",              # outpatient procedures (names require the `cpt4` step)
+    "LOINC",             # lab tests, measurements, vitals
+    "RxNorm",            # drugs (standard)
+    "RxNorm Extension",  # OHDSI drugs not covered by RxNorm
+    "NDC",               # drug product codes
+    "Race",              # demographics
+    "Ethnicity",         # demographics
+    "ABMS",              # provider board certifications / specialties
+    "NUCC",              # provider taxonomy / specialties
+    "Medicare Specialty",  # CMS provider/supplier specialty codes
+)
+
+# Reserved sentinel value for `--vocabulary-id` that disables the highest-yield
+# default and embeds every vocabulary present in the source CSV(s).
+ALL_VOCABULARIES_SENTINEL = "all"
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +138,12 @@ CREATE TABLE IF NOT EXISTS concept_embeddings (
     embed_text          TEXT      NOT NULL,
     model_version       TEXT      NOT NULL,
     embedded_at         TIMESTAMP NOT NULL,
+    -- Source-dataset provenance; NULL for Athena concepts.  Carries the
+    -- concept-mapper source_concepts key so embedded source rows round-trip
+    -- back on (mapping_wave, source_id).  Not part of the primary key (the
+    -- hashed concept_id surrogate already disambiguates within a namespace).
+    source_id           TEXT,
+    mapping_wave        TEXT,
     PRIMARY KEY (namespace, concept_id, model_version)
 );
 """

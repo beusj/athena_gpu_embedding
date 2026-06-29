@@ -32,6 +32,7 @@ class EmbedConfig(BaseSettings):
 
     # Paths
     vocab_dir: Path = Path("athena_vocab")
+    source_parquet: Path | None = None
     db: Path = Path("embeddings.duckdb")
     log_dir: Path = Path("logs")
     log_max_bytes: int = 2 * 1024 * 1024
@@ -55,11 +56,13 @@ class EmbedConfig(BaseSettings):
 
     # Text construction
     text_fields: Annotated[list[str], NoDecode] = ["concept_name"]
+    source_text_fields: Annotated[list[str], NoDecode] = ["source_name"]
     separator: str = " "
 
     # Identity: namespace separates source-concept datasets from Athena standard
     # concepts so their concept_ids cannot collide on the primary key.
     namespace: str = "athena"
+    source_namespace: str = "source"
 
     # Behaviour
     force: bool = False
@@ -71,7 +74,7 @@ class EmbedConfig(BaseSettings):
             raise ValueError("must be greater than 0")
         return v
 
-    @field_validator("text_fields", mode="before")
+    @field_validator("text_fields", "source_text_fields", mode="before")
     @classmethod
     def parse_text_fields(cls, v: object) -> list[str]:
         """Allow comma-separated string from env var."""
