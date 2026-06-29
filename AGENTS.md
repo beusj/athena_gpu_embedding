@@ -8,7 +8,8 @@ Guidance for AI coding agents (and humans) working in this repository.
 
 `gpu-embedder` is a focused CLI tool that batch-embeds OHDSI Athena
 `CONCEPT.csv` files using **SapBERT** (FP32, CUDA GPU) and persists vectors to
-a local **DuckDB** database. It is intentionally single-purpose: no pipeline
+a local **Lance** store (`embeddings.lance` by default; a `.duckdb` path selects
+the DuckDB backend instead). It is intentionally single-purpose: no pipeline
 orchestration, no LLM calls, no network I/O beyond the initial HuggingFace
 model download.
 
@@ -244,8 +245,8 @@ from `cli.py`.
   output.
 - **Do not quantize** the model (`fp16`, `int8`, `bnb`, etc.).
 - **Do not add a pipeline orchestration layer** (no Prefect, Airflow, etc.).
-- **Do not read or write anything other than local files and DuckDB.** No
-  Snowflake, no S3, no HTTP in production code paths.
+- **Do not read or write anything other than local files and the local store
+  (Lance or DuckDB).** No Snowflake, no S3, no HTTP in production code paths.
 - **Do not embed SQL in Python f-strings.** Any non-trivial SQL goes in a
   `.sql` file under `src/gpu_embedder/sql/` and is loaded via a helper.
 - **Do not pass lists directly as bind parameters to DuckDB `IN` clauses.**

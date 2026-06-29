@@ -1,7 +1,8 @@
 # DuckDB concurrency: embed (writes) vs export/status (reads)
 
 **Date:** 2026-06
-**Status:** Notes / options — no change made yet
+**Status:** Superseded — Lance adopted as the live store (2026-06-29; see
+`adr_lance_store_proposal.md`). Notes retained for historical context.
 
 ---
 
@@ -108,11 +109,11 @@ addendum); the concurrency-relevant takeaways:
   `adr_parquet_store_rejected.md` (4× amplification, rewrites the whole
   partition). So MERGE is the part of Delta this workload must avoid.
 
-Given pure DuckDB is the standing live backend, the proportionate concurrency
-answer is **in-process, cursor-per-thread** (Option 1): no backend change, and
-DuckDB's MVCC already supports one writer plus concurrent readers in a single
-process. Cross-process concurrency is impossible with one `.duckdb` file
-(exclusive lock), and the snapshot-copy workaround is unattractive at tens of GB.
+When using the DuckDB backend specifically, the proportionate concurrency answer
+is **in-process, cursor-per-thread** (Option 1): no backend change, and DuckDB's
+MVCC already supports one writer plus concurrent readers in a single process.
+Cross-process concurrency is impossible with one `.duckdb` file (exclusive lock),
+and the snapshot-copy workaround is unattractive at tens of GB.
 
 True cross-process multi-reader access requires a **file-based** backend — the
 demoted parquet path + compaction, Delta-rs in *append* mode (not MERGE), or
