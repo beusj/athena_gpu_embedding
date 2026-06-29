@@ -1,8 +1,9 @@
 """Typer CLI entry point for gpu-embedder.
 
 Subcommands:
-  gpu-embed embed [OPTIONS] [CSV_PATH...]   — batch-embed concepts
-  gpu-embed cpt4  [OPTIONS]                 — populate CPT-4 names via Athena Java tool
+  gpu-embed embed   [OPTIONS] [CSV_PATH...] — batch-embed concepts
+  gpu-embed cpt4    [OPTIONS]               — populate CPT-4 names via Athena Java tool
+  gpu-embed cleanup [OPTIONS]               — delete embeddings for a model/vocabularies
 
 This module is intentionally thin: all logic lives in config, ingest, embed,
 and store.  cli.py is excluded from coverage requirements.
@@ -22,12 +23,16 @@ from collections import defaultdict
 from datetime import datetime
 from glob import glob
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import torch
 import typer
 from dotenv import load_dotenv
 from typer.main import get_command
+
+if TYPE_CHECKING:
+    from gpu_embedder.report import ModelVersionInfo
+    from gpu_embedder.store import ModelRegistryEntry
 
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
@@ -1413,3 +1418,283 @@ def coverage_cmd(
                     ]
                 )
         typer.echo(f"Coverage CSV written: {csv_output}")
+
+
+# ---------------------------------------------------------------------------
+# cleanup subcommand
+# ---------------------------------------------------------------------------
+
+
+def _resolve_cleanup_model_version(
+    versions: list[ModelVersionInfo],
+    registry_by_version: dict[str, ModelRegistryEntry],
+    model_version_prefix: str | None,
+) -> str:
+    """Resolve the model version to clean up, interactively when not specified.
+
+    With a prefix, require a *unique* match (a destructive command should never
+    guess between candidates).  Without one, render a numbered menu and prompt.
+    Returns the full model_version hash. Exits the program on bad input.
+    """
+    def _model_label(model_version: str) -> str:
+        entry = registry_by_version.get(model_version)
+        if entry is None:
+            return "(unknown model — not in registry)"
+        revision = entry.model_revision or "default"
+        return f"{entry.model_id} (revision={revision})"
+
+    if model_version_prefix:
+        matched = [v for v in versions if v.model_version.startswith(model_version_prefix)]
+        if not matched:
+            typer.echo(
+                f"No model version starting with '{model_version_prefix}' found.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        if len(matched) > 1:
+            typer.echo(
+                f"'{model_version_prefix}' matches {len(matched)} model versions; "
+                "use a longer, unambiguous prefix:",
+                err=True,
+            )
+            for v in matched:
+                typer.echo(f"  {v.short_hash}…  {_model_label(v.model_version)}", err=True)
+            raise typer.Exit(1)
+        return matched[0].model_version
+
+    typer.echo("\nStored model versions:")
+    typer.echo(f"  {'#':>3}  {'MODEL VERSION':18}  {'CONCEPTS':>9}  MODEL")
+    typer.echo("  " + "-" * 78)
+    for idx, v in enumerate(versions, start=1):
+        typer.echo(
+            f"  {idx:>3}  {v.short_hash}…  {v.count:>9,}  {_model_label(v.model_version)}"
+        )
+    choice = typer.prompt("\nSelect a model version to clean up by number", type=int)
+    if choice < 1 or choice > len(versions):
+        typer.echo(f"Invalid selection: {choice}.", err=True)
+        raise typer.Exit(1)
+    return str(versions[choice - 1].model_version)
+
+
+def _resolve_cleanup_vocabularies(
+    available: list[tuple[str | None, int]],
+    requested: list[str],
+    all_vocabularies: bool,
+) -> list[str] | None:
+    """Resolve which vocabularies to delete.
+
+    Returns ``None`` to mean "every vocabulary for the model" (a full wipe of
+    the model version) or a concrete list of vocabulary IDs.  Interactive when
+    neither ``--all-vocabularies`` nor ``--vocabulary-id`` is given.  Exits on
+    bad input.
+    """
+    available_named = [vocab for vocab, _ in available if vocab is not None]
+
+    if all_vocabularies:
+        return None
+
+    if requested:
+        unknown = [v for v in requested if v not in available_named]
+        if unknown:
+            typer.echo(
+                "Vocabulary ID(s) not present for this model version: "
+                + ", ".join(unknown),
+                err=True,
+            )
+            raise typer.Exit(1)
+        # De-duplicate while preserving the order the user gave.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for v in requested:
+            if v not in seen:
+                seen.add(v)
+                ordered.append(v)
+        return ordered
+
+    # Interactive menu.
+    typer.echo("\nVocabularies for this model version:")
+    typer.echo(f"  {'#':>3}  {'VOCABULARY':24}  {'CONCEPTS':>9}")
+    typer.echo("  " + "-" * 42)
+    for idx, (vocab, count) in enumerate(available, start=1):
+        typer.echo(f"  {idx:>3}  {vocab or '(null)':24}  {count:>9,}")
+    typer.echo(f"  {'A':>3}  {'all of the above (whole model version)':<24}")
+    raw = typer.prompt(
+        "\nSelect vocabularies to delete (comma-separated numbers, or 'A' for all)"
+    )
+    answer = raw.strip().lower()
+    if answer in {"a", "all"}:
+        return None
+
+    selected: list[str] = []
+    seen_idx: set[int] = set()
+    for piece in answer.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if not piece.isdigit():
+            typer.echo(f"Invalid selection: '{piece}'.", err=True)
+            raise typer.Exit(1)
+        num = int(piece)
+        if num < 1 or num > len(available):
+            typer.echo(f"Selection out of range: {num}.", err=True)
+            raise typer.Exit(1)
+        if num in seen_idx:
+            continue
+        seen_idx.add(num)
+        vocab = available[num - 1][0]
+        if vocab is None:
+            typer.echo(
+                "The (null) vocabulary cannot be selected individually; "
+                "use 'A' to delete the whole model version.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        selected.append(vocab)
+
+    if not selected:
+        typer.echo("Nothing selected; aborting.", err=True)
+        raise typer.Exit(1)
+    return selected
+
+
+@app.command("cleanup")
+def cleanup_cmd(
+    db: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path to clean up"),
+    ] = None,
+    model_version_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--model-version",
+            help="Model version hash prefix to delete (must match exactly one)",
+        ),
+    ] = None,
+    vocabulary_id: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--vocabulary-id",
+            help="Vocabulary IDs to delete (repeatable or comma-delimited)",
+        ),
+    ] = None,
+    all_vocabularies: Annotated[
+        bool,
+        typer.Option(
+            "--all-vocabularies",
+            help="Delete every vocabulary for the model version (the whole model)",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what would be deleted, then stop"),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip the confirmation prompt (use with care)"),
+    ] = False,
+) -> None:
+    """Delete embeddings for a chosen model version and vocabularies.
+
+    Cautious by design: it previews exactly what will be removed and requires
+    confirmation before deleting anything. Run with no options for a guided,
+    interactive selection of the model version and vocabularies.
+    """
+    from gpu_embedder import store as st
+    from gpu_embedder.report import list_model_versions
+
+    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    versions = list_model_versions(conn)
+    if not versions:
+        typer.echo("No embeddings found in the store; nothing to clean up.")
+        raise typer.Exit(0)
+
+    if all_vocabularies and vocabulary_id:
+        typer.echo(
+            "ERROR: pass either --all-vocabularies or --vocabulary-id, not both.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    registry_by_version = {entry.model_version: entry for entry in st.list_model_registry(conn)}
+
+    model_version = _resolve_cleanup_model_version(
+        versions, registry_by_version, model_version_prefix
+    )
+    available = st.list_vocabulary_counts(conn, model_version)
+    requested = _split_multi_values(vocabulary_id)
+    vocabularies = _resolve_cleanup_vocabularies(available, requested, all_vocabularies)
+
+    delete_count = st.count_embeddings(conn, model_version, vocabularies)
+    total_for_model = st.count_rows(conn, model_version)
+    entry = registry_by_version.get(model_version)
+    model_label = (
+        f"{entry.model_id} (revision={entry.model_revision or 'default'})"
+        if entry is not None
+        else "(unknown model — not in registry)"
+    )
+
+    typer.echo("\nPlanned deletion")
+    typer.echo(f"  Store:          {cfg.db}")
+    typer.echo(f"  Model version:  {model_version[:16]}…  {model_label}")
+    if vocabularies is None:
+        typer.echo("  Vocabularies:   ALL (the entire model version will be removed)")
+    else:
+        typer.echo(f"  Vocabularies:   {', '.join(vocabularies)}")
+    typer.echo(f"  Embeddings to delete: {delete_count:,} of {total_for_model:,} for this model.")
+
+    if delete_count == 0:
+        typer.echo("\nNothing matches the selection; nothing to delete.")
+        raise typer.Exit(0)
+
+    if dry_run:
+        typer.secho("\nDry run: no changes were made.", fg=typer.colors.YELLOW)
+        raise typer.Exit(0)
+
+    will_empty_model = delete_count >= total_for_model
+
+    if not yes:
+        typer.secho(
+            "\nWARNING: this permanently deletes embeddings and cannot be undone.",
+            fg=typer.colors.RED,
+        )
+        # Deleting an entire model version is the highest-risk case; require the
+        # user to retype its short hash, not just a y/N.
+        if will_empty_model:
+            typed = typer.prompt(
+                f"To remove the WHOLE model version, retype its hash prefix "
+                f"({model_version[:16]})"
+            )
+            if typed.strip() != model_version[:16]:
+                typer.echo("Confirmation did not match; aborting.", err=True)
+                raise typer.Exit(1)
+        else:
+            typer.confirm(
+                f"Permanently delete {delete_count:,} embedding(s)?",
+                default=False,
+                abort=True,
+            )
+
+    deleted = st.delete_embeddings(
+        conn, model_version=model_version, vocabulary_ids=vocabularies
+    )
+    fingerprints_removed = st.delete_csv_fingerprints(conn, model_version)
+
+    remaining = st.count_rows(conn, model_version)
+    if remaining == 0:
+        st.delete_model_metadata(conn, model_version)
+        typer.echo(
+            f"Removed model registry/cache entries for {model_version[:16]}… "
+            "(no embeddings remain)."
+        )
+
+    typer.secho(f"\nDeleted {deleted:,} embedding(s).", fg=typer.colors.GREEN)
+    if fingerprints_removed:
+        typer.echo(
+            f"Invalidated {fingerprints_removed} CSV fingerprint(s) so a later "
+            "`embed` run will re-read the source CSV(s)."
+        )
+    typer.echo(f"{remaining:,} embedding(s) remain for this model version.")

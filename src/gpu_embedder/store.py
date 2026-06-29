@@ -8,6 +8,7 @@ paths use parquet shards partitioned by model_version and vocabulary_id.
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 import uuid
 import weakref
@@ -766,6 +767,247 @@ def count_rows(
             [model_version, namespace],
         ).fetchone()
     return int(result[0]) if result else 0
+
+
+# ---------------------------------------------------------------------------
+# Deletion / cleanup
+# ---------------------------------------------------------------------------
+
+
+def list_vocabulary_counts(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+) -> list[tuple[str | None, int]]:
+    """Return ``(vocabulary_id, count)`` pairs for *model_version*, busiest first.
+
+    ``vocabulary_id`` may be ``None`` for rows with no vocabulary.  Returns an
+    empty list when the table/view does not exist yet.  Drives both the
+    interactive cleanup menu and the pre-delete preview.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT vocabulary_id, COUNT(*) AS cnt
+            FROM concept_embeddings
+            WHERE model_version = ?
+            GROUP BY vocabulary_id
+            ORDER BY cnt DESC, vocabulary_id NULLS LAST
+            """,
+            [model_version],
+        ).fetchall()
+    except duckdb.CatalogException:
+        return []
+    return [(row[0], int(row[1])) for row in rows]
+
+
+def count_embeddings(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+    vocabulary_ids: list[str] | None = None,
+) -> int:
+    """Count embeddings for *model_version*, optionally restricted to vocabularies.
+
+    When *vocabulary_ids* is ``None``, counts every embedding for the model
+    version.  Otherwise counts only the listed vocabularies.  This is the
+    figure ``delete_embeddings`` would remove for the same arguments.
+    """
+    if vocabulary_ids is None:
+        result = conn.execute(
+            "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ?",
+            [model_version],
+        ).fetchone()
+    else:
+        # Small, bounded list (a handful of vocabularies) — unnest is the
+        # approved pattern for IN against a bind parameter here.
+        result = conn.execute(
+            """
+            SELECT COUNT(*) FROM concept_embeddings
+            WHERE model_version = ?
+              AND vocabulary_id IN (SELECT unnest(?::VARCHAR[]))
+            """,
+            [model_version, list(vocabulary_ids)],
+        ).fetchone()
+    return int(result[0]) if result else 0
+
+
+def _delete_parquet_partitions(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+    vocabulary_ids: list[str] | None,
+) -> None:
+    """Remove parquet partition directories for a model version / vocabularies.
+
+    The parquet layout is ``model_version=<mv>/vocabulary_id=<vocab>/*.parquet``,
+    so deleting whole vocabularies (or a whole model version) is a directory
+    removal — no shard rewrite needed.  Each concept lives in exactly one
+    vocabulary partition, so nothing it removes can be resurrected by the dedup
+    view.  The logical view is refreshed afterwards.
+    """
+    ctx = _get_context(conn)
+    assert ctx.parquet_root is not None
+    model_dir = ctx.parquet_root / f"model_version={model_version}"
+
+    if vocabulary_ids is None:
+        if model_dir.exists():
+            shutil.rmtree(model_dir)
+    else:
+        for vocab in vocabulary_ids:
+            partition = NULL_VOCAB_PARTITION if vocab is None else vocab
+            vocab_dir = model_dir / f"vocabulary_id={partition}"
+            if vocab_dir.exists():
+                shutil.rmtree(vocab_dir)
+        # Drop the now-empty model directory so it does not linger.
+        if model_dir.exists() and not any(model_dir.iterdir()):
+            model_dir.rmdir()
+
+    _refresh_view(conn, ctx.parquet_root)
+
+
+def delete_embeddings(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    model_version: str,
+    vocabulary_ids: list[str] | None = None,
+) -> int:
+    """Delete stored embeddings for *model_version*; return the count removed.
+
+    When *vocabulary_ids* is ``None`` every embedding for the model version is
+    removed.  Otherwise only the listed vocabularies are removed.  This is a
+    hard, irreversible delete — callers (the ``cleanup`` CLI) are responsible
+    for confirmation.
+
+    The count is measured *before* deletion (it is also the count this would
+    remove) so the caller can report it.  After a delete the caller should
+    invalidate CSV fingerprints (see ``delete_csv_fingerprints``) so a later
+    ``embed`` run re-reads the source CSVs instead of trusting a now-stale
+    "fully ingested" fingerprint.
+    """
+    ctx = _get_context(conn)
+    deleted = count_embeddings(conn, model_version, vocabulary_ids)
+    if deleted == 0:
+        return 0
+
+    if ctx.backend == "duckdb":
+        if vocabulary_ids is None:
+            conn.execute(
+                "DELETE FROM concept_embeddings WHERE model_version = ?",
+                [model_version],
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM concept_embeddings
+                WHERE model_version = ?
+                  AND vocabulary_id IN (SELECT unnest(?::VARCHAR[]))
+                """,
+                [model_version, list(vocabulary_ids)],
+            )
+    else:
+        _delete_parquet_partitions(conn, model_version, vocabulary_ids)
+
+    return deleted
+
+
+def delete_csv_fingerprints(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+) -> int:
+    """Drop csv_fingerprints for *model_version*; return rows removed.
+
+    Embeddings and fingerprints can drift after a cleanup: a fingerprint says a
+    CSV was fully ingested for ``(model_version, filter_hash)``, which is no
+    longer true once those embeddings are deleted, so ``embed`` would skip the
+    file and never re-create them.  Always call this after deleting embeddings
+    for a model version.  No-op (returns 0) for the parquet backend, which has
+    no fingerprint table.
+    """
+    ctx = _get_context(conn)
+    if ctx.backend != "duckdb":
+        return 0
+    before = conn.execute(
+        "SELECT COUNT(*) FROM csv_fingerprints WHERE model_version = ?",
+        [model_version],
+    ).fetchone()
+    removed = int(before[0]) if before else 0
+    if removed:
+        conn.execute(
+            "DELETE FROM csv_fingerprints WHERE model_version = ?",
+            [model_version],
+        )
+    return removed
+
+
+def _delete_parquet_registry_entry(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+) -> None:
+    """Rewrite the parquet model registry without *model_version*."""
+    ctx = _get_context(conn)
+    assert ctx.parquet_root is not None
+    registry_files = _registry_files(ctx.parquet_root)
+    if not registry_files:
+        return
+
+    remaining = [e for e in list_model_registry(conn) if e.model_version != model_version]
+    for file_path in registry_files:
+        file_path.unlink()
+    if not remaining:
+        return
+
+    registry_dir = _registry_dir(ctx.parquet_root)
+    registry_dir.mkdir(parents=True, exist_ok=True)
+    rewrite = pa.table(
+        {
+            "model_version": pa.array([e.model_version for e in remaining], type=pa.string()),
+            "model_id": pa.array([e.model_id for e in remaining], type=pa.string()),
+            "model_revision": pa.array(
+                [e.model_revision for e in remaining], type=pa.string()
+            ),
+            "precision": pa.array([e.precision for e in remaining], type=pa.string()),
+            "quantization_scheme": pa.array(
+                [e.quantization_scheme for e in remaining], type=pa.string()
+            ),
+            "recorded_at": pa.array(
+                [
+                    e.recorded_at.replace(tzinfo=None) if e.recorded_at.tzinfo else e.recorded_at
+                    for e in remaining
+                ],
+                type=pa.timestamp("us"),
+            ),
+        }
+    )
+    registry_path = registry_dir / f"part-{uuid.uuid4().hex}.parquet"
+    conn.register("_registry_rewrite", rewrite)
+    try:
+        conn.execute(
+            """
+            COPY (SELECT * FROM _registry_rewrite ORDER BY model_version)
+            TO '__REGISTRY_PATH__'
+            (FORMAT PARQUET, COMPRESSION SNAPPY)
+            """.replace(
+                "__REGISTRY_PATH__", registry_path.as_posix().replace("'", "''")
+            )
+        )
+    finally:
+        conn.unregister("_registry_rewrite")
+
+
+def delete_model_metadata(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+) -> None:
+    """Remove the registry entry and weight-hash cache for *model_version*.
+
+    Call only once a model version has *no* embeddings left, so ``status`` and
+    ``model-registry`` do not advertise a model with zero vectors and a later
+    ``embed`` re-hashes the weights instead of reusing the cached digest.
+    """
+    ctx = _get_context(conn)
+    if ctx.backend == "duckdb":
+        conn.execute("DELETE FROM model_registry WHERE model_version = ?", [model_version])
+        conn.execute("DELETE FROM model_version_cache WHERE sha256 = ?", [model_version])
+        return
+    _delete_parquet_registry_entry(conn, model_version)
 
 
 def upsert_model_registry(

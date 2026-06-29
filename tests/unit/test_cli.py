@@ -10,7 +10,13 @@ from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
 from gpu_embedder.models import DEFAULT_VOCABULARY_IDS, ConceptRow, EmbeddedRow
-from gpu_embedder.store import ensure_schema, open_db, upsert_model_registry, upsert_rows
+from gpu_embedder.store import (
+    ensure_schema,
+    list_model_registry,
+    open_db,
+    upsert_model_registry,
+    upsert_rows,
+)
 
 
 def _seed_embeddings_db(db_path: Path) -> None:
@@ -692,3 +698,186 @@ def test_model_registry_backfills_from_logs(tmp_path: Path, monkeypatch) -> None
     assert "Backfill complete from logs" in result.output
     assert "FremyCompany/BioLORD-2023" in result.output
     assert "f8c969586cc6b0fd" in result.output
+
+
+# ---------------------------------------------------------------------------
+# cleanup subcommand
+# ---------------------------------------------------------------------------
+
+
+def _seed_cleanup_db(db_path: Path) -> None:
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    rows = []
+    for cid, vocab in [(1, "SNOMED"), (2, "SNOMED"), (3, "LOINC"), (4, "RxNorm")]:
+        rows.append(
+            EmbeddedRow(
+                concept=ConceptRow(
+                    concept_id=cid,
+                    concept_name=f"Concept {cid}",
+                    domain_id="Condition",
+                    vocabulary_id=vocab,
+                ),
+                embedding=[0.0] * 768,
+                embed_text=f"Concept {cid}",
+                model_version="abc123def456",
+                embedded_at=datetime.now(tz=UTC),
+            )
+        )
+    upsert_rows(conn, rows)
+    upsert_model_registry(
+        conn,
+        model_version="abc123def456",
+        model_id="FremyCompany/BioLORD-2023",
+        model_revision=None,
+    )
+    conn.close()
+
+
+def test_cleanup_deletes_selected_vocabulary_with_yes(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "cleanup",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "abc123",
+            "--vocabulary-id",
+            "SNOMED",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Deleted 2 embedding(s)." in result.output
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ?",
+        ["abc123def456"],
+    ).fetchone()
+    assert remaining[0] == 2
+    conn.close()
+
+
+def test_cleanup_dry_run_changes_nothing(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "cleanup",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "abc123",
+            "--all-vocabularies",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Dry run" in result.output
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    count = conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()
+    assert count[0] == 4
+    conn.close()
+
+
+def test_cleanup_whole_model_requires_hash_confirmation(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    # Wrong confirmation aborts and deletes nothing.
+    bad = runner.invoke(
+        app,
+        ["cleanup", "--db", str(db_path), "--model-version", "abc123", "--all-vocabularies"],
+        input="nope\n",
+    )
+    assert bad.exit_code == 1
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    assert conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()[0] == 4
+    conn.close()
+
+    # Correct hash prefix proceeds and removes the whole model + registry entry.
+    ok = runner.invoke(
+        app,
+        ["cleanup", "--db", str(db_path), "--model-version", "abc123", "--all-vocabularies"],
+        input="abc123def456\n",
+    )
+    assert ok.exit_code == 0, ok.output
+    assert "Deleted 4 embedding(s)." in ok.output
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    assert conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()[0] == 0
+    assert list_model_registry(conn) == []
+    conn.close()
+
+
+def test_cleanup_unknown_vocabulary_errors(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "cleanup",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "abc123",
+            "--vocabulary-id",
+            "NOTREAL",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "not present" in result.output
+
+
+def test_cleanup_interactive_selection(tmp_path: Path) -> None:
+    db_path = tmp_path / "embeddings.duckdb"
+    _seed_cleanup_db(db_path)
+    runner = CliRunner()
+
+    # One model version (select 1), then pick the LOINC row, then confirm y.
+    # SNOMED(2) sorts first by count, LOINC and RxNorm follow.
+    result = runner.invoke(
+        app,
+        ["cleanup", "--db", str(db_path)],
+        input="1\n2\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    remaining = conn.execute("SELECT COUNT(*) FROM concept_embeddings").fetchone()[0]
+    assert remaining == 3
+    conn.close()
+
+
+def test_cleanup_no_embeddings(tmp_path: Path) -> None:
+    db_path = tmp_path / "empty.duckdb"
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    conn.close()
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["cleanup", "--db", str(db_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert "nothing to clean up" in result.output
