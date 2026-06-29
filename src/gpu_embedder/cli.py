@@ -266,6 +266,18 @@ def embed_cmd(
             help="Separator between concatenated text fields",
         ),
     ] = None,
+    namespace: Annotated[
+        str | None,
+        typer.Option(
+            "--namespace",
+            envvar="GPU_EMBED_NAMESPACE",
+            help=(
+                "Identity namespace for these concepts (default 'athena'). Use a "
+                "distinct value for source-concept datasets so their concept_ids "
+                "do not collide with Athena standard concepts."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Batch-embed Athena CONCEPT.csv rows with SapBERT and store in parquet shards."""
     # Build config, allowing CLI overrides
@@ -294,6 +306,8 @@ def embed_cmd(
         cfg_overrides["text_fields"] = text_field
     if separator is not None:
         cfg_overrides["separator"] = separator
+    if namespace is not None:
+        cfg_overrides["namespace"] = namespace
 
     cfg = EmbedConfig(**cfg_overrides)
 
@@ -364,7 +378,7 @@ def embed_cmd(
         )
         model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
         st.upsert_model_version_cache(conn, cfg.model, cfg.model_revision, model_version)
-    filter_hash = filter_spec_hash(spec)
+    filter_hash = filter_spec_hash(spec, cfg.namespace)
 
     # Load only CSVs that changed for this (model_version, filter_hash)
     filtered = []
@@ -405,7 +419,7 @@ def embed_cmd(
                 )
                 continue
 
-            loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine)
+            loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine, namespace=cfg.namespace)
             filtered.extend(loaded)
             ingested_fingerprints.append((p, current_fp, len(loaded)))
             continue
@@ -413,7 +427,7 @@ def embed_cmd(
         # Read CSV first so the file is warm in the OS page cache, then hash
         # it.  Computing the SHA-256 on a cold file before read_csv caused two
         # sequential full scans of CONCEPT.csv (~500 MB) on every first run.
-        loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine)
+        loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine, namespace=cfg.namespace)
         current_fp = compute_csv_fingerprint(p)
         filtered.extend(loaded)
         ingested_fingerprints.append((p, current_fp, len(loaded)))
@@ -479,7 +493,7 @@ def embed_cmd(
         raise typer.Exit(0)
 
     if not cfg.force:
-        existing_for_model = st.count_rows(conn, model_version)
+        existing_for_model = st.count_rows(conn, model_version, namespace=cfg.namespace)
         registry_rows = st.list_model_registry(conn)
         has_other_model_versions = any(
             row.model_version != model_version for row in registry_rows
@@ -604,10 +618,10 @@ def embed_cmd(
     # Refresh logical view once after all checkpoint shards are written.
     st.ensure_schema(conn)
 
-    total = st.count_rows(conn, model_version)
+    total = st.count_rows(conn, model_version, namespace=cfg.namespace)
     typer.echo(
         f"Done. Embedded {total_embedded} concepts. "
-        f"Total stored for this model version: {total}."
+        f"Total stored for this model version (namespace={cfg.namespace}): {total}."
     )
 
     persist_ingested_fingerprints()
@@ -775,6 +789,13 @@ def export_cmd(
             help="Limit export to these vocabulary IDs (repeatable or comma-delimited)",
         ),
     ] = None,
+    namespace: Annotated[
+        str | None,
+        typer.Option(
+            "--namespace",
+            help="Export only this identity namespace (default: all namespaces)",
+        ),
+    ] = None,
     shard_rows: Annotated[
         int,
         typer.Option(
@@ -878,11 +899,16 @@ def export_cmd(
     total_files_written = 0
     total_files_skipped = 0
 
-    count_sql = """
+    # Optional namespace filter, applied to both the count and the COPY.
+    ns_predicate = "" if namespace is None else " AND namespace = ?"
+    ns_param: list[object] = [] if namespace is None else [namespace]
+
+    count_sql = f"""
         SELECT COUNT(*)
         FROM concept_embeddings
         WHERE model_version = ?
           AND ((? IS NULL AND vocabulary_id IS NULL) OR vocabulary_id = ?)
+          {ns_predicate}
     """
 
     for vocab in vocabularies_to_export:
@@ -893,7 +919,7 @@ def export_cmd(
 
         count_row = conn.execute(
             count_sql,
-            [selected_model_version, vocab_value, vocab_value],
+            [selected_model_version, vocab_value, vocab_value, *ns_param],
         ).fetchone()
         vocab_count = int(count_row[0]) if count_row else 0
         if vocab_count == 0:
@@ -918,6 +944,7 @@ def export_cmd(
             export_sql = f"""
                 COPY (
                     SELECT
+                        namespace,
                         concept_id,
                         concept_name,
                         domain_id,
@@ -932,6 +959,7 @@ def export_cmd(
                         embedded_at
                     FROM (
                         SELECT
+                            namespace,
                             concept_id,
                             concept_name,
                             domain_id,
@@ -948,6 +976,7 @@ def export_cmd(
                         FROM concept_embeddings
                         WHERE model_version = ?
                           AND ((? IS NULL AND vocabulary_id IS NULL) OR vocabulary_id = ?)
+                          {ns_predicate}
                     ) ranked
                     WHERE rn BETWEEN ? AND ?
                 ) TO '{escaped_output_path}'
@@ -955,7 +984,7 @@ def export_cmd(
             """
             conn.execute(
                 export_sql,
-                [selected_model_version, vocab_value, vocab_value, start_rn, end_rn],
+                [selected_model_version, vocab_value, vocab_value, *ns_param, start_rn, end_rn],
             )
             total_files_written += 1
             total_rows_exported += end_rn - start_rn + 1

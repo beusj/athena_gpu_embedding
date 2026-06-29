@@ -237,6 +237,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--invalid-reason` | _(all)_ | Keep only rows with this invalid_reason; use `valid` as a shorthand for NULL/empty (repeatable) |
 | `--text-field` | `concept_name` | Column(s) to concatenate as embedding input (repeatable) |
 | `--separator` | `" "` | Separator between concatenated text fields |
+| `--namespace` | `athena` | Identity namespace; use a distinct value for source-concept datasets so their `concept_id`s don't collide with Athena |
 
 ### `cpt4` — populate CPT-4 names via Athena Java tool
 
@@ -300,6 +301,7 @@ Sharding is controlled by `--shard-rows` (rows per file).
 | `--db` | `embeddings.duckdb` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
+| `--namespace` | _(all)_ | Export only this identity namespace |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
 | `--compression` | `snappy` | Parquet codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `uncompressed` |
 | `--overwrite` | false | Replace existing shard files if present |

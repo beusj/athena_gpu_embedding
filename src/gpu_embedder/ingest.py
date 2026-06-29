@@ -314,14 +314,16 @@ def compute_csv_fingerprint(path: Path) -> dict[str, object]:
     }
 
 
-def filter_spec_hash(spec: FilterSpec | None) -> str:
-    """Return a stable SHA-256 hex digest of *spec*.
+def filter_spec_hash(spec: FilterSpec | None, namespace: str = DEFAULT_NAMESPACE) -> str:
+    """Return a stable SHA-256 hex digest of *(spec, namespace)*.
 
-    The digest changes whenever any filter value is added or removed, so
-    a fingerprint recorded under one filter spec will not suppress a run
-    that uses a different spec (e.g. adding a new --vocabulary-id).
+    The digest changes whenever any filter value or the namespace is added or
+    removed, so a fingerprint recorded under one filter spec (or namespace) will
+    not suppress a run that uses a different one (e.g. ingesting the same file
+    under a second namespace, or adding a new --vocabulary-id).
     """
-    canonical: dict[str, list[str]] = {
+    canonical: dict[str, object] = {
+        "namespace": namespace,
         "vocabulary_ids": sorted(spec.vocabulary_ids if spec else []),
         "domain_ids": sorted(spec.domain_ids if spec else []),
         "concept_class_ids": sorted(spec.concept_class_ids if spec else []),

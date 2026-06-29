@@ -208,7 +208,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     class _FakeConn:
         pass
 
-    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         return rows
 
     def fake_load_model(model_id: str, device: str, revision: str | None = None):
@@ -273,7 +273,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     ) -> None:
         upsert_sizes.append(len(embedded_rows))
 
-    def fake_count_rows(conn, model_version: str) -> int:  # type: ignore[no-untyped-def]
+    def fake_count_rows(conn, model_version: str, namespace: str | None = None) -> int:  # type: ignore[no-untyped-def]
         return sum(upsert_sizes)
 
     def fake_list_model_registry(conn):  # type: ignore[no-untyped-def]
@@ -362,7 +362,7 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     class _FakeConn:
         pass
 
-    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         return rows
 
     def fake_load_model(model_id: str, device: str, revision: str | None = None):
@@ -421,7 +421,7 @@ def test_embed_accepts_comma_delimited_vocabulary_id(monkeypatch) -> None:
 
     captured: dict[str, object] = {}
 
-    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["path"] = path
         captured["vocabulary_ids"] = spec.vocabulary_ids
         captured["engine"] = engine
@@ -445,7 +445,7 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
 
     captured: dict[str, object] = {}
 
-    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["vocabulary_ids"] = spec.vocabulary_ids
         return []
 
