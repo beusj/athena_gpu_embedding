@@ -240,7 +240,9 @@ existed needs **no manual DDL**:
 
 - `ensure_schema` (run automatically by `embed`) adds the `namespace` column to
   an existing table via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` and backfills
-  existing rows to `athena`. Just re-run `gpu-embed embed` as usual.
+  existing rows to `athena`. The same idempotent migration adds the nullable
+  `source_id` / `mapping_wave` provenance columns (left NULL on existing rows).
+  Just re-run `gpu-embed embed` as usual.
 - The first post-upgrade run re-reads and re-hashes each input CSV once (the
   change-detection fingerprint now includes the namespace). Nothing is
   re-embedded — already-stored concepts are detected as unchanged — and
