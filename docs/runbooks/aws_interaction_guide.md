@@ -32,10 +32,17 @@ uv run gpu-embed migrate-store --db embeddings
 uv run gpu-embed migrate-store --db embeddings.duckdb
 
 # Verify parquet shards exist
-uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/*.parquet'))))"
+uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/vocabulary_id=*/*.parquet'))))"
 ```
 
 After migration, sync `embeddings/` directly to S3 as the default path.
+
+Expected migration behavior:
+
+- Throughput may decline over time as larger partitions are processed.
+- This is normal if progress logs continue to update with increasing
+  `partitions`/`rows`/`files` counters.
+- Prefer `migrate-store` for migration-only runs; `status` adds summary queries.
 
 ## Prerequisites
 

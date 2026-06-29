@@ -30,7 +30,7 @@ Model hash provenance is stored alongside the dataset at:
 
 ```bash
 uv run gpu-embed migrate-store --db embeddings
-uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/*.parquet'))))"
+uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/vocabulary_id=*/*.parquet'))))"
 ```
 
 If you are migrating from a legacy `.duckdb` file and have not migrated yet,
@@ -40,7 +40,11 @@ run once to trigger automatic migration:
 uv run gpu-embed migrate-store --db embeddings.duckdb
 ```
 
-This creates `embeddings/model_version=.../*.parquet` and no manual pre-export is required.
+This creates `embeddings/model_version=.../vocabulary_id=.../*.parquet` and no manual pre-export is required.
+
+During large migrations, throughput may slow as bigger partitions are processed.
+Treat this as expected if migration progress logs keep advancing (`partitions`,
+`rows`, `files`, `eta_minutes`).
 
 ## 2) Authenticate to AWS CLI
 

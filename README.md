@@ -188,6 +188,15 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
   same basename (for example `embeddings.duckdb` → `embeddings/`).
 - No manual pre-export is required for migration.
 
+#### Migration runtime notes
+
+- Migration throughput is often non-linear: it may slow as larger
+  vocabulary/model partitions are processed.
+- This is expected as long as progress logs continue to advance
+  (`partitions`, `rows`, `files`, `eta_minutes`).
+- If progress appears stalled, prefer `gpu-embed migrate-store --db ...`
+  over `status` for migration-only workflows to avoid extra summary queries.
+
 ### `embed` — batch embed concepts
 
 ```
