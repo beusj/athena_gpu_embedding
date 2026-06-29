@@ -14,6 +14,7 @@ class TestEmbedConfigDefaults:
         monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.vocab_dir == Path("athena_vocab")
+        assert cfg.source_parquet is None
         assert cfg.db == Path("embeddings.duckdb")
         assert cfg.log_dir == Path("logs")
         assert cfg.log_max_bytes == 2 * 1024 * 1024
@@ -26,7 +27,10 @@ class TestEmbedConfigDefaults:
         assert cfg.ingest_engine == "duckdb"
         assert cfg.write_mode == "ndjson"
         assert cfg.text_fields == ["concept_name"]
+        assert cfg.source_text_fields == ["source_name"]
         assert cfg.separator == " "
+        assert cfg.namespace == "athena"
+        assert cfg.source_namespace == "source"
         assert cfg.force is False
 
     def test_device_auto_resolves_to_string(self, monkeypatch) -> None:
@@ -75,6 +79,13 @@ class TestEmbedConfigTextFields:
         monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(text_fields=" concept_code , concept_name ", _env_file=None)  # type: ignore[call-arg]
         assert cfg.text_fields == ["concept_code", "concept_name"]
+
+    def test_source_text_fields_env_override(self, monkeypatch) -> None:
+        from gpu_embedder.config import EmbedConfig
+
+        monkeypatch.setenv("GPU_EMBED_SOURCE_TEXT_FIELDS", "source_name,source_description")
+        cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.source_text_fields == ["source_name", "source_description"]
 
 
 class TestEmbedConfigRevision:

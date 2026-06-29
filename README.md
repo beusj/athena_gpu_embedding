@@ -263,6 +263,10 @@ gpu-embed embed [OPTIONS] [CSV_PATH...]
 When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 `GPU_EMBED_VOCAB_DIR` (default `athena_vocab/`).
 
+To embed source-side query concepts instead, pass `--source-parquet` pointing
+at a Stage 0 `source_concepts` parquet file (or a directory of parquet files).
+That path uses a source adapter rather than the Athena `CONCEPT.csv` ingest.
+
 #### Positional
 
 | Argument | Description |
@@ -274,6 +278,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` (used when no explicit path given) |
+| `--source-parquet` | _(none)_ | Source-concept parquet file or directory to embed instead of Athena CSV |
 | `--db` | `embeddings.duckdb` | Embedding store path (default fast local DuckDB file; directory enables parquet store mode) |
 | `--batch-size` | `256` | Rows per GPU forward pass |
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
@@ -290,8 +295,15 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--standard-concept` | _(all)_ | Keep only `S`, `C`, or _(blank)_ rows (repeatable) |
 | `--invalid-reason` | _(all)_ | Keep only rows with this invalid_reason; use `valid` as a shorthand for NULL/empty (repeatable) |
 | `--text-field` | `concept_name` | Column(s) to concatenate as embedding input (repeatable) |
+| `--source-text-field` | `source_name` | Source parquet field(s) to concatenate as embedding input (repeatable) |
 | `--separator` | `" "` | Separator between concatenated text fields |
 | `--namespace` | `athena` | Identity namespace; use a distinct value for source-concept datasets so their `concept_id`s don't collide with Athena |
+| `--source-namespace` | `source` | Default namespace used by `--source-parquet` runs unless `--namespace` is passed |
+
+Source-parquet mode does not use the Athena filter flags (`--vocabulary-id`,
+`--domain-id`, `--concept-class-id`, `--standard-concept`, `--invalid-reason`).
+Instead, adapt the source parquet and choose the embed text with
+`--source-text-field`.
 
 #### Default vocabularies (highest-yield set)
 
@@ -550,6 +562,7 @@ so an empty `.env` is valid for local GPU runs against `athena_vocab/`.
 ```dotenv
 # Paths
 GPU_EMBED_VOCAB_DIR=athena_vocab
+GPU_EMBED_SOURCE_PARQUET=source_concepts/
 GPU_EMBED_DB=embeddings.duckdb   # native DuckDB table (default); a directory path selects the parquet store
 
 # Model (see "Choosing an embedding model"; e.g. FremyCompany/BioLORD-2023)
@@ -560,7 +573,10 @@ GPU_EMBED_BATCH_SIZE=256
 GPU_EMBED_MAX_LENGTH=128
 GPU_EMBED_UPSERT_EVERY_BATCHES=250
 GPU_EMBED_TEXT_FIELDS=concept_name
+GPU_EMBED_SOURCE_TEXT_FIELDS=source_name,source_description
 GPU_EMBED_SEPARATOR=" "
+GPU_EMBED_NAMESPACE=athena
+GPU_EMBED_SOURCE_NAMESPACE=source
 
 # CPT-4 / UMLS
 UMLS_API_KEY=your-key-here

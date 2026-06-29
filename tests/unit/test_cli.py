@@ -9,6 +9,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
+from gpu_embedder.ingest import SourceParquetRows
 from gpu_embedder.models import DEFAULT_VOCABULARY_IDS, ConceptRow, EmbeddedRow
 from gpu_embedder.store import ensure_schema, open_db, upsert_model_registry, upsert_rows
 
@@ -321,6 +322,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
     monkeypatch.setattr("gpu_embedder.store.get_cached_model_version", fake_get_cached_model_version)
     monkeypatch.setattr("gpu_embedder.store.upsert_model_version_cache", fake_upsert_model_version_cache)
+    monkeypatch.setattr("gpu_embedder.store.refresh_view", lambda conn: None)
 
     result = runner.invoke(
         app,
@@ -397,6 +399,9 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     def fake_upsert_csv_fingerprint(conn, *, csv_path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
         recorded_fingerprints.append(csv_path)
 
+    def fake_get_cached_model_version(conn, model_id: str, revision):  # type: ignore[no-untyped-def]
+        return "test-model-version"
+
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
     monkeypatch.setattr("gpu_embedder.embed.load_model", fake_load_model)
     monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
@@ -409,6 +414,9 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     monkeypatch.setattr("gpu_embedder.store.upsert_model_registry", fake_upsert_model_registry)
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
+    monkeypatch.setattr("gpu_embedder.store.get_cached_model_version", fake_get_cached_model_version)
+    monkeypatch.setattr("gpu_embedder.store.count_rows", lambda conn, model_version, namespace=None: 0)
+    monkeypatch.setattr("gpu_embedder.store.list_model_registry", lambda conn: [])
 
     result = runner.invoke(app, ["embed", str(fixture), "--device", "cpu"])
 
@@ -423,11 +431,23 @@ def test_embed_accepts_comma_delimited_vocabulary_id(monkeypatch) -> None:
 
     captured: dict[str, object] = {}
 
+    class _FakeConn:
+        pass
+
     def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["path"] = path
         captured["vocabulary_ids"] = spec.vocabulary_ids
         captured["engine"] = engine
         return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision: "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
 
@@ -447,9 +467,21 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
 
     captured: dict[str, object] = {}
 
+    class _FakeConn:
+        pass
+
     def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["vocabulary_ids"] = spec.vocabulary_ids
         return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision: "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
 
@@ -475,9 +507,21 @@ def test_embed_defaults_to_highest_yield_vocabularies(monkeypatch) -> None:
 
     captured: dict[str, object] = {}
 
+    class _FakeConn:
+        pass
+
     def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["vocabulary_ids"] = spec.vocabulary_ids
         return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision: "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
 
@@ -494,9 +538,21 @@ def test_embed_all_sentinel_embeds_every_vocabulary(monkeypatch) -> None:
 
     captured: dict[str, object] = {}
 
+    class _FakeConn:
+        pass
+
     def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
         captured["vocabulary_ids"] = spec.vocabulary_ids
         return []
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", lambda path: _FakeConn())
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
+    monkeypatch.setattr(
+        "gpu_embedder.store.get_cached_model_version",
+        lambda conn, model_id, revision: "test-model-version",
+    )
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
 
@@ -505,6 +561,91 @@ def test_embed_all_sentinel_embeds_every_vocabulary(monkeypatch) -> None:
     assert result.exit_code == 0
     assert captured["vocabulary_ids"] == []
     assert "Embedding all vocabularies" in result.output
+
+
+def test_embed_source_parquet_uses_source_adapter_defaults(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    source_dir = tmp_path / "source_concepts"
+    source_dir.mkdir()
+    parquet_path = source_dir / "wave.parquet"
+    parquet_path.write_bytes(b"not-real-parquet")
+
+    captured: dict[str, object] = {}
+
+    class _FakeConn:
+        pass
+
+    def fake_open_db(path: Path):
+        return _FakeConn()
+
+    def fake_ensure_schema(conn) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_get_cached_model_version(conn, model_id: str, revision):  # type: ignore[no-untyped-def]
+        return "test-model-version"
+
+    def fake_get_csv_fingerprint(conn, csv_path: str, model_version: str, filter_hash: str):  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_read_source_parquet(path: Path, *, namespace: str, text_fields, separator: str):  # type: ignore[no-untyped-def]
+        captured["path"] = path
+        captured["namespace"] = namespace
+        captured["text_fields"] = list(text_fields)
+        captured["separator"] = separator
+        return SourceParquetRows(rows=[], embed_texts={})
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", fake_open_db)
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", fake_ensure_schema)
+    monkeypatch.setattr("gpu_embedder.store.get_cached_model_version", fake_get_cached_model_version)
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
+    monkeypatch.setattr("gpu_embedder.cli.read_source_parquet", fake_read_source_parquet)
+
+    result = runner.invoke(
+        app,
+        [
+            "embed",
+            "--source-parquet",
+            str(source_dir),
+            "--source-namespace",
+            "stcm_source",
+            "--source-text-field",
+            "concept_name",
+            "--source-text-field",
+            "source_description",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["path"] == parquet_path
+    assert captured["namespace"] == "stcm_source"
+    assert captured["text_fields"] == ["concept_name", "source_description"]
+    assert "Loaded 0 rows from source parquet input." in result.output
+    assert "Nothing to embed." in result.output
+
+
+def test_embed_source_parquet_rejects_athena_filters(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    parquet_path = tmp_path / "wave.parquet"
+    parquet_path.write_bytes(b"not-real-parquet")
+
+    result = runner.invoke(
+        app,
+        [
+            "embed",
+            "--source-parquet",
+            str(parquet_path),
+            "--vocabulary-id",
+            "LOINC",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Athena filter options are not supported with --source-parquet" in result.output
 
 
 def test_migrate_store_invokes_store_initialization(monkeypatch, tmp_path: Path) -> None:

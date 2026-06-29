@@ -22,7 +22,7 @@ from collections import defaultdict
 from datetime import datetime
 from glob import glob
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, cast
 
 import torch
 import typer
@@ -31,7 +31,12 @@ from typer.main import get_command
 
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
-from gpu_embedder.ingest import compute_csv_fingerprint, filter_spec_hash, read_csv
+from gpu_embedder.ingest import (
+    compute_csv_fingerprint,
+    filter_spec_hash,
+    read_csv,
+    read_source_parquet,
+)
 from gpu_embedder.models import (
     ALL_VOCABULARIES_SENTINEL,
     DEFAULT_VOCABULARY_IDS,
@@ -67,6 +72,17 @@ def _split_multi_values(values: list[str] | None) -> list[str]:
     for value in values:
         normalized.extend(piece.strip() for piece in value.split(",") if piece.strip())
     return normalized
+
+
+def _resolve_source_parquet_paths(path: Path) -> list[Path]:
+    """Return parquet files under *path* (file or directory), sorted for stability."""
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        return sorted(p for p in path.rglob("*.parquet") if p.is_file())
+    raise ValueError(f"Unsupported source parquet path: {path}")
 
 
 def _extract_model_pairs_from_logs(log_dir: Path) -> list[tuple[str, str | None]]:
@@ -174,6 +190,14 @@ def embed_cmd(
         Path | None,
         typer.Option(envvar="GPU_EMBED_VOCAB_DIR", help="Directory containing CONCEPT.csv"),
     ] = None,
+    source_parquet: Annotated[
+        Path | None,
+        typer.Option(
+            "--source-parquet",
+            envvar="GPU_EMBED_SOURCE_PARQUET",
+            help="Source-concept parquet file or directory to embed",
+        ),
+    ] = None,
     db: Annotated[
         Path | None,
         typer.Option(
@@ -263,6 +287,13 @@ def embed_cmd(
             help="Concept columns to concatenate as embed input (repeatable)",
         ),
     ] = None,
+    source_text_field: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--source-text-field",
+            help="Source parquet columns to concatenate as embed input (repeatable)",
+        ),
+    ] = None,
     separator: Annotated[
         str | None,
         typer.Option(
@@ -282,12 +313,22 @@ def embed_cmd(
             ),
         ),
     ] = None,
+    source_namespace: Annotated[
+        str | None,
+        typer.Option(
+            "--source-namespace",
+            envvar="GPU_EMBED_SOURCE_NAMESPACE",
+            help="Default namespace to use for --source-parquet runs",
+        ),
+    ] = None,
 ) -> None:
-    """Batch-embed Athena CONCEPT.csv rows with SapBERT and store in parquet shards."""
+    """Batch-embed Athena CSVs or source-concept parquet rows with SapBERT."""
     # Build config, allowing CLI overrides
-    cfg_overrides: dict[str, object] = {}
+    cfg_overrides: dict[str, Any] = {}
     if vocab_dir is not None:
         cfg_overrides["vocab_dir"] = vocab_dir
+    if source_parquet is not None:
+        cfg_overrides["source_parquet"] = source_parquet
     if db is not None:
         cfg_overrides["db"] = db
     if model is not None:
@@ -308,12 +349,21 @@ def embed_cmd(
         cfg_overrides["force"] = True
     if text_field:
         cfg_overrides["text_fields"] = text_field
+    if source_text_field:
+        cfg_overrides["source_text_fields"] = source_text_field
     if separator is not None:
         cfg_overrides["separator"] = separator
     if namespace is not None:
         cfg_overrides["namespace"] = namespace
+    if source_namespace is not None:
+        cfg_overrides["source_namespace"] = source_namespace
 
     cfg = EmbedConfig(**cfg_overrides)
+    source_mode = cfg.source_parquet is not None
+    effective_namespace = (
+        cfg.namespace if not source_mode or namespace is not None else cfg.source_namespace
+    )
+    effective_source_text_fields = source_text_field or text_field or cfg.source_text_fields
 
     if device is None and cfg.device == "cpu":
         typer.secho(
@@ -330,9 +380,23 @@ def embed_cmd(
             torch.cuda.is_available(),
         )
 
-    # Resolve CSV paths
+    if source_mode and csv_paths:
+        typer.echo("ERROR: pass either CSV_PATH arguments or --source-parquet, not both.", err=True)
+        raise typer.Exit(2)
+
+    # Resolve input paths
     paths: list[Path]
-    if csv_paths:
+    if source_mode:
+        assert cfg.source_parquet is not None
+        try:
+            paths = _resolve_source_parquet_paths(cfg.source_parquet)
+        except FileNotFoundError:
+            typer.echo(f"ERROR: {cfg.source_parquet} not found.", err=True)
+            raise typer.Exit(1) from None
+        if not paths:
+            typer.echo(f"ERROR: no parquet files found under {cfg.source_parquet}.", err=True)
+            raise typer.Exit(1)
+    elif csv_paths:
         paths = list(csv_paths)
     else:
         default = cfg.vocab_dir / "CONCEPT.csv"
@@ -347,38 +411,55 @@ def embed_cmd(
 
     # Build filter spec
     normalized_vocabulary_ids = _split_multi_values(vocabulary_id)
-
-    # Resolve the vocabulary filter default. With no --vocabulary-id, embedding
-    # every vocabulary in CONCEPT.csv is rarely intended, so default to the
-    # curated highest-yield set. The reserved sentinel "all" (case-insensitive)
-    # is the explicit escape hatch back to "embed everything".
-    if any(v.lower() == ALL_VOCABULARIES_SENTINEL for v in normalized_vocabulary_ids):
-        normalized_vocabulary_ids = []
-        typer.echo("Embedding all vocabularies (--vocabulary-id all).")
-    elif not normalized_vocabulary_ids:
-        normalized_vocabulary_ids = list(DEFAULT_VOCABULARY_IDS)
-        typer.echo(
-            "No --vocabulary-id given; defaulting to highest-yield vocabularies: "
-            + ", ".join(normalized_vocabulary_ids)
-            + ".\nPass --vocabulary-id all to embed every vocabulary instead."
-        )
-        if "CPT4" in normalized_vocabulary_ids:
-            typer.echo(
-                "Note: CPT4 concept names are blank in the raw Athena download until "
-                "you run `gpu-embed cpt4` (requires a UMLS license)."
+    if source_mode:
+        if any(
+            option
+            for option in (
+                normalized_vocabulary_ids,
+                domain_id,
+                concept_class_id,
+                standard_concept,
+                invalid_reason,
             )
+        ):
+            typer.echo(
+                "ERROR: Athena filter options are not supported with --source-parquet.",
+                err=True,
+            )
+            raise typer.Exit(2)
+        spec = None
+    else:
+        # Resolve the vocabulary filter default. With no --vocabulary-id, embedding
+        # every vocabulary in CONCEPT.csv is rarely intended, so default to the
+        # curated highest-yield set. The reserved sentinel "all" (case-insensitive)
+        # is the explicit escape hatch back to "embed everything".
+        if any(v.lower() == ALL_VOCABULARIES_SENTINEL for v in normalized_vocabulary_ids):
+            normalized_vocabulary_ids = []
+            typer.echo("Embedding all vocabularies (--vocabulary-id all).")
+        elif not normalized_vocabulary_ids:
+            normalized_vocabulary_ids = list(DEFAULT_VOCABULARY_IDS)
+            typer.echo(
+                "No --vocabulary-id given; defaulting to highest-yield vocabularies: "
+                + ", ".join(normalized_vocabulary_ids)
+                + ".\nPass --vocabulary-id all to embed every vocabulary instead."
+            )
+            if "CPT4" in normalized_vocabulary_ids:
+                typer.echo(
+                    "Note: CPT4 concept names are blank in the raw Athena download until "
+                    "you run `gpu-embed cpt4` (requires a UMLS license)."
+                )
 
-    spec = FilterSpec(
-        vocabulary_ids=normalized_vocabulary_ids,
-        domain_ids=domain_id or [],
-        concept_class_ids=concept_class_id or [],
-        standard_concepts=(
-            [None if v in ("", "null", "NULL") else v for v in standard_concept]
-            if standard_concept
-            else []
-        ),
-        invalid_reasons=invalid_reason or [],
-    )
+        spec = FilterSpec(
+            vocabulary_ids=normalized_vocabulary_ids,
+            domain_ids=domain_id or [],
+            concept_class_ids=concept_class_id or [],
+            standard_concepts=(
+                [None if v in ("", "null", "NULL") else v for v in standard_concept]
+                if standard_concept
+                else []
+            ),
+            invalid_reasons=cast(list[str | None], invalid_reason or []),
+        )
 
     # Open store connection
     from gpu_embedder import store as st
@@ -402,7 +483,19 @@ def embed_cmd(
         )
         model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
         st.upsert_model_version_cache(conn, cfg.model, cfg.model_revision, model_version)
-    filter_hash = filter_spec_hash(spec, cfg.namespace)
+    if source_mode:
+        hash_extra = {
+            "input_kind": "source_parquet",
+            "text_fields": effective_source_text_fields,
+            "separator": cfg.separator,
+        }
+    else:
+        hash_extra = {
+            "input_kind": "athena_csv",
+            "text_fields": cfg.text_fields,
+            "separator": cfg.separator,
+        }
+    filter_hash = filter_spec_hash(spec, effective_namespace, extra=hash_extra)
 
     # Load only CSVs that changed for this (model_version, filter_hash).
     # Each ingested_fingerprints entry is (path, fingerprint, row_count) where
@@ -411,13 +504,14 @@ def embed_cmd(
     # counts below are reporting figures only — they can exceed the number of
     # distinct concepts actually stored and must not be treated as authoritative.
     filtered = []
-    ingested_fingerprints: list[tuple[Path, dict[str, object], int]] = []
+    precomputed_source_texts: dict[int, str] = {}
+    ingested_fingerprints: list[tuple[Path, dict[str, Any], int]] = []
     skipped_unchanged = 0
     skipped_unchanged_rows = 0
 
     for p in paths:
         csv_path = str(p.resolve())
-        stored = st.get_csv_fingerprint(conn, csv_path, model_version, filter_hash)
+        stored = cast(dict[str, Any] | None, st.get_csv_fingerprint(conn, csv_path, model_version, filter_hash))
 
         stat = p.stat()
         size_bytes = int(stat.st_size)
@@ -437,7 +531,7 @@ def embed_cmd(
                 )
                 continue
 
-            current_fp = compute_csv_fingerprint(p)
+            current_fp = cast(dict[str, Any], compute_csv_fingerprint(p))
             if str(stored["sha256"]) == str(current_fp["sha256"]):
                 skipped_unchanged += 1
                 skipped_unchanged_rows += int(stored["row_count"])
@@ -448,7 +542,23 @@ def embed_cmd(
                 )
                 continue
 
-            loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine, namespace=cfg.namespace)
+            if source_mode:
+                source_rows = read_source_parquet(
+                    p,
+                    namespace=effective_namespace,
+                    text_fields=effective_source_text_fields,
+                    separator=cfg.separator,
+                )
+                loaded = source_rows.rows
+                for concept_id, embed_text in source_rows.embed_texts.items():
+                    precomputed_source_texts.setdefault(concept_id, embed_text)
+            else:
+                loaded = read_csv(
+                    p,
+                    spec=spec,
+                    engine=cfg.ingest_engine,
+                    namespace=effective_namespace,
+                )
             filtered.extend(loaded)
             ingested_fingerprints.append((p, current_fp, len(loaded)))
             continue
@@ -456,12 +566,31 @@ def embed_cmd(
         # Read CSV first so the file is warm in the OS page cache, then hash
         # it.  Computing the SHA-256 on a cold file before read_csv caused two
         # sequential full scans of CONCEPT.csv (~500 MB) on every first run.
-        loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine, namespace=cfg.namespace)
-        current_fp = compute_csv_fingerprint(p)
+        if source_mode:
+            source_rows = read_source_parquet(
+                p,
+                namespace=effective_namespace,
+                text_fields=effective_source_text_fields,
+                separator=cfg.separator,
+            )
+            loaded = source_rows.rows
+            for concept_id, embed_text in source_rows.embed_texts.items():
+                precomputed_source_texts.setdefault(concept_id, embed_text)
+        else:
+            loaded = read_csv(
+                p,
+                spec=spec,
+                engine=cfg.ingest_engine,
+                namespace=effective_namespace,
+            )
+        current_fp = cast(dict[str, Any], compute_csv_fingerprint(p))
         filtered.extend(loaded)
         ingested_fingerprints.append((p, current_fp, len(loaded)))
 
-    typer.echo(f"Loaded {len(filtered)} rows after {cfg.ingest_engine} filtering.")
+    if source_mode:
+        typer.echo(f"Loaded {len(filtered)} rows from source parquet input.")
+    else:
+        typer.echo(f"Loaded {len(filtered)} rows after {cfg.ingest_engine} filtering.")
     if skipped_unchanged:
         typer.echo(
             f"Skipped {skipped_unchanged} unchanged CSV file(s) "
@@ -522,7 +651,7 @@ def embed_cmd(
         raise typer.Exit(0)
 
     if not cfg.force:
-        existing_for_model = st.count_rows(conn, model_version, namespace=cfg.namespace)
+        existing_for_model = st.count_rows(conn, model_version, namespace=effective_namespace)
         registry_rows = st.list_model_registry(conn)
         has_other_model_versions = any(
             row.model_version != model_version for row in registry_rows
@@ -572,14 +701,20 @@ def embed_cmd(
     texts_for_embed: dict[int, str] | None = None
     if cfg.force:
         to_embed = filtered
+        if source_mode:
+            texts_for_embed = {
+                row.concept_id: precomputed_source_texts[row.concept_id] for row in filtered
+            }
     else:
         typer.echo(
             f"Detecting which of {len(filtered)} concept(s) need embedding "
-            f"(namespace={cfg.namespace}) …"
+            f"(namespace={effective_namespace}) …"
         )
         # Fast path for the common single-field default avoids the per-row
         # build_embed_text call overhead across millions of rows.
-        if cfg.text_fields == ["concept_name"]:
+        if source_mode:
+            candidate_texts = {row.concept_id: precomputed_source_texts[row.concept_id] for row in filtered}
+        elif cfg.text_fields == ["concept_name"]:
             candidate_texts = {row.concept_id: row.concept_name for row in filtered}
         else:
             candidate_texts = {
@@ -664,10 +799,10 @@ def embed_cmd(
     # (no-op for the duckdb backend).
     st.refresh_view(conn)
 
-    total = st.count_rows(conn, model_version, namespace=cfg.namespace)
+    total = st.count_rows(conn, model_version, namespace=effective_namespace)
     typer.echo(
         f"Done. Embedded {total_embedded} concepts. "
-        f"Total stored for this model version (namespace={cfg.namespace}): {total}."
+        f"Total stored for this model version (namespace={effective_namespace}): {total}."
     )
 
     persist_ingested_fingerprints()
@@ -783,7 +918,7 @@ def migrate_store_cmd(
     """Migrate or initialize the parquet embeddings store without heavy summaries."""
     from gpu_embedder import store as st
 
-    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+    cfg = EmbedConfig(**cast(dict[str, Any], {"db": db} if db is not None else {}))
 
     store_root = cfg.db.with_suffix("") if cfg.db.suffix.lower() == ".duckdb" else cfg.db
     if reset and store_root.exists():
@@ -869,7 +1004,7 @@ def export_cmd(
     from gpu_embedder import store as st
     from gpu_embedder.report import list_model_versions
 
-    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+    cfg = EmbedConfig(**cast(dict[str, Any], {"db": db} if db is not None else {}))
     allowed_compressions = {"zstd", "snappy", "gzip", "brotli", "lz4", "uncompressed"}
     normalized_compression = compression.lower()
     if normalized_compression not in allowed_compressions:
@@ -1066,7 +1201,7 @@ def status_cmd(
     from gpu_embedder import store as st
     from gpu_embedder.report import embedded_summary, list_model_versions
 
-    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+    cfg = EmbedConfig(**cast(dict[str, Any], {"db": db} if db is not None else {}))
 
     conn = st.open_db(cfg.db)
     st.ensure_schema(conn)
@@ -1143,7 +1278,7 @@ def model_registry_cmd(
     from gpu_embedder import store as st
     from gpu_embedder.embed import compute_model_version
 
-    cfg_overrides: dict[str, object] = {}
+    cfg_overrides: dict[str, Any] = {}
     if db is not None:
         cfg_overrides["db"] = db
     if log_dir is not None:
@@ -1263,7 +1398,7 @@ def coverage_cmd(
     from gpu_embedder import store as st
     from gpu_embedder.report import VocabCoverage, coverage_report, list_model_versions
 
-    cfg_overrides: dict[str, object] = {}
+    cfg_overrides: dict[str, Any] = {}
     if db is not None:
         cfg_overrides["db"] = db
     if vocab_dir is not None:

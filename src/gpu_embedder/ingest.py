@@ -8,6 +8,7 @@ Pydantic validation and embedding.
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 import hashlib
 import json
 import logging
@@ -32,6 +33,40 @@ _ATHENA_COLUMNS = [
     "valid_end_date",
     "invalid_reason",
 ]
+
+_SOURCE_PARQUET_COLUMNS = [
+    "source_id",
+    "source_name",
+    "source_description",
+    "source_domain",
+    "ehr_codes",
+    "sample_units",
+    "sample_values",
+    "data_type",
+]
+
+_SOURCE_TEXT_FIELD_ALIASES = {
+    "concept_name": "source_name",
+}
+
+_SOURCE_TEXT_FIELDS = {
+    "source_id",
+    "source_name",
+    "source_description",
+    "source_domain",
+    "ehr_codes",
+    "sample_units",
+    "sample_values",
+    "data_type",
+}
+
+
+@dataclass(slots=True)
+class SourceParquetRows:
+    """Source-concept parquet rows adapted to `ConceptRow` plus embed texts."""
+
+    rows: list[ConceptRow]
+    embed_texts: dict[int, str]
 
 
 def _sql_quote(value: str) -> str:
@@ -100,6 +135,176 @@ def _nullish_to_none(value: str | None) -> str | None:
     if value is None or value == "" or value.upper() == "NULL":
         return None
     return value
+
+
+def _stable_source_concept_id(source_id: str) -> int:
+    """Return a deterministic positive BIGINT-safe surrogate key for `source_id`."""
+    digest = hashlib.sha256(source_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
+def _parse_source_ehr_codes(raw: object) -> list[dict[str, str]]:
+    """Normalize source `ehr_codes` values to a list of `{system, code}` dicts."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    elif isinstance(raw, list):
+        parsed = raw
+    else:
+        return []
+
+    result: list[dict[str, str]] = []
+    if not isinstance(parsed, list):
+        return result
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        system = item.get("system")
+        code = item.get("code")
+        if not isinstance(system, str) or not isinstance(code, str):
+            continue
+        if not system.strip() or not code.strip():
+            continue
+        result.append({"system": system.strip(), "code": code.strip()})
+    return result
+
+
+def _normalize_source_text_fields(text_fields: list[str]) -> list[str]:
+    """Resolve source-text aliases and validate the requested source fields."""
+    normalized = [_SOURCE_TEXT_FIELD_ALIASES.get(field, field) for field in text_fields]
+    invalid = sorted({field for field in normalized if field not in _SOURCE_TEXT_FIELDS})
+    if invalid:
+        allowed = ", ".join(sorted(_SOURCE_TEXT_FIELDS | set(_SOURCE_TEXT_FIELD_ALIASES)))
+        raise ValueError(
+            "Unsupported source text field(s): "
+            + ", ".join(invalid)
+            + f". Allowed values: {allowed}"
+        )
+    return normalized
+
+
+def _format_source_text_value(field_name: str, value: object) -> str | None:
+    """Return one source field rendered for embed-text concatenation."""
+    if field_name == "ehr_codes":
+        codes = _parse_source_ehr_codes(value)
+        if not codes:
+            return None
+        return ", ".join(f"{code['system']}:{code['code']}" for code in codes)
+
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _build_source_embed_text(
+    record: dict[str, object],
+    *,
+    text_fields: list[str],
+    separator: str,
+) -> str:
+    """Build the tokenizer input string for one source parquet row."""
+    parts = [
+        rendered
+        for field_name in text_fields
+        if (rendered := _format_source_text_value(field_name, record.get(field_name))) is not None
+    ]
+    if parts:
+        return separator.join(parts)
+
+    fallback_name = _format_source_text_value("source_name", record.get("source_name"))
+    if fallback_name is not None:
+        return fallback_name
+
+    source_id = record.get("source_id")
+    if isinstance(source_id, str) and source_id.strip():
+        return source_id.strip()
+
+    return ""
+
+
+def read_source_parquet(
+    path: Path,
+    *,
+    namespace: str,
+    text_fields: list[str] | None = None,
+    separator: str = " ",
+) -> SourceParquetRows:
+    """Read Stage-0-style source-concept parquet rows and adapt them to `ConceptRow`.
+
+    The parquet schema is the `concept-mapper` `source_concepts` contract
+    (`source_id`, `source_name`, `source_description`, `source_domain`,
+    `ehr_codes`, `sample_units`, `sample_values`, `data_type`).
+    """
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(path)
+
+    source_text_fields = _normalize_source_text_fields(text_fields or ["source_name"])
+    sql = "SELECT " + ", ".join(_SOURCE_PARQUET_COLUMNS) + " FROM read_parquet(?)"
+
+    with duckdb.connect() as conn:
+        records = conn.execute(sql, [str(path)]).fetchall()
+
+    rows: list[ConceptRow] = []
+    embed_texts: dict[int, str] = {}
+    source_ids_by_concept_id: dict[int, str] = {}
+    skipped = 0
+
+    for record in records:
+        raw = dict(zip(_SOURCE_PARQUET_COLUMNS, record, strict=True))
+        source_id = raw["source_id"]
+        if not isinstance(source_id, str) or not source_id.strip():
+            skipped += 1
+            continue
+        source_id = source_id.strip()
+
+        concept_id = _stable_source_concept_id(source_id)
+        prior_source_id = source_ids_by_concept_id.get(concept_id)
+        if prior_source_id is not None and prior_source_id != source_id:
+            raise ValueError(
+                "Stable hash collision while adapting source parquet: "
+                f"{prior_source_id!r} and {source_id!r} map to concept_id {concept_id}"
+            )
+        source_ids_by_concept_id.setdefault(concept_id, source_id)
+
+        ehr_codes = _parse_source_ehr_codes(raw["ehr_codes"])
+        first_code = ehr_codes[0] if ehr_codes else None
+        source_name = _nullish_to_none(raw["source_name"] if isinstance(raw["source_name"], str) else None)
+        source_domain = _nullish_to_none(
+            raw["source_domain"] if isinstance(raw["source_domain"], str) else None
+        )
+        data_type = _nullish_to_none(raw["data_type"] if isinstance(raw["data_type"], str) else None)
+
+        row = ConceptRow(
+            concept_id=concept_id,
+            concept_name=source_name or source_id,
+            domain_id=source_domain,
+            vocabulary_id=first_code["system"] if first_code is not None else None,
+            concept_class_id=data_type,
+            standard_concept=None,
+            concept_code=first_code["code"] if first_code is not None else source_id,
+            valid_start_date=None,
+            valid_end_date=None,
+            invalid_reason=None,
+            namespace=namespace,
+        )
+        rows.append(row)
+        embed_texts.setdefault(
+            concept_id,
+            _build_source_embed_text(raw, text_fields=source_text_fields, separator=separator),
+        )
+
+    if skipped:
+        logger.warning("Skipped %d malformed source parquet row(s) with blank source_id", skipped)
+
+    logger.info("Loaded %d source parquet rows from %s", len(rows), path)
+    return SourceParquetRows(rows=rows, embed_texts=embed_texts)
 
 
 def _coerced_scan_columns() -> str:
@@ -314,7 +519,12 @@ def compute_csv_fingerprint(path: Path) -> dict[str, object]:
     }
 
 
-def filter_spec_hash(spec: FilterSpec | None, namespace: str = DEFAULT_NAMESPACE) -> str:
+def filter_spec_hash(
+    spec: FilterSpec | None,
+    namespace: str = DEFAULT_NAMESPACE,
+    *,
+    extra: dict[str, object] | None = None,
+) -> str:
     """Return a stable SHA-256 hex digest of *(spec, namespace)*.
 
     The digest changes whenever any filter value or the namespace is added or
@@ -330,4 +540,6 @@ def filter_spec_hash(spec: FilterSpec | None, namespace: str = DEFAULT_NAMESPACE
         "standard_concepts": sorted(str(v) for v in (spec.standard_concepts if spec else [])),
         "invalid_reasons": sorted(str(v) for v in (spec.invalid_reasons if spec else [])),
     }
+    if extra:
+        canonical["extra"] = extra
     return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
