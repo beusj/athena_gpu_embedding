@@ -276,6 +276,9 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     def fake_count_rows(conn, model_version: str) -> int:  # type: ignore[no-untyped-def]
         return sum(upsert_sizes)
 
+    def fake_list_model_registry(conn):  # type: ignore[no-untyped-def]
+        return []
+
     def fake_get_csv_fingerprint(conn, csv_path: str, model_version: str, filter_hash: str):  # type: ignore[no-untyped-def]
         return None
 
@@ -305,6 +308,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.upsert_model_registry", fake_upsert_model_registry)
     monkeypatch.setattr("gpu_embedder.store.upsert_rows", fake_upsert_rows)
     monkeypatch.setattr("gpu_embedder.store.count_rows", fake_count_rows)
+    monkeypatch.setattr("gpu_embedder.store.list_model_registry", fake_list_model_registry)
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
 

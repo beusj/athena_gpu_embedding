@@ -432,6 +432,31 @@ def embed_cmd(
         typer.echo("Nothing to embed.")
         raise typer.Exit(0)
 
+    if not cfg.force:
+        existing_for_model = st.count_rows(conn, model_version)
+        registry_rows = st.list_model_registry(conn)
+        has_other_model_versions = any(
+            row.model_version != model_version for row in registry_rows
+        )
+        if existing_for_model == 0 and has_other_model_versions:
+            latest_other = next(
+                (row for row in registry_rows if row.model_version != model_version),
+                None,
+            )
+            latest_other_label = (
+                latest_other.model_version[:16] + "…"
+                if latest_other is not None
+                else "(unknown)"
+            )
+            typer.secho(
+                "WARNING: current model_version has 0 existing embeddings while "
+                "other model_version(s) exist in this DB. This run may embed most "
+                "or all concepts under a new model hash. "
+                f"Current={model_version[:16]}…, latest_other={latest_other_label}.",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+
     rev_label = cfg.model_revision or "default"
     logger.info(
         "Device diagnostics: requested=%s, torch.cuda.is_available=%s, "
