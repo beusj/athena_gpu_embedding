@@ -19,7 +19,7 @@ from typing import Literal
 
 import duckdb
 
-from gpu_embedder.models import EmbeddedRow, SCHEMA_DDL
+from gpu_embedder.models import ConceptRow, EmbeddedRow, SCHEMA_DDL, CSV_FINGERPRINTS_DDL
 
 logger = logging.getLogger(__name__)
 TARGET_ROWS_PER_SHARD = 250_000
@@ -426,6 +426,7 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             WHERE precision IS NULL OR quantization_scheme IS NULL
             """
         )
+        conn.execute(CSV_FINGERPRINTS_DDL)
         logger.debug("DuckDB-backed schema ensured")
         return
 
@@ -445,6 +446,133 @@ def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set
     ids = {r[0] for r in rows}
     logger.info("Found %d existing concept_ids for model_version=%s", len(ids), model_version[:8])
     return ids
+
+
+def filter_unembedded_rows(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[ConceptRow],
+    model_version: str,
+) -> list[ConceptRow]:
+    """Return only the rows whose concept_id has no embedding for *model_version*.
+
+    Performs the anti-join inside DuckDB rather than materialising all existing
+    IDs into a Python set.  This is significantly faster when the store already
+    contains millions of rows and only a small fraction remain to embed.
+    """
+    if not rows:
+        return []
+
+    candidate_ids = [r.concept_id for r in rows]
+    conn.execute("DROP TABLE IF EXISTS _candidate_ids")
+    conn.execute("CREATE TEMP TABLE _candidate_ids (concept_id BIGINT)")
+    conn.executemany("INSERT INTO _candidate_ids VALUES (?)", [(i,) for i in candidate_ids])
+    result = conn.execute(
+        """
+        SELECT concept_id
+        FROM _candidate_ids
+        WHERE concept_id NOT IN (
+            SELECT concept_id
+            FROM concept_embeddings
+            WHERE model_version = ?
+        )
+        """,
+        [model_version],
+    ).fetchall()
+    conn.execute("DROP TABLE IF EXISTS _candidate_ids")
+    unembedded = {r[0] for r in result}
+    logger.info(
+        "filter_unembedded_rows: %d candidates, %d already embedded, %d to embed "
+        "(model_version=%s)",
+        len(candidate_ids),
+        len(candidate_ids) - len(unembedded),
+        len(unembedded),
+        model_version[:8],
+    )
+    return [r for r in rows if r.concept_id in unembedded]
+
+
+def classify_rows_requiring_embedding(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[ConceptRow],
+    model_version: str,
+    candidate_texts: dict[int, str],
+) -> tuple[list[ConceptRow], int, int, int]:
+    """Return rows requiring embedding plus (new_count, changed_count, unchanged_count).
+
+    A row requires embedding when either:
+    - `(concept_id, model_version)` has no stored embedding, or
+    - stored `embed_text` differs from the current candidate text.
+    """
+    if not rows:
+        return ([], 0, 0, 0)
+
+    payload = [(row.concept_id, candidate_texts[row.concept_id]) for row in rows]
+    conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
+    conn.execute(
+        """
+        CREATE TEMP TABLE _candidate_embed_texts (
+            concept_id BIGINT,
+            embed_text VARCHAR
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO _candidate_embed_texts VALUES (?, ?)",
+        payload,
+    )
+    result = conn.execute(
+        """
+        SELECT
+            c.concept_id,
+            CASE
+                WHEN e.concept_id IS NULL THEN 'new'
+                WHEN e.embed_text IS DISTINCT FROM c.embed_text THEN 'changed'
+                ELSE 'unchanged'
+            END AS status
+        FROM _candidate_embed_texts c
+        LEFT JOIN concept_embeddings e
+          ON e.concept_id = c.concept_id
+         AND e.model_version = ?
+        """,
+        [model_version],
+    ).fetchall()
+    conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
+
+    status_by_id = {int(row[0]): str(row[1]) for row in result}
+    need_embed = {
+        concept_id
+        for concept_id, status in status_by_id.items()
+        if status in {"new", "changed"}
+    }
+    new_count = sum(1 for status in status_by_id.values() if status == "new")
+    changed_count = sum(1 for status in status_by_id.values() if status == "changed")
+    unchanged_count = sum(1 for status in status_by_id.values() if status == "unchanged")
+    logger.info(
+        "classify_rows_requiring_embedding: %d candidates, %d new, %d changed, %d unchanged "
+        "(model_version=%s)",
+        len(rows),
+        new_count,
+        changed_count,
+        unchanged_count,
+        model_version[:8],
+    )
+    return ([row for row in rows if row.concept_id in need_embed], new_count, changed_count, unchanged_count)
+
+
+def filter_rows_requiring_embedding(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[ConceptRow],
+    model_version: str,
+    candidate_texts: dict[int, str],
+) -> list[ConceptRow]:
+    """Backward-compatible wrapper returning only rows requiring embedding."""
+    to_embed, _, _, _ = classify_rows_requiring_embedding(
+        conn,
+        rows,
+        model_version,
+        candidate_texts,
+    )
+    return to_embed
 
 
 def _append_rows_as_parquet_shards(
@@ -570,25 +698,41 @@ def upsert_rows(
             )
             for r in rows
         ]
+        # Bulk-load into a temp table (no PK index) then merge in one SQL
+        # statement.  This avoids per-row primary key lookup overhead that
+        # makes executemany slow on large tables.
+        conn.execute("DROP TABLE IF EXISTS _upsert_batch")
+        conn.execute(
+            """
+            CREATE TEMP TABLE _upsert_batch (
+                concept_id BIGINT,
+                concept_name VARCHAR,
+                domain_id VARCHAR,
+                vocabulary_id VARCHAR,
+                concept_class_id VARCHAR,
+                standard_concept VARCHAR,
+                concept_code VARCHAR,
+                invalid_reason VARCHAR,
+                embedding FLOAT[768],
+                embed_text VARCHAR,
+                model_version VARCHAR,
+                embedded_at TIMESTAMP
+            )
+            """
+        )
         conn.executemany(
             """
-            INSERT OR REPLACE INTO concept_embeddings (
-                concept_id,
-                concept_name,
-                domain_id,
-                vocabulary_id,
-                concept_class_id,
-                standard_concept,
-                concept_code,
-                invalid_reason,
-                embedding,
-                embed_text,
-                model_version,
-                embedded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO _upsert_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             records,
         )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO concept_embeddings
+            SELECT * FROM _upsert_batch
+            """
+        )
+        conn.execute("DROP TABLE IF EXISTS _upsert_batch")
         logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
         return
 
@@ -848,3 +992,77 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
         )
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# CSV fingerprinting
+# ---------------------------------------------------------------------------
+
+def get_csv_fingerprint(
+    conn: duckdb.DuckDBPyConnection,
+    csv_path: str,
+    model_version: str,
+    filter_hash: str,
+) -> dict[str, object] | None:
+    """Return the stored fingerprint for *(csv_path, model_version, filter_hash)*, or None."""
+    ctx = _get_context(conn)
+    if ctx.backend != "duckdb":
+        return None  # parquet backend has no fingerprint table
+    row = conn.execute(
+        """
+        SELECT size_bytes, mtime_ns, sha256, row_count, completed_at
+        FROM csv_fingerprints
+        WHERE csv_path = ? AND model_version = ? AND filter_hash = ?
+        """,
+        [csv_path, model_version, filter_hash],
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "size_bytes": row[0],
+        "mtime_ns": row[1],
+        "sha256": row[2],
+        "row_count": row[3],
+        "completed_at": row[4],
+    }
+
+
+def upsert_csv_fingerprint(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    csv_path: str,
+    model_version: str,
+    filter_hash: str,
+    size_bytes: int,
+    mtime_ns: int,
+    sha256: str,
+    row_count: int,
+) -> None:
+    """Record a successful ingest fingerprint for *(csv_path, model_version, filter_hash)*."""
+    ctx = _get_context(conn)
+    if ctx.backend != "duckdb":
+        return  # no-op for parquet backend
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO csv_fingerprints
+            (csv_path, model_version, filter_hash, size_bytes, mtime_ns, sha256, row_count, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            csv_path,
+            model_version,
+            filter_hash,
+            size_bytes,
+            mtime_ns,
+            sha256,
+            row_count,
+            datetime.now(tz=UTC),
+        ],
+    )
+    logger.info(
+        "Upserted csv_fingerprint: path=%s model=%s filter=%s rows=%d",
+        csv_path,
+        model_version[:12],
+        filter_hash[:12],
+        row_count,
+    )

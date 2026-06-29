@@ -245,8 +245,13 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     def fake_ensure_schema(conn) -> None:  # type: ignore[no-untyped-def]
         return None
 
-    def fake_get_existing_ids(conn, model_version: str) -> set[int]:  # type: ignore[no-untyped-def]
-        return set()
+    def fake_classify_rows_requiring_embedding(  # type: ignore[no-untyped-def]
+        conn,
+        rows,
+        model_version: str,
+        candidate_texts,
+    ):
+        return rows, len(rows), 0, 0  # all rows are new in this test
 
     def fake_upsert_model_registry(  # type: ignore[no-untyped-def]
         conn,
@@ -271,16 +276,37 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     def fake_count_rows(conn, model_version: str) -> int:  # type: ignore[no-untyped-def]
         return sum(upsert_sizes)
 
+    def fake_get_csv_fingerprint(conn, csv_path: str, model_version: str, filter_hash: str):  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_upsert_csv_fingerprint(  # type: ignore[no-untyped-def]
+        conn,
+        *,
+        csv_path: str,
+        model_version: str,
+        filter_hash: str,
+        size_bytes: int,
+        mtime_ns: int,
+        sha256: str,
+        row_count: int,
+    ) -> None:
+        return None
+
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
     monkeypatch.setattr("gpu_embedder.embed.load_model", fake_load_model)
     monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
     monkeypatch.setattr("gpu_embedder.embed.embed_all", fake_embed_all)
     monkeypatch.setattr("gpu_embedder.store.open_db", fake_open_db)
     monkeypatch.setattr("gpu_embedder.store.ensure_schema", fake_ensure_schema)
-    monkeypatch.setattr("gpu_embedder.store.get_existing_ids", fake_get_existing_ids)
+    monkeypatch.setattr(
+        "gpu_embedder.store.classify_rows_requiring_embedding",
+        fake_classify_rows_requiring_embedding,
+    )
     monkeypatch.setattr("gpu_embedder.store.upsert_model_registry", fake_upsert_model_registry)
     monkeypatch.setattr("gpu_embedder.store.upsert_rows", fake_upsert_rows)
     monkeypatch.setattr("gpu_embedder.store.count_rows", fake_count_rows)
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
 
     result = runner.invoke(
         app,

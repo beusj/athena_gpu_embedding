@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gpu_embedder.ingest import count_csv_rows, filter_rows, read_csv
+from gpu_embedder.ingest import compute_csv_fingerprint, count_csv_rows, filter_rows, filter_spec_hash, read_csv
 from gpu_embedder.models import ConceptRow, FilterSpec
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
@@ -188,3 +188,33 @@ class TestFilterRowsEdgeCases:
         rows = read_csv(bad_tsv)
         assert len(rows) == 1
         assert rows[0].concept_id == 999
+
+
+class TestCsvFingerprintHelpers:
+    def test_compute_csv_fingerprint_changes_when_file_changes(self, tmp_path: Path) -> None:
+        csv_path = tmp_path / "CONCEPT.csv"
+        csv_path.write_text("a\tb\n1\t2\n", encoding="utf-8")
+
+        fp1 = compute_csv_fingerprint(csv_path)
+        csv_path.write_text("a\tb\n1\t2\n3\t4\n", encoding="utf-8")
+        fp2 = compute_csv_fingerprint(csv_path)
+
+        assert fp1["sha256"] != fp2["sha256"]
+
+    def test_filter_spec_hash_is_order_insensitive_within_columns(self) -> None:
+        spec_a = FilterSpec(
+            vocabulary_ids=["SNOMED", "LOINC"],
+            domain_ids=["Condition", "Measurement"],
+        )
+        spec_b = FilterSpec(
+            vocabulary_ids=["LOINC", "SNOMED"],
+            domain_ids=["Measurement", "Condition"],
+        )
+
+        assert filter_spec_hash(spec_a) == filter_spec_hash(spec_b)
+
+    def test_filter_spec_hash_changes_when_filter_changes(self) -> None:
+        spec_a = FilterSpec(vocabulary_ids=["LOINC"])
+        spec_b = FilterSpec(vocabulary_ids=["LOINC", "SNOMED"])
+
+        assert filter_spec_hash(spec_a) != filter_spec_hash(spec_b)

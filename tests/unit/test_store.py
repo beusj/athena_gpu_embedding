@@ -11,9 +11,13 @@ from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow
 from gpu_embedder.store import (
     count_rows,
     ensure_schema,
+    filter_rows_requiring_embedding,
+    filter_unembedded_rows,
+    get_csv_fingerprint,
     get_existing_ids,
     list_model_registry,
     open_db,
+    upsert_csv_fingerprint,
     upsert_model_registry,
     upsert_rows,
 )
@@ -35,6 +39,19 @@ def _make_row(concept_id: int = 1, vocabulary_id: str = "SNOMED") -> EmbeddedRow
         embed_text=f"Concept {concept_id}",
         model_version="v1",
         embedded_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def _make_concept_row(concept_id: int = 1, vocabulary_id: str = "SNOMED") -> ConceptRow:
+    return ConceptRow(
+        concept_id=concept_id,
+        concept_name=f"Concept {concept_id}",
+        domain_id="Condition",
+        vocabulary_id=vocabulary_id,
+        concept_class_id="Clinical Finding",
+        standard_concept="S",
+        concept_code=str(concept_id),
+        invalid_reason=None,
     )
 
 
@@ -195,6 +212,86 @@ class TestUpsertAndExistence:
 
 
 # ---------------------------------------------------------------------------
+# filter_unembedded_rows
+# ---------------------------------------------------------------------------
+
+class TestFilterUnembeddedRows:
+    def test_returns_all_when_none_embedded(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        rows = [_make_concept_row(i) for i in range(1, 4)]
+        result = filter_unembedded_rows(conn, rows, "v1")
+        assert [r.concept_id for r in result] == [1, 2, 3]
+
+    def test_returns_only_missing(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        embed_rows = [_make_row(i) for i in range(1, 4)]
+        upsert_rows(conn, [embed_rows[0]])  # embed concept_id=1 only
+        concept_rows = [r.concept for r in embed_rows]
+        result = filter_unembedded_rows(conn, concept_rows, "v1")
+        assert {r.concept_id for r in result} == {2, 3}
+
+    def test_returns_empty_when_all_embedded(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        embed_rows = [_make_row(i) for i in range(1, 4)]
+        upsert_rows(conn, embed_rows)
+        concept_rows = [r.concept for r in embed_rows]
+        result = filter_unembedded_rows(conn, concept_rows, "v1")
+        assert result == []
+
+    def test_scoped_to_model_version(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        embed_row = _make_row(concept_id=7)
+        upsert_rows(conn, [embed_row])  # embedded under "v1"
+        # should still appear as unembedded under "v2"
+        result = filter_unembedded_rows(conn, [embed_row.concept], "v2")
+        assert len(result) == 1
+
+    def test_empty_candidates(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        result = filter_unembedded_rows(conn, [], "v1")
+        assert result == []
+
+
+class TestFilterRowsRequiringEmbedding:
+    def test_new_rows_require_embedding(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        rows = [_make_concept_row(1), _make_concept_row(2)]
+        candidate_texts = {1: "Concept 1", 2: "Concept 2"}
+
+        result = filter_rows_requiring_embedding(conn, rows, "v1", candidate_texts)
+
+        assert {r.concept_id for r in result} == {1, 2}
+
+    def test_unchanged_rows_are_skipped(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        upsert_rows(conn, [_make_row(concept_id=7)])
+        rows = [_make_concept_row(7)]
+        candidate_texts = {7: "Concept 7"}
+
+        result = filter_rows_requiring_embedding(conn, rows, "v1", candidate_texts)
+
+        assert result == []
+
+    def test_changed_embed_text_requires_reembed(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+        upsert_rows(conn, [_make_row(concept_id=9)])
+        rows = [_make_concept_row(9)]
+        candidate_texts = {9: "Concept 9 (updated)"}
+
+        result = filter_rows_requiring_embedding(conn, rows, "v1", candidate_texts)
+
+        assert [r.concept_id for r in result] == [9]
+
+
+# ---------------------------------------------------------------------------
 # count_rows
 # ---------------------------------------------------------------------------
 
@@ -316,3 +413,69 @@ class TestModelRegistry:
         assert v2_row.model_revision is None
         assert v2_row.precision == "fp32"
         assert v2_row.quantization_scheme == "none"
+
+
+class TestCsvFingerprints:
+    def test_get_returns_none_when_missing(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+
+        result = get_csv_fingerprint(conn, "C:/tmp/CONCEPT.csv", "v1", "f1")
+
+        assert result is None
+
+    def test_upsert_then_get_round_trip(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+
+        upsert_csv_fingerprint(
+            conn,
+            csv_path="C:/tmp/CONCEPT.csv",
+            model_version="v1",
+            filter_hash="f1",
+            size_bytes=123,
+            mtime_ns=456,
+            sha256="abc",
+            row_count=789,
+        )
+
+        result = get_csv_fingerprint(conn, "C:/tmp/CONCEPT.csv", "v1", "f1")
+
+        assert result is not None
+        assert result["size_bytes"] == 123
+        assert result["mtime_ns"] == 456
+        assert result["sha256"] == "abc"
+        assert result["row_count"] == 789
+
+    def test_upsert_replaces_same_pk(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings.duckdb")
+        ensure_schema(conn)
+
+        upsert_csv_fingerprint(
+            conn,
+            csv_path="C:/tmp/CONCEPT.csv",
+            model_version="v1",
+            filter_hash="f1",
+            size_bytes=100,
+            mtime_ns=200,
+            sha256="old",
+            row_count=300,
+        )
+        upsert_csv_fingerprint(
+            conn,
+            csv_path="C:/tmp/CONCEPT.csv",
+            model_version="v1",
+            filter_hash="f1",
+            size_bytes=101,
+            mtime_ns=201,
+            sha256="new",
+            row_count=301,
+        )
+
+        result = get_csv_fingerprint(conn, "C:/tmp/CONCEPT.csv", "v1", "f1")
+
+        assert result is not None
+        assert result["size_bytes"] == 101
+        assert result["mtime_ns"] == 201
+        assert result["sha256"] == "new"
+        assert result["row_count"] == 301

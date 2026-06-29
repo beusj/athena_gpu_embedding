@@ -31,7 +31,7 @@ from typer.main import get_command
 
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
-from gpu_embedder.ingest import read_csv
+from gpu_embedder.ingest import compute_csv_fingerprint, filter_spec_hash, read_csv
 from gpu_embedder.models import FilterSpec
 
 app = typer.Typer(
@@ -342,12 +342,73 @@ def embed_cmd(
         invalid_reasons=invalid_reason or [],
     )
 
-    # Load all rows with DuckDB pushdown filtering
+    # Open store connection
+    from gpu_embedder import store as st
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    # Resolve model version before CSV load so we can short-circuit unchanged inputs.
+    from gpu_embedder.embed import build_embed_text, compute_model_version, embed_all, load_model
+
+    model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
+    filter_hash = filter_spec_hash(spec)
+
+    # Load only CSVs that changed for this (model_version, filter_hash)
     filtered = []
+    ingested_fingerprints: list[tuple[Path, dict[str, object], int]] = []
+    skipped_unchanged = 0
+    skipped_unchanged_rows = 0
+
     for p in paths:
-        filtered.extend(read_csv(p, spec=spec, engine=cfg.ingest_engine))
+        csv_path = str(p.resolve())
+        stored = st.get_csv_fingerprint(conn, csv_path, model_version, filter_hash)
+
+        stat = p.stat()
+        size_bytes = int(stat.st_size)
+        mtime_ns = int(stat.st_mtime_ns)
+
+        if stored is not None and not cfg.force:
+            stored_size = int(stored["size_bytes"])
+            stored_mtime = int(stored["mtime_ns"])
+
+            if stored_size == size_bytes and stored_mtime == mtime_ns:
+                skipped_unchanged += 1
+                skipped_unchanged_rows += int(stored["row_count"])
+                logger.info(
+                    "Skipping unchanged CSV by size/mtime: %s (rows=%d)",
+                    csv_path,
+                    int(stored["row_count"]),
+                )
+                continue
+
+            current_fp = compute_csv_fingerprint(p)
+            if str(stored["sha256"]) == str(current_fp["sha256"]):
+                skipped_unchanged += 1
+                skipped_unchanged_rows += int(stored["row_count"])
+                logger.info(
+                    "Skipping unchanged CSV by SHA-256: %s (rows=%d)",
+                    csv_path,
+                    int(stored["row_count"]),
+                )
+                continue
+
+            loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine)
+            filtered.extend(loaded)
+            ingested_fingerprints.append((p, current_fp, len(loaded)))
+            continue
+
+        current_fp = compute_csv_fingerprint(p)
+        loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine)
+        filtered.extend(loaded)
+        ingested_fingerprints.append((p, current_fp, len(loaded)))
 
     typer.echo(f"Loaded {len(filtered)} rows after {cfg.ingest_engine} filtering.")
+    if skipped_unchanged:
+        typer.echo(
+            f"Skipped {skipped_unchanged} unchanged CSV file(s) "
+            f"({skipped_unchanged_rows} filtered rows)."
+        )
 
     # Deduplicate by concept_id before model loading/embedding. Keep first-seen row.
     seen_concept_ids: set[int] = set()
@@ -371,15 +432,6 @@ def embed_cmd(
         typer.echo("Nothing to embed.")
         raise typer.Exit(0)
 
-    # Open DuckDB
-    from gpu_embedder import store as st
-
-    conn = st.open_db(cfg.db)
-    st.ensure_schema(conn)
-
-    # Determine skip set
-    from gpu_embedder.embed import compute_model_version, embed_all, load_model
-
     rev_label = cfg.model_revision or "default"
     logger.info(
         "Device diagnostics: requested=%s, torch.cuda.is_available=%s, "
@@ -391,7 +443,6 @@ def embed_cmd(
     )
     typer.echo(f"Loading model {cfg.model} (revision={rev_label}) on {cfg.device} …")
     mdl, tok = load_model(cfg.model, cfg.device, revision=cfg.model_revision)
-    model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
     typer.echo(f"model_version={model_version[:16]}…")
     st.upsert_model_registry(
         conn,
@@ -402,11 +453,23 @@ def embed_cmd(
         quantization_scheme="none",
     )
 
-    skip_ids: set[int] = set()
-    if not cfg.force:
-        skip_ids = st.get_existing_ids(conn, model_version)
-
-    to_embed = [r for r in filtered if r.concept_id not in skip_ids]
+    if cfg.force:
+        to_embed = filtered
+    else:
+        candidate_texts = {
+            row.concept_id: build_embed_text(row, cfg.text_fields, cfg.separator)
+            for row in filtered
+        }
+        to_embed, new_count, changed_count, unchanged_count = st.classify_rows_requiring_embedding(
+            conn,
+            filtered,
+            model_version,
+            candidate_texts,
+        )
+        typer.echo(
+            "Embedding delta: "
+            f"{new_count} new, {changed_count} changed-text, {unchanged_count} unchanged."
+        )
     skipped = len(filtered) - len(to_embed)
     typer.echo(f"Skipping {skipped} already-embedded, embedding {len(to_embed)} …")
 
@@ -471,6 +534,18 @@ def embed_cmd(
         f"Done. Embedded {total_embedded} concepts. "
         f"Total stored for this model version: {total}."
     )
+
+    for path_obj, fingerprint, row_count in ingested_fingerprints:
+        st.upsert_csv_fingerprint(
+            conn,
+            csv_path=str(path_obj.resolve()),
+            model_version=model_version,
+            filter_hash=filter_hash,
+            size_bytes=int(fingerprint["size_bytes"]),
+            mtime_ns=int(fingerprint["mtime_ns"]),
+            sha256=str(fingerprint["sha256"]),
+            row_count=row_count,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -181,6 +181,13 @@ from `cli.py`.
   the query.
 - **Do not silently swallow embedding errors.** Log and re-raise; a partial
   batch should not produce a partial write.
+- **Do not use Parquet as the primary write store.** A Parquet-backed backend
+  was tried and abandoned after production use — it caused severe write
+  amplification (full shard rewrite per checkpoint), no native upsert/PK
+  enforcement, stale-view bugs, and startup cost proportional to total table
+  size. See `docs/adr_parquet_store_rejected.md` for the full post-mortem.
+  The `.duckdb` native table is the only supported live write backend.
+  Parquet is for `gpu-embed export` (Snowflake handoff) only.
 
 ---
 

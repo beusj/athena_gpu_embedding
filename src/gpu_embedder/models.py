@@ -94,3 +94,21 @@ CREATE TABLE IF NOT EXISTS concept_embeddings (
     PRIMARY KEY (concept_id, model_version)
 );
 """
+
+# Tracks which (csv_path, model_version, filter_hash) triples have been fully
+# ingested so subsequent runs can skip the expensive CSV load when the source
+# file has not changed.  filter_hash is a SHA-256 of the canonical FilterSpec
+# so changing filters correctly invalidates the fingerprint.
+CSV_FINGERPRINTS_DDL = """
+CREATE TABLE IF NOT EXISTS csv_fingerprints (
+    csv_path      TEXT      NOT NULL,
+    model_version TEXT      NOT NULL,
+    filter_hash   TEXT      NOT NULL,
+    size_bytes    BIGINT    NOT NULL,
+    mtime_ns      BIGINT    NOT NULL,
+    sha256        TEXT      NOT NULL,
+    row_count     BIGINT    NOT NULL,
+    completed_at  TIMESTAMP NOT NULL,
+    PRIMARY KEY (csv_path, model_version, filter_hash)
+);
+"""

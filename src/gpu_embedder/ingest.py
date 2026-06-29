@@ -8,6 +8,8 @@ Pydantic validation and embedding.
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import logging
 from pathlib import Path
 
@@ -218,3 +220,42 @@ def filter_rows(rows: list[ConceptRow], spec: FilterSpec) -> list[ConceptRow]:
     result = _records_to_concepts(records)
     logger.info("filter_rows: %d → %d rows after filtering", len(rows), len(result))
     return result
+
+
+# ---------------------------------------------------------------------------
+# CSV fingerprinting
+# ---------------------------------------------------------------------------
+
+def compute_csv_fingerprint(path: Path) -> dict[str, object]:
+    """Return a fingerprint dict for *path* containing size_bytes, mtime_ns, and sha256.
+
+    Used to detect whether the source CSV has changed since the last
+    successful ingest run, so we can skip the expensive read_csv() call.
+    """
+    stat = path.stat()
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return {
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": h.hexdigest(),
+    }
+
+
+def filter_spec_hash(spec: FilterSpec | None) -> str:
+    """Return a stable SHA-256 hex digest of *spec*.
+
+    The digest changes whenever any filter value is added or removed, so
+    a fingerprint recorded under one filter spec will not suppress a run
+    that uses a different spec (e.g. adding a new --vocabulary-id).
+    """
+    canonical: dict[str, list[str]] = {
+        "vocabulary_ids": sorted(spec.vocabulary_ids if spec else []),
+        "domain_ids": sorted(spec.domain_ids if spec else []),
+        "concept_class_ids": sorted(spec.concept_class_ids if spec else []),
+        "standard_concepts": sorted(str(v) for v in (spec.standard_concepts if spec else [])),
+        "invalid_reasons": sorted(str(v) for v in (spec.invalid_reasons if spec else [])),
+    }
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
