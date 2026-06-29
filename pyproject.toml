@@ -19,9 +19,13 @@ dependencies = [
 [project.optional-dependencies]
 # Torch build selection — choose exactly one backend when syncing:
 #   uv sync --extra gpu   CUDA 13.0 on Linux/Windows (CPU/MPS wheels on macOS)
-#   uv sync --extra cpu   CPU-only wheels everywhere — small, GPU-free; CI/tests
+#   uv sync --extra cpu   CPU-only wheels — the right choice for running the
+#                         tests, which mock the model and never need a GPU.
 # torch is also listed in [project.dependencies]; these extras only route which
 # index it is resolved from (see [tool.uv.sources]).
+# NOTE: the cpu/gpu indexes live on download.pytorch.org. In sandboxes that block
+# it (e.g. Claude Code on the web), install a CPU torch from PyPI instead — see
+# the README's "Testing without a GPU" section / .claude/hooks/session-start.sh.
 cpu = ["torch>=2.3"]
 gpu = ["torch>=2.3"]
 

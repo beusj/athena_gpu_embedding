@@ -1155,10 +1155,9 @@ def export_cmd(
     # into the digest, so cls and mean land under distinct model_version dirs.
     model_dir = output_dir / f"model_version={selected_model_version}"
     model_dir.mkdir(parents=True, exist_ok=True)
+    selected_pooling = _pooling_of(selected_model_version)
     typer.echo(f"Export root: {output_dir}")
-    typer.echo(
-        f"model_version={selected_model_version[:16]}…  pooling={_pooling_of(selected_model_version)}"
-    )
+    typer.echo(f"model_version={selected_model_version[:16]}…  pooling={selected_pooling}")
     typer.echo(
         f"Sharding by up to {shard_rows:,} row(s) per file with {normalized_compression} "
         "compression."

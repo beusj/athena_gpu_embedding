@@ -136,6 +136,40 @@ If `cuda.is_available()` is still `False` after syncing:
 - `--torch-backend=auto` resolves the right backend for your installed driver
   automatically; use it to sanity-check what uv would pick.
 
+### Testing without a GPU (CI, sandboxes, Claude Code on the web)
+
+**The unit tests never need a GPU or CUDA** — they mock the model, so there is no
+real forward pass. The `cpu` extra exists specifically for these GPU-free
+environments. This is the recommended setup for running the suite.
+
+**Open-network CI or a local machine** — use the `cpu` extra, which pulls small
+CPU-only wheels from the PyTorch index:
+
+```bash
+uv sync --group dev --extra cpu
+uv run pytest
+```
+
+**Network-restricted sandboxes** (e.g. Claude Code on the web, some CI runners)
+often allow `pypi.org` but **block `download.pytorch.org`**. There the `cpu`
+extra can't fetch its wheels, so install a CPU-capable torch straight from PyPI
+instead (larger, bundles CUDA libs, but runs fine on CPU):
+
+```bash
+uv venv
+uv pip install "torch>=2.3"          # CPU-capable build from PyPI
+uv pip install --no-deps -e .        # project without re-resolving the torch index
+uv pip install duckdb typer pydantic pydantic-settings python-dotenv \
+  transformers tqdm numpy pyarrow pytest pytest-cov pytest-asyncio ruff mypy
+uv run pytest
+```
+
+For **Claude Code on the web**, this is automated: `.claude/hooks/session-start.sh`
+runs the PyPI-based setup above on session start so `uv run pytest` works
+out of the box (see `.claude/settings.json`). The hook only runs in the remote
+environment (`CLAUDE_CODE_REMOTE=true`); local development uses the `uv sync`
+commands above.
+
 ---
 
 ## Choosing an embedding model
