@@ -9,7 +9,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
-from gpu_embedder.models import ConceptRow, EmbeddedRow
+from gpu_embedder.models import DEFAULT_VOCABULARY_IDS, ConceptRow, EmbeddedRow
 from gpu_embedder.store import ensure_schema, open_db, upsert_model_registry, upsert_rows
 
 
@@ -467,6 +467,44 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
 
     assert result.exit_code == 0
     assert captured["vocabulary_ids"] == ["LOINC", "SNOMED", "RxNorm"]
+
+
+def test_embed_defaults_to_highest_yield_vocabularies(monkeypatch) -> None:
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    captured: dict[str, object] = {}
+
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
+        captured["vocabulary_ids"] = spec.vocabulary_ids
+        return []
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+
+    result = runner.invoke(app, ["embed", str(fixture)])
+
+    assert result.exit_code == 0
+    assert captured["vocabulary_ids"] == list(DEFAULT_VOCABULARY_IDS)
+    assert "defaulting to highest-yield vocabularies" in result.output
+
+
+def test_embed_all_sentinel_embeds_every_vocabulary(monkeypatch) -> None:
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    captured: dict[str, object] = {}
+
+    def fake_read_csv(path: Path, spec, engine: str, namespace: str = "athena"):  # type: ignore[no-untyped-def]
+        captured["vocabulary_ids"] = spec.vocabulary_ids
+        return []
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+
+    result = runner.invoke(app, ["embed", str(fixture), "--vocabulary-id", "all"])
+
+    assert result.exit_code == 0
+    assert captured["vocabulary_ids"] == []
+    assert "Embedding all vocabularies" in result.output
 
 
 def test_migrate_store_invokes_store_initialization(monkeypatch, tmp_path: Path) -> None:

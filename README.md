@@ -284,7 +284,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
 | `--verbose` | false | Enable detailed logging and progress visibility |
 | `--force` | false | Re-embed rows that already exist in the store |
-| `--vocabulary-id` | _(all)_ | Keep only these vocabulary IDs (repeatable or comma-delimited) |
+| `--vocabulary-id` | _(highest-yield set)_ | Keep only these vocabulary IDs (repeatable or comma-delimited). When omitted, defaults to the curated highest-yield vocabularies (see below). Pass `--vocabulary-id all` to embed every vocabulary instead. |
 | `--domain-id` | _(all)_ | Keep only these domain IDs (repeatable) |
 | `--concept-class-id` | _(all)_ | Keep only these concept class IDs (repeatable) |
 | `--standard-concept` | _(all)_ | Keep only `S`, `C`, or _(blank)_ rows (repeatable) |
@@ -292,6 +292,40 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--text-field` | `concept_name` | Column(s) to concatenate as embedding input (repeatable) |
 | `--separator` | `" "` | Separator between concatenated text fields |
 | `--namespace` | `athena` | Identity namespace; use a distinct value for source-concept datasets so their `concept_id`s don't collide with Athena |
+
+#### Default vocabularies (highest-yield set)
+
+A full Athena `CONCEPT.csv` spans dozens of vocabularies, many of which add
+little value for downstream concept mapping while inflating embedding time and
+store size. So when **no** `--vocabulary-id` is given, `embed` does **not**
+embed everything — it defaults to a curated set of the highest-yield Athena
+vocabularies:
+
+| Domain | `vocabulary_id`(s) |
+|--------|--------------------|
+| Conditions | `SNOMED`, `ICD9CM`, `ICD10CM` |
+| Procedures | `CPT4`, `ICD9Proc`, `ICD10PCS` |
+| Drugs | `RxNorm`, `RxNorm Extension`, `NDC` |
+| Labs / measurements | `LOINC` |
+| Demographics | `Race`, `Ethnicity` |
+| Providers | `ABMS`, `NUCC` |
+
+To override:
+
+```bash
+# Embed every vocabulary present in the CSV (reserved sentinel "all"):
+gpu-embed embed --vocabulary-id all
+
+# Restrict to an explicit subset (disables the default):
+gpu-embed embed --vocabulary-id SNOMED,RxNorm
+```
+
+> **CPT-4 note:** Athena ships CPT-4 with blank concept names; run
+> `gpu-embed cpt4` (UMLS license required) to populate them *before* embedding,
+> otherwise the CPT4 rows embed degenerate text.
+
+The default list is the `DEFAULT_VOCABULARY_IDS` constant in
+`src/gpu_embedder/models.py`; edit it there to change the curated set.
 
 ### `cpt4` — populate CPT-4 names via Athena Java tool
 

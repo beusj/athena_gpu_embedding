@@ -62,6 +62,41 @@ class EmbeddedRow:
 
 
 # ---------------------------------------------------------------------------
+# Default "highest-yield" vocabularies
+# ---------------------------------------------------------------------------
+
+# When `embed` is run without any `--vocabulary-id`, the filter would otherwise
+# match *every* vocabulary in CONCEPT.csv (millions of rows, much of it low-value
+# for downstream concept mapping). Instead we default to this curated set of the
+# highest-yield Athena vocabularies, covering conditions, procedures, drugs, labs,
+# demographics, and provider taxonomies.
+#
+# These are the exact, case-sensitive Athena ``vocabulary_id`` strings (DuckDB
+# string equality is case-sensitive). To bypass this default and embed every
+# vocabulary, pass the reserved sentinel ``--vocabulary-id all``.
+DEFAULT_VOCABULARY_IDS: tuple[str, ...] = (
+    "SNOMED",            # conditions, clinical findings (standard)
+    "ICD9CM",            # legacy US diagnoses
+    "ICD10CM",           # US diagnoses
+    "ICD9Proc",          # legacy US inpatient procedures
+    "ICD10PCS",          # US inpatient procedures
+    "CPT4",              # outpatient procedures (names require the `cpt4` step)
+    "LOINC",             # lab tests, measurements, vitals
+    "RxNorm",            # drugs (standard)
+    "RxNorm Extension",  # OHDSI drugs not covered by RxNorm
+    "NDC",               # drug product codes
+    "Race",              # demographics
+    "Ethnicity",         # demographics
+    "ABMS",              # provider board certifications / specialties
+    "NUCC",              # provider taxonomy / specialties
+)
+
+# Reserved sentinel value for `--vocabulary-id` that disables the highest-yield
+# default and embeds every vocabulary present in the source CSV(s).
+ALL_VOCABULARIES_SENTINEL = "all"
+
+
+# ---------------------------------------------------------------------------
 # Filter spec
 # ---------------------------------------------------------------------------
 
