@@ -24,6 +24,10 @@ By default, embeddings are stored as:
 
 `embeddings/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
 
+Model hash provenance is stored alongside the dataset at:
+
+`embeddings/_meta/model_registry/part-*.parquet`
+
 ```bash
 uv run gpu-embed status --db embeddings
 uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/*.parquet'))))"

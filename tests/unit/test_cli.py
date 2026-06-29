@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
 from gpu_embedder.models import ConceptRow, EmbeddedRow
-from gpu_embedder.store import ensure_schema, open_db, upsert_rows
+from gpu_embedder.store import ensure_schema, open_db, upsert_model_registry, upsert_rows
 
 
 def _seed_embeddings_db(db_path: Path) -> None:
@@ -248,6 +248,15 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     def fake_get_existing_ids(conn, model_version: str) -> set[int]:  # type: ignore[no-untyped-def]
         return set()
 
+    def fake_upsert_model_registry(  # type: ignore[no-untyped-def]
+        conn,
+        *,
+        model_version: str,
+        model_id: str,
+        model_revision: str | None,
+    ) -> None:
+        return None
+
     def fake_upsert_rows(conn, embedded_rows, mode: str = "ndjson") -> None:  # type: ignore[no-untyped-def]
         upsert_sizes.append(len(embedded_rows))
 
@@ -261,6 +270,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.open_db", fake_open_db)
     monkeypatch.setattr("gpu_embedder.store.ensure_schema", fake_ensure_schema)
     monkeypatch.setattr("gpu_embedder.store.get_existing_ids", fake_get_existing_ids)
+    monkeypatch.setattr("gpu_embedder.store.upsert_model_registry", fake_upsert_model_registry)
     monkeypatch.setattr("gpu_embedder.store.upsert_rows", fake_upsert_rows)
     monkeypatch.setattr("gpu_embedder.store.count_rows", fake_count_rows)
 
@@ -436,3 +446,62 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
     assert loinc_count is not None
     assert snomed_count[0] == 3
     assert loinc_count[0] == 1
+
+
+def test_model_registry_lists_entries(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    upsert_model_registry(
+        conn,
+        model_version="a" * 64,
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3",
+    )
+    conn.close()
+
+    result = runner.invoke(app, ["model-registry", "--db", str(db_path)])
+
+    assert result.exit_code == 0
+    assert "MODEL VERSION" in result.output
+    assert "cambridgeltl/SapBERT-from-PubMedBERT-fulltext" in result.output
+    assert "090663c3" in result.output
+
+
+def test_model_registry_backfills_from_logs(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "gpu-embed-2026-06-28.log").write_text(
+        "2026-06-28 09:00:00 INFO gpu_embedder.embed: "
+        "Loading model from FremyCompany/BioLORD-2023 → device=cuda "
+        "(FP32, revision=167aab527b238a50ca65224e6319215d2ff4fc9f, source=cached)\n",
+        encoding="utf-8",
+    )
+
+    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+        assert model_id == "FremyCompany/BioLORD-2023"
+        assert revision == "167aab527b238a50ca65224e6319215d2ff4fc9f"
+        return "f8c969586cc6b0fd393faa7d879de93d6cc532123956041fefd3474194322050"
+
+    monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
+
+    result = runner.invoke(
+        app,
+        [
+            "model-registry",
+            "--db",
+            str(db_path),
+            "--backfill-from-logs",
+            "--log-dir",
+            str(log_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Backfill complete from logs" in result.output
+    assert "FremyCompany/BioLORD-2023" in result.output
+    assert "f8c969586cc6b0fd" in result.output

@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,11 @@ app = typer.Typer(
 logger = logging.getLogger(__name__)
 
 
+_LOADING_MODEL_RE = re.compile(
+    r"Loading model from (?P<model_id>.+?) → .*?\(FP32, revision=(?P<revision>[^,\)]+)",
+)
+
+
 def _split_multi_values(values: list[str] | None) -> list[str]:
     """Normalize repeatable option values with optional comma-delimited input.
 
@@ -56,6 +62,35 @@ def _split_multi_values(values: list[str] | None) -> list[str]:
     for value in values:
         normalized.extend(piece.strip() for piece in value.split(",") if piece.strip())
     return normalized
+
+
+def _extract_model_pairs_from_logs(log_dir: Path) -> list[tuple[str, str | None]]:
+    """Parse log files for model_id/revision pairs used by embed runs."""
+    if not log_dir.exists() or not log_dir.is_dir():
+        return []
+
+    seen: set[tuple[str, str | None]] = set()
+    ordered: list[tuple[str, str | None]] = []
+
+    for log_path in sorted(log_dir.glob("*.log")):
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = _LOADING_MODEL_RE.search(line)
+            if not match:
+                continue
+            model_id = match.group("model_id").strip()
+            revision_text = match.group("revision").strip()
+            revision = None if revision_text == "default" else revision_text
+            key = (model_id, revision)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+
+    return ordered
 
 
 def _resolve_java_executable() -> Path | None:
@@ -136,7 +171,10 @@ def embed_cmd(
     ] = None,
     db: Annotated[
         Path | None,
-        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path (parquet root or legacy .duckdb)"),
+        typer.Option(
+            envvar="GPU_EMBED_DB",
+            help="Embedding store path (parquet root or legacy .duckdb)",
+        ),
     ] = None,
     model: Annotated[
         str | None,
@@ -354,6 +392,12 @@ def embed_cmd(
     mdl, tok = load_model(cfg.model, cfg.device, revision=cfg.model_revision)
     model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
     typer.echo(f"model_version={model_version[:16]}…")
+    st.upsert_model_registry(
+        conn,
+        model_version=model_version,
+        model_id=cfg.model,
+        model_revision=cfg.model_revision,
+    )
 
     skip_ids: set[int] = set()
     if not cfg.force:
@@ -804,6 +848,93 @@ def status_cmd(
     total = sum(r.embedded for r in rows)
     typer.echo("-" * 60)
     typer.echo(f"{'TOTAL':<22}  {'':22}  {total:>9,}\n")
+
+
+@app.command("model-registry")
+def model_registry_cmd(
+    db: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path to inspect"),
+    ] = None,
+    backfill_from_logs: Annotated[
+        bool,
+        typer.Option(
+            "--backfill-from-logs",
+            help="Parse logs and upsert missing model hash mappings before listing",
+        ),
+    ] = False,
+    log_dir: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_LOG_DIR", help="Directory containing gpu-embed logs"),
+    ] = None,
+) -> None:
+    """Show model hash to model-id/revision mappings from parquet metadata."""
+    from gpu_embedder import store as st
+    from gpu_embedder.embed import compute_model_version
+
+    cfg_overrides: dict[str, object] = {}
+    if db is not None:
+        cfg_overrides["db"] = db
+    if log_dir is not None:
+        cfg_overrides["log_dir"] = log_dir
+
+    cfg = EmbedConfig(**cfg_overrides)
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    if backfill_from_logs:
+        candidates = _extract_model_pairs_from_logs(cfg.log_dir)
+        if not candidates:
+            typer.echo(f"No log-derived model pairs found in {cfg.log_dir}.")
+        else:
+            added = 0
+            failed = 0
+            for model_id, revision in candidates:
+                try:
+                    model_version = compute_model_version(model_id, revision=revision)
+                except Exception as exc:  # pragma: no cover - defensive CLI handling
+                    failed += 1
+                    revision_label = revision or "default"
+                    typer.echo(
+                        (
+                            f"Warning: could not hash model '{model_id}' "
+                            f"(revision={revision_label}): {exc}"
+                        ),
+                        err=True,
+                    )
+                    continue
+
+                st.upsert_model_registry(
+                    conn,
+                    model_version=model_version,
+                    model_id=model_id,
+                    model_revision=revision,
+                )
+                added += 1
+
+            typer.echo(
+                f"Backfill complete from logs: {added} mapping(s) upserted, {failed} failed."
+            )
+
+    rows = st.list_model_registry(conn)
+    if not rows:
+        typer.echo("No model registry entries found.")
+        raise typer.Exit(0)
+
+    typer.echo(f"\nStore: {cfg.db}")
+    typer.echo(f"Registry source: {cfg.db}/_meta/model_registry")
+    typer.echo()
+    typer.echo(f"{'MODEL VERSION':18}  {'RECORDED AT':20}  {'REVISION':12}  MODEL ID")
+    typer.echo("-" * 100)
+    for row in rows:
+        revision_label = row.model_revision or "default"
+        typer.echo(
+            f"{row.model_version[:16]}…  "
+            f"{row.recorded_at.strftime('%Y-%m-%d %H:%M'):20}  "
+            f"{revision_label[:12]:12}  "
+            f"{row.model_id}"
+        )
+    typer.echo()
 
 
 # ---------------------------------------------------------------------------

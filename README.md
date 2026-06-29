@@ -167,6 +167,7 @@ The tool has five subcommands:
 gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
 gpu-embed export    [OPTIONS] OUTPUT_DIR      — export DB rows to sharded parquet
 gpu-embed status    [OPTIONS]                — show what is stored in the DB
+gpu-embed model-registry [OPTIONS]           — show hash -> model/revision mappings
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
 gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 ```
@@ -178,6 +179,9 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 - Default store path is `embeddings/` (directory).
 - Data is stored as parquet files under
   `model_version=<digest>/vocabulary_id=<value>/part-*.parquet`.
+- Model provenance is stored alongside shards under
+  `_meta/model_registry/part-*.parquet` with one deduplicated row per
+  `model_version` (`model_id`, `model_revision`, `recorded_at`).
 - `concept_embeddings` is exposed as a DuckDB view for all reads and exports.
 - If `--db` / `GPU_EMBED_DB` points to an existing legacy `.duckdb` file,
   rows are auto-migrated one time into a sibling parquet directory with the
@@ -247,6 +251,21 @@ breakdown of embedded concept counts. No source CSV is required.
 |------|---------|-------------|
 | `--db` | `embeddings` | Embedding store path to inspect |
 | `--model-version` | _(most recent)_ | Show breakdown for the version starting with this prefix |
+
+### `model-registry` — inspect model hash provenance
+
+```
+gpu-embed model-registry [OPTIONS]
+```
+
+Shows mappings between `model_version` hashes and model metadata recorded in
+`_meta/model_registry/*.parquet`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db` | `embeddings` | Embedding store path to inspect |
+| `--backfill-from-logs` | false | Parse `GPU_EMBED_LOG_DIR` logs for model/revision lines and upsert derived hash mappings |
+| `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
 
 ### `export` — write sharded parquet by vocabulary directory
 

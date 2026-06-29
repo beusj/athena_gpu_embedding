@@ -11,8 +11,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from glob import glob
-from pathlib import Path
 from math import ceil
+from pathlib import Path
 from typing import Literal
 
 import duckdb
@@ -22,12 +22,21 @@ from gpu_embedder.models import EmbeddedRow
 logger = logging.getLogger(__name__)
 TARGET_ROWS_PER_SHARD = 250_000
 NULL_VOCAB_PARTITION = "_null"
+MODEL_REGISTRY_SUBDIR = Path("_meta") / "model_registry"
 
 
 @dataclass(frozen=True)
 class _StoreContext:
     parquet_root: Path
     legacy_db_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class ModelRegistryEntry:
+    model_version: str
+    model_id: str
+    model_revision: str | None
+    recorded_at: datetime
 
 
 _CONTEXTS: dict[int, _StoreContext] = {}
@@ -57,6 +66,18 @@ def _parquet_patterns(parquet_root: Path) -> list[str]:
         str((parquet_root / "model_version=*" / "*.parquet").as_posix()),
         str((parquet_root / "model_version=*" / "vocabulary_id=*" / "*.parquet").as_posix()),
     ]
+
+
+def _registry_dir(parquet_root: Path) -> Path:
+    return parquet_root / MODEL_REGISTRY_SUBDIR
+
+
+def _registry_pattern(parquet_root: Path) -> str:
+    return str((_registry_dir(parquet_root) / "*.parquet").as_posix())
+
+
+def _registry_files(parquet_root: Path) -> list[Path]:
+    return sorted(_registry_dir(parquet_root).glob("*.parquet"))
 
 
 def _existing_parquet_patterns(parquet_root: Path) -> list[str]:
@@ -163,7 +184,11 @@ def _copy_relation_to_partitioned_shards(
 
     total_files = 0
     for model_version, vocabulary_partition, vocabulary_id, row_count in partitions:
-        partition_dir = parquet_root / f"model_version={model_version}" / f"vocabulary_id={vocabulary_partition}"
+        partition_dir = (
+            parquet_root
+            / f"model_version={model_version}"
+            / f"vocabulary_id={vocabulary_partition}"
+        )
         partition_dir.mkdir(parents=True, exist_ok=True)
         shard_count = ceil(int(row_count) / TARGET_ROWS_PER_SHARD)
 
@@ -294,7 +319,10 @@ def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set
     return ids
 
 
-def _append_rows_as_parquet_shards(conn: duckdb.DuckDBPyConnection, rows: list[EmbeddedRow]) -> None:
+def _append_rows_as_parquet_shards(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[EmbeddedRow],
+) -> None:
     if not rows:
         return
 
@@ -394,3 +422,172 @@ def count_rows(conn: duckdb.DuckDBPyConnection, model_version: str) -> int:
         [model_version],
     ).fetchone()
     return int(result[0]) if result else 0
+
+
+def upsert_model_registry(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    model_version: str,
+    model_id: str,
+    model_revision: str | None,
+) -> None:
+    """Upsert model provenance metadata alongside parquet embeddings.
+
+    Registry rows are stored in ``<parquet_root>/_meta/model_registry/*.parquet``
+    and deduplicated by ``model_version``.
+    """
+    ctx = _get_context(conn)
+    registry_dir = _registry_dir(ctx.parquet_root)
+    registry_dir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(tz=UTC)
+    conn.execute("DROP TABLE IF EXISTS temp_model_registry_new")
+    conn.execute(
+        """
+        CREATE TEMP TABLE temp_model_registry_new (
+            model_version VARCHAR,
+            model_id VARCHAR,
+            model_revision VARCHAR,
+            recorded_at TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO temp_model_registry_new (
+            model_version,
+            model_id,
+            model_revision,
+            recorded_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        [model_version, model_id, model_revision, now],
+    )
+
+    registry_files = _registry_files(ctx.parquet_root)
+    if registry_files:
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE temp_model_registry_existing AS
+            SELECT
+                model_version,
+                model_id,
+                model_revision,
+                CAST(recorded_at AS TIMESTAMP) AS recorded_at
+            FROM read_parquet(
+                '__REGISTRY_PATTERN__',
+                union_by_name=true
+            )
+            """.replace(
+                "__REGISTRY_PATTERN__",
+                _registry_pattern(ctx.parquet_root).replace("'", "''"),
+            )
+        )
+    else:
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE temp_model_registry_existing AS
+            SELECT
+                CAST(NULL AS VARCHAR) AS model_version,
+                CAST(NULL AS VARCHAR) AS model_id,
+                CAST(NULL AS VARCHAR) AS model_revision,
+                CAST(NULL AS TIMESTAMP) AS recorded_at
+            WHERE FALSE
+            """
+        )
+
+    conn.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE temp_model_registry_merged AS
+        SELECT
+            model_version,
+            model_id,
+            model_revision,
+            recorded_at
+        FROM (
+            SELECT
+                model_version,
+                model_id,
+                model_revision,
+                recorded_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY model_version
+                    ORDER BY recorded_at DESC
+                ) AS _rownum
+            FROM (
+                SELECT * FROM temp_model_registry_existing
+                UNION ALL
+                SELECT * FROM temp_model_registry_new
+            ) all_rows
+        ) ranked
+        WHERE _rownum = 1
+        """
+    )
+
+    for file_path in registry_files:
+        file_path.unlink()
+
+    registry_path = registry_dir / f"part-{uuid.uuid4().hex}.parquet"
+    conn.execute(
+        """
+        COPY (
+            SELECT
+                model_version,
+                model_id,
+                model_revision,
+                recorded_at
+            FROM temp_model_registry_merged
+            ORDER BY model_version
+        ) TO '__REGISTRY_PATH__'
+        (FORMAT PARQUET, COMPRESSION ZSTD)
+        """.replace("__REGISTRY_PATH__", registry_path.as_posix().replace("'", "''"))
+    )
+
+    conn.execute("DROP TABLE IF EXISTS temp_model_registry_existing")
+    conn.execute("DROP TABLE IF EXISTS temp_model_registry_new")
+    conn.execute("DROP TABLE IF EXISTS temp_model_registry_merged")
+
+
+def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEntry]:
+    """Return model registry entries stored alongside parquet shards."""
+    ctx = _get_context(conn)
+    if not _registry_files(ctx.parquet_root):
+        return []
+
+    rows = conn.execute(
+        """
+        SELECT
+            model_version,
+            model_id,
+            model_revision,
+            CAST(recorded_at AS TIMESTAMP) AS recorded_at
+        FROM (
+            SELECT
+                model_version,
+                model_id,
+                model_revision,
+                recorded_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY model_version
+                    ORDER BY CAST(recorded_at AS TIMESTAMP) DESC
+                ) AS _rownum
+            FROM read_parquet(
+                ?,
+                union_by_name=true
+            )
+        ) ranked
+        WHERE _rownum = 1
+        ORDER BY CAST(recorded_at AS TIMESTAMP) DESC, model_version
+        """,
+        [_registry_pattern(ctx.parquet_root)],
+    ).fetchall()
+
+    return [
+        ModelRegistryEntry(
+            model_version=str(row[0]),
+            model_id=str(row[1]),
+            model_revision=str(row[2]) if row[2] is not None else None,
+            recorded_at=row[3],
+        )
+        for row in rows
+    ]

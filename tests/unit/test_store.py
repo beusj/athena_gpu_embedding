@@ -7,14 +7,17 @@ from pathlib import Path
 
 import duckdb
 
-from gpu_embedder.models import ConceptRow, EmbeddedRow, SCHEMA_DDL
+from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow
 from gpu_embedder.store import (
     count_rows,
     ensure_schema,
     get_existing_ids,
+    list_model_registry,
     open_db,
+    upsert_model_registry,
     upsert_rows,
 )
+
 
 def _make_row(concept_id: int = 1, vocabulary_id: str = "SNOMED") -> EmbeddedRow:
     return EmbeddedRow(
@@ -173,7 +176,10 @@ class TestUpsertAndExistence:
         ensure_schema(conn)
         upsert_rows(conn, [])  # should be a no-op
 
-    def test_upsert_ndjson_preserves_numeric_like_concept_code_as_text(self, tmp_path: Path) -> None:
+    def test_upsert_ndjson_preserves_numeric_like_concept_code_as_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
         conn = open_db(tmp_path / "embeddings")
         ensure_schema(conn)
         row = _make_row(concept_id=42)
@@ -222,3 +228,87 @@ class TestCountRows:
         upsert_rows(conn, rows_v2)
         assert count_rows(conn, "v1") == 3
         assert count_rows(conn, "v2") == 2
+
+
+class TestModelRegistry:
+    def test_writes_registry_row_to_meta_parquet(self, tmp_path: Path) -> None:
+        store_root = tmp_path / "embeddings"
+        conn = open_db(store_root)
+        ensure_schema(conn)
+
+        upsert_model_registry(
+            conn,
+            model_version="abc123",
+            model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+            model_revision="090663c3",
+        )
+
+        rows = conn.execute(
+            """
+            SELECT model_version, model_id, model_revision
+            FROM read_parquet(?, union_by_name=true)
+            """,
+            [str((store_root / "_meta" / "model_registry" / "*.parquet").as_posix())],
+        ).fetchall()
+
+        assert rows == [
+            (
+                "abc123",
+                "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+                "090663c3",
+            )
+        ]
+
+    def test_upsert_replaces_existing_model_version_row(self, tmp_path: Path) -> None:
+        store_root = tmp_path / "embeddings"
+        conn = open_db(store_root)
+        ensure_schema(conn)
+
+        upsert_model_registry(
+            conn,
+            model_version="abc123",
+            model_id="model/one",
+            model_revision="rev1",
+        )
+        upsert_model_registry(
+            conn,
+            model_version="abc123",
+            model_id="model/two",
+            model_revision="rev2",
+        )
+
+        rows = conn.execute(
+            """
+            SELECT model_version, model_id, model_revision
+            FROM read_parquet(?, union_by_name=true)
+            """,
+            [str((store_root / "_meta" / "model_registry" / "*.parquet").as_posix())],
+        ).fetchall()
+
+        assert rows == [("abc123", "model/two", "rev2")]
+
+    def test_list_model_registry_returns_latest_rows(self, tmp_path: Path) -> None:
+        conn = open_db(tmp_path / "embeddings")
+        ensure_schema(conn)
+
+        upsert_model_registry(
+            conn,
+            model_version="v1",
+            model_id="model/one",
+            model_revision="rev1",
+        )
+        upsert_model_registry(
+            conn,
+            model_version="v2",
+            model_id="model/two",
+            model_revision=None,
+        )
+
+        rows = list_model_registry(conn)
+
+        assert len(rows) == 2
+        versions = {r.model_version for r in rows}
+        assert versions == {"v1", "v2"}
+        v2_row = next(r for r in rows if r.model_version == "v2")
+        assert v2_row.model_id == "model/two"
+        assert v2_row.model_revision is None
