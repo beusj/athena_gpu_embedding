@@ -239,7 +239,7 @@ The tool has eight subcommands:
 
 ```
 gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
-gpu-embed export    [OPTIONS] OUTPUT_DIR      — export DB rows to sharded parquet
+gpu-embed export    [OPTIONS] [OUTPUT_DIR]    — export DB rows to sharded parquet
 gpu-embed status    [OPTIONS]                — show what is stored in the DB
 gpu-embed model-registry [OPTIONS]           — show hash -> model/revision mappings
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
@@ -525,18 +525,24 @@ Shows mappings between `model_version` hashes and model metadata, including
 ### `export` — write Hive-partitioned parquet by model and vocabulary
 
 ```
-gpu-embed export [OPTIONS] OUTPUT_DIR
+gpu-embed export [OPTIONS] [OUTPUT_DIR]
 ```
 
 Exports rows from `concept_embeddings` into Hive-partitioned parquet files:
 
+`OUTPUT_DIR/<model>__rev-<short>__mv-<short>/model_version=<digest>/vocabulary_id=<value>/part-00000.parquet`
+
+When `OUTPUT_DIR` is omitted, the default is `exports/parquet`.
+
+Use `--legacy-layout` to opt into the old layout:
+
 `OUTPUT_DIR/model_version=<digest>/vocabulary_id=<value>/part-00000.parquet`
 
-This mirrors the parquet store / `migrate-store` layout, so a single uniform
-Hive-partitioned layout is used everywhere (S3, Snowflake external stages).
+The default metadata-prefixed layout aligns with `sync-s3` naming and keeps
+each model/revision handoff isolated under one directory. Inside that directory
+the inner Hive partition is unchanged (`model_version=.../vocabulary_id=...`).
 Because the path includes `model_version=<digest>`, exporting more than one
-model version into the same `OUTPUT_DIR` is safe — different versions land in
-separate partitions instead of colliding on `part-*.parquet` filenames.
+model version into the same base `OUTPUT_DIR` remains safe.
 
 Pooling is folded into `model_version` (see "Choosing an embedding model"), so a
 `cls` and a `mean` export of the same weights automatically land under distinct
@@ -549,7 +555,7 @@ Within each partition, sharding is controlled by `--shard-rows` (rows per file).
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `OUTPUT_DIR` | _(required)_ | Destination directory for parquet output |
+| `OUTPUT_DIR` | `exports/parquet` | Destination directory for parquet output |
 | `--db` | `embeddings.lance` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
 | `--pooling` | _(none)_ | Disambiguate by pooling (`cls` or `mean`); required when the selection matches both |
@@ -557,7 +563,40 @@ Within each partition, sharding is controlled by `--shard-rows` (rows per file).
 | `--namespace` | _(all)_ | Export only this identity namespace |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
 | `--compression` | `snappy` | Parquet codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `uncompressed` |
+| `--hash-length` | `8` | Short-hash length used in metadata-prefixed export directories (`6` to `8`) |
+| `--legacy-layout` | false | Opt into old layout rooted directly at `OUTPUT_DIR/model_version=...` |
 | `--overwrite` | false | Replace existing shard files if present |
+
+### `sync-s3` — AWS SSO login + model-aware S3 sync
+
+```
+gpu-embed sync-s3 [OPTIONS]
+```
+
+Runs a small handoff wrapper for a single model version:
+
+1. Optionally runs `aws sso login` (enabled by default)
+2. Resolves model metadata (`model_id`, `model_revision`) from the store
+3. Locates an existing local export under
+  `<export-root>/<model>__rev-<short-revision>__mv-<short-model-version>/`
+4. Syncs that directory to S3 under the same model/version-specific prefix
+
+This keeps each model/revision handoff isolated in S3 while preserving the
+standard inner Hive layout (`model_version=.../vocabulary_id=.../part-*.parquet`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--s3-root` | `s3://gpu-embedder-artifacts-chic/gpu-embed/dev/concept_embeddings/` | Base S3 prefix; command appends `<model>__rev-<hash>__mv-<hash>/` |
+| `--db` | `embeddings.lance` | Embedding store path to export from |
+| `--model-version` | _(most recent)_ | Model version prefix to sync |
+| `--pooling` | _(none)_ | Optional pooling disambiguation (`cls` or `mean`) |
+| `--export-root` | `exports/parquet` | Local root containing the existing export dir |
+| `--profile` | _(none)_ | Optional AWS profile for login/sync |
+| `--hash-length` | `8` | Short-hash length for path suffixes (`6` to `8`) |
+| `--sso-login` / `--no-sso-login` | `--sso-login` | Enable/disable `aws sso login` step |
+| `--backfill-from-logs` | false | Parse logs and upsert missing model hash mappings before resolving model info |
+| `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
+| `--dry-run` | false | Print the plan only; do not export or sync |
 
 ### `coverage` — identify unembedded concepts
 
@@ -679,10 +718,13 @@ gpu-embed embed /data/vocab/CONCEPT.csv \
 # Show what model versions are stored and concept counts by vocabulary/domain
 gpu-embed status
 
-# Export most recent model version into Hive-partitioned parquet
-# (model_version=<digest>/vocabulary_id=<value>/part-*.parquet)
+# Export most recent model version into metadata-prefixed parquet layout
+# (<model>__rev-<short>__mv-<short>/model_version=<digest>/vocabulary_id=<value>/part-*.parquet)
 # Errors and lists candidates if the selection matches both cls and mean.
 gpu-embed export exports/parquet --shard-rows 50000
+
+# Opt into legacy layout rooted directly at OUTPUT_DIR/model_version=...
+gpu-embed export exports/parquet --legacy-layout --shard-rows 50000
 
 # Export the mean-pooled BioLORD-2023 embeddings (disambiguate by pooling)
 gpu-embed export exports/parquet --pooling mean
@@ -692,6 +734,13 @@ gpu-embed export exports/parquet \
   --model-version abc12345 \
   --vocabulary-id SNOMED,LOINC \
   --shard-rows 50000
+
+# One-command AWS handoff for a single model version:
+# optional SSO login + export + sync to
+# s3://.../concept_embeddings/<model>__<revision>/
+gpu-embed sync-s3 \
+  --model-version abc12345 \
+  --profile your-aws-profile
 
 # Show only the breakdown for a specific model version (prefix match)
 gpu-embed status --model-version abc12345

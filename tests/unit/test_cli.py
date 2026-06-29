@@ -745,6 +745,12 @@ def test_export_writes_sharded_parquet_by_model_and_vocabulary(tmp_path: Path) -
     ]
 
     upsert_rows(conn, rows)
+    upsert_model_registry(
+        conn,
+        model_version="v1",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+    )
     conn.close()
 
     result = runner.invoke(
@@ -763,7 +769,10 @@ def test_export_writes_sharded_parquet_by_model_and_vocabulary(tmp_path: Path) -
 
     assert result.exit_code == 0
 
-    model_dir = out_dir / "model_version=v1"
+    model_dir = (
+        out_dir
+        / "cambridgeltl__SapBERT-from-PubMedBERT-fulltext__rev-090663c3__mv-v1"
+    )
     snomed_files = sorted((model_dir / "vocabulary_id=SNOMED").glob("*.parquet"))
     loinc_files = sorted((model_dir / "vocabulary_id=LOINC").glob("*.parquet"))
 
@@ -787,6 +796,105 @@ def test_export_writes_sharded_parquet_by_model_and_vocabulary(tmp_path: Path) -
     assert loinc_count is not None
     assert snomed_count[0] == 3
     assert loinc_count[0] == 1
+
+
+def test_export_legacy_layout_opt_in(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    out_dir = tmp_path / "parquet"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    upsert_rows(
+        conn,
+        [
+            EmbeddedRow(
+                concept=ConceptRow(
+                    concept_id=1,
+                    concept_name="SNOMED A",
+                    domain_id="Condition",
+                    vocabulary_id="SNOMED",
+                ),
+                embedding=[0.1] * 768,
+                embed_text="SNOMED A",
+                model_version="v1",
+                embedded_at=now,
+            )
+        ],
+    )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            str(out_dir),
+            "--db",
+            str(db_path),
+            "--model-version",
+            "v1",
+            "--legacy-layout",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "model_version=v1" / "vocabulary_id=SNOMED").is_dir()
+
+
+def test_export_defaults_output_dir_when_omitted(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    upsert_rows(
+        conn,
+        [
+            EmbeddedRow(
+                concept=ConceptRow(
+                    concept_id=1,
+                    concept_name="SNOMED A",
+                    domain_id="Condition",
+                    vocabulary_id="SNOMED",
+                ),
+                embedding=[0.1] * 768,
+                embed_text="SNOMED A",
+                model_version="v1",
+                embedded_at=now,
+            )
+        ],
+    )
+    upsert_model_registry(
+        conn,
+        model_version="v1",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+    )
+    conn.close()
+
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "v1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    expected_dir = (
+        tmp_path
+        / "exports"
+        / "parquet"
+        / "cambridgeltl__SapBERT-from-PubMedBERT-fulltext__rev-090663c3__mv-v1"
+        / "vocabulary_id=SNOMED"
+    )
+    assert expected_dir.is_dir()
 
 
 def _seed_pooled_version(
@@ -856,11 +964,374 @@ def test_export_pooling_selects_matching_version(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
     # Pooling is folded into model_version, so the mean run lands under its own
-    # model_version= partition; the cls version is not exported.
-    mean_dir = out_dir / "model_version=vmean"
-    cls_dir = out_dir / "model_version=vcls"
+    # metadata-prefixed export directory; the cls version is not exported.
+    mean_dir = out_dir / "FremyCompany__BioLORD-2023__rev-default__mv-vmean"
+    cls_dir = out_dir / "FremyCompany__BioLORD-2023__rev-default__mv-vcls"
     assert (mean_dir / "vocabulary_id=SNOMED").is_dir()
     assert not cls_dir.exists()
+
+
+def test_sync_s3_dry_run_plans_prefixed_destination(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        pooling="cls",
+    )
+    # Add revision metadata for prefix naming.
+    upsert_model_registry(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+        pooling="cls",
+    )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-s3",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "vcls",
+            "--s3-root",
+            "s3://gpu-embedder-artifacts-chic/gpu-embed/dev/concept_embeddings/",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Planned sync" in result.output
+    assert "model_version: vcls" in result.output
+    assert (
+        "cambridgeltl__SapBERT-from-PubMedBERT-fulltext__rev-090663c3__mv-vcls"
+        in result.output
+    )
+    assert "Dry run: no export or sync performed." in result.output
+
+
+def test_sync_s3_runs_sso_and_sync_commands(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        pooling="cls",
+    )
+    upsert_model_registry(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+        pooling="cls",
+    )
+    conn.close()
+
+    export_root = tmp_path / "exports"
+    model_dir = (
+        export_root
+        / "cambridgeltl__SapBERT-from-PubMedBERT-fulltext__rev-090663c3__mv-vcls"
+        / "model_version=vcls"
+        / "vocabulary_id=SNOMED"
+    )
+    model_dir.mkdir(parents=True)
+    (model_dir / "part-00000.parquet").write_bytes(b"parquet")
+
+    calls: list[list[str]] = []
+
+    def fake_which(cmd: str) -> str | None:
+        if cmd == "aws":
+            return "aws"
+        return None
+
+    def fake_run(cmd: list[str], check: bool, env: dict[str, str] | None = None) -> None:
+        assert check is True
+        assert env is not None
+        assert env.get("AWS_PAGER") == ""
+        calls.append(cmd)
+        return None
+
+    monkeypatch.setattr("gpu_embedder.cli.shutil.which", fake_which)
+    monkeypatch.setattr("gpu_embedder.cli.subprocess.run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-s3",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "vcls",
+            "--profile",
+            "dev-profile",
+            "--export-root",
+            str(export_root),
+            "--s3-root",
+            "s3://gpu-embedder-artifacts-chic/gpu-embed/dev/concept_embeddings/",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0] == ["aws", "--profile", "dev-profile", "sso", "login"]
+    assert calls[1][0:4] == ["aws", "--profile", "dev-profile", "s3"]
+    assert calls[1][4] == "sync"
+
+
+def test_sync_s3_uses_legacy_export_layout_when_present(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        pooling="cls",
+    )
+    upsert_model_registry(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+        pooling="cls",
+    )
+    conn.close()
+
+    export_root = tmp_path / "exports"
+    legacy_model_dir = export_root / "model_version=vcls" / "vocabulary_id=SNOMED"
+    legacy_model_dir.mkdir(parents=True)
+    (legacy_model_dir / "part-00000.parquet").write_bytes(b"parquet")
+
+    calls: list[list[str]] = []
+
+    def fake_which(cmd: str) -> str | None:
+        return "aws" if cmd == "aws" else None
+
+    def fake_run(cmd: list[str], check: bool, env: dict[str, str] | None = None) -> None:
+        assert check is True
+        calls.append(cmd)
+        return None
+
+    monkeypatch.setattr("gpu_embedder.cli.shutil.which", fake_which)
+    monkeypatch.setattr("gpu_embedder.cli.subprocess.run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-s3",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "vcls",
+            "--no-sso-login",
+            "--export-root",
+            str(export_root),
+            "--s3-root",
+            "s3://gpu-embedder-artifacts-chic/gpu-embed/dev/concept_embeddings/",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "using legacy export layout" in result.output
+    # Sync source should be the legacy partition dir, not export_root.
+    assert calls[0][0:3] == ["aws", "s3", "sync"]
+    assert calls[0][3].replace("\\", "/").endswith("/exports/model_version=vcls")
+
+
+def test_sync_s3_flat_layout_requires_opt_in(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        pooling="cls",
+    )
+    upsert_model_registry(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+        pooling="cls",
+    )
+    conn.close()
+
+    export_root = tmp_path / "exports"
+    flat_dir = export_root / "ABMS"
+    flat_dir.mkdir(parents=True)
+    (flat_dir / "part-00000.parquet").write_bytes(b"parquet")
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-s3",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "vcls",
+            "--export-root",
+            str(export_root),
+            "--no-sso-login",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "pass --allow-flat-layout" in result.output
+
+
+def test_sync_s3_flat_layout_with_opt_in(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        pooling="cls",
+    )
+    upsert_model_registry(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+        pooling="cls",
+    )
+    conn.close()
+
+    export_root = tmp_path / "exports"
+    flat_dir = export_root / "ABMS"
+    flat_dir.mkdir(parents=True)
+    (flat_dir / "part-00000.parquet").write_bytes(b"parquet")
+
+    calls: list[list[str]] = []
+
+    def fake_which(cmd: str) -> str | None:
+        return "aws" if cmd == "aws" else None
+
+    def fake_run(cmd: list[str], check: bool, env: dict[str, str] | None = None) -> None:
+        assert check is True
+        calls.append(cmd)
+        return None
+
+    monkeypatch.setattr("gpu_embedder.cli.shutil.which", fake_which)
+    monkeypatch.setattr("gpu_embedder.cli.subprocess.run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-s3",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "vcls",
+            "--export-root",
+            str(export_root),
+            "--allow-flat-layout",
+            "--no-sso-login",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][0:3] == ["aws", "s3", "sync"]
+    assert calls[0][3].replace("\\", "/").endswith("/exports")
+
+
+def test_sync_s3_can_infer_model_from_env(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(
+        conn,
+        model_version="vcls",
+        model_id="some/other-model",
+        pooling="cls",
+    )
+    upsert_model_registry(
+        conn,
+        model_version="vcls",
+        model_id="some/other-model",
+        model_revision="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        pooling="cls",
+    )
+    conn.close()
+
+    monkeypatch.setenv("GPU_EMBED_MODEL", "cambridgeltl/SapBERT-from-PubMedBERT-fulltext")
+    monkeypatch.setenv("GPU_EMBED_MODEL_REVISION", "090663c3ae57bf35ffe4d0d468a2a88d03051a4d")
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-s3",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "vcls",
+            "--infer-model-from-env",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "model_id:      cambridgeltl/SapBERT-from-PubMedBERT-fulltext" in result.output
+    assert "revision:      090663c3ae57bf35ffe4d0d468a2a88d03051a4d" in result.output
+
+
+def test_sync_s3_errors_when_local_export_missing(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        pooling="cls",
+    )
+    upsert_model_registry(
+        conn,
+        model_version="vcls",
+        model_id="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        model_revision="090663c3ae57bf35ffe4d0d468a2a88d03051a4d",
+        pooling="cls",
+    )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "sync-s3",
+            "--db",
+            str(db_path),
+            "--model-version",
+            "vcls",
+            "--export-root",
+            str(tmp_path / "exports"),
+            "--no-sso-login",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "no local export found for the selected model version" in result.output
 
 
 def test_export_rejects_invalid_pooling(tmp_path: Path) -> None:

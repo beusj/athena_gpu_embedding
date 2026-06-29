@@ -1157,9 +1157,9 @@ def compact_cmd(
 @app.command("export")
 def export_cmd(
     output_dir: Annotated[
-        Path,
+        Path | None,
         typer.Argument(help="Destination root directory for parquet export"),
-    ],
+    ] = None,
     db: Annotated[
         Path | None,
         typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path to export from"),
@@ -1220,12 +1220,32 @@ def export_cmd(
             help="Parquet compression codec (for example zstd or snappy)",
         ),
     ] = "snappy",
+    hash_length: Annotated[
+        int,
+        typer.Option(
+            "--hash-length",
+            min=6,
+            max=8,
+            help="Short-hash length used in the metadata-prefixed export directory",
+        ),
+    ] = 8,
+    legacy_layout: Annotated[
+        bool,
+        typer.Option(
+            "--legacy-layout",
+            help=(
+                "Use legacy layout under OUTPUT_DIR/model_version=<digest>/... "
+                "instead of metadata-prefixed directory"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Export embeddings to Hive-partitioned parquet by model_version and vocabulary."""
     from gpu_embedder import store as st
     from gpu_embedder.report import list_model_versions
 
     cfg = EmbedConfig(**cast(dict[str, Any], {"db": db} if db is not None else {}))
+    effective_output_dir = output_dir if output_dir is not None else Path("exports/parquet")
     allowed_compressions = {"zstd", "snappy", "gzip", "brotli", "lz4", "uncompressed"}
     normalized_compression = compression.lower()
     if normalized_compression not in allowed_compressions:
@@ -1336,17 +1356,30 @@ def export_cmd(
         typer.echo("No rows match the requested export filters.")
         raise typer.Exit(0)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # Hive-style partition root mirroring the parquet store / `migrate-store`
-    # layout (`model_version=<digest>/vocabulary_id=<value>/`). Keeping the two
-    # layouts identical means a single uniform stage layout in S3/Snowflake and
-    # lets exports of different model versions coexist under one OUTPUT_DIR
-    # without colliding on `part-*.parquet` filenames. Pooling is already folded
-    # into the digest, so cls and mean land under distinct model_version dirs.
-    model_dir = output_dir / f"model_version={selected_model_version}"
+    effective_output_dir.mkdir(parents=True, exist_ok=True)
+    selected_entry = registry.get(selected_model_version)
+    model_label = selected_entry.model_id if selected_entry is not None else "unknown-model"
+    revision_label = (
+        selected_entry.model_revision
+        if selected_entry is not None and selected_entry.model_revision is not None
+        else "default"
+    )
+    model_component = _safe_prefix_component(model_label, fallback="unknown-model")
+    revision_component = _safe_prefix_component(revision_label, fallback="default")
+    revision_short = _short_hash_component(revision_component, hash_length)
+    model_version_short = _short_hash_component(selected_model_version, hash_length)
+    prefix_dir = f"{model_component}__rev-{revision_short}__mv-{model_version_short}"
+
+    # Default layout (aligned with sync-s3):
+    #   OUTPUT_DIR/<model>__rev-<short>__mv-<short>/vocabulary_id=...
+    # Legacy opt-in layout:
+    #   OUTPUT_DIR/model_version=<digest>/vocabulary_id=...
+    base_dir = effective_output_dir if legacy_layout else (effective_output_dir / prefix_dir)
+    model_dir = (base_dir / f"model_version={selected_model_version}") if legacy_layout else base_dir
     model_dir.mkdir(parents=True, exist_ok=True)
     selected_pooling = _pooling_of(selected_model_version)
-    typer.echo(f"Export root: {output_dir}")
+    typer.echo(f"Export root: {effective_output_dir}")
+    typer.echo(f"Export base: {base_dir}")
     typer.echo(f"model_version={selected_model_version[:16]}…  pooling={selected_pooling}")
     typer.echo(
         f"Sharding by up to {shard_rows:,} row(s) per file with {normalized_compression} "
@@ -1466,6 +1499,324 @@ def export_cmd(
     )
     if total_files_skipped:
         typer.echo(f"Skipped {total_files_skipped} existing file(s) (use --overwrite to replace).")
+
+
+def _safe_prefix_component(value: str, fallback: str) -> str:
+    """Normalise a string for filesystem/S3 prefix components."""
+    candidate = value.strip().replace("/", "__").replace(" ", "_")
+    candidate = re.sub(r"[^A-Za-z0-9._-]", "_", candidate)
+    candidate = candidate.strip("._-")
+    return candidate or fallback
+
+
+def _short_hash_component(value: str, hash_length: int) -> str:
+    """Return a short hash-like prefix (or sanitised fallback for non-hash labels)."""
+    text = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{6,}", text):
+        return text[:hash_length].lower()
+    return _safe_prefix_component(text, fallback="default")
+
+
+@app.command("sync-s3")
+def sync_s3_cmd(
+    s3_root: Annotated[
+        str,
+        typer.Option(
+            "--s3-root",
+            help=(
+                "Base S3 prefix for uploads; a model+revision subdir is appended "
+                "automatically"
+            ),
+        ),
+    ] = "s3://gpu-embedder-artifacts-chic/gpu-embed/dev/concept_embeddings/",
+    db: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path to export from"),
+    ] = None,
+    model_version_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--model-version",
+            help=(
+                "Sync only this model version prefix (default: most recent model version)"
+            ),
+        ),
+    ] = None,
+    pooling: Annotated[
+        str | None,
+        typer.Option(
+            "--pooling",
+            help="Disambiguate by pooling strategy when needed: cls or mean",
+        ),
+    ] = None,
+    export_root: Annotated[
+        Path,
+        typer.Option(
+            "--export-root",
+            help="Local export root; command writes into <export-root>/<model>__<revision>",
+        ),
+    ] = Path("exports/parquet"),
+    profile: Annotated[
+        str | None,
+        typer.Option("--profile", help="Optional AWS profile for sso login and sync"),
+    ] = None,
+    hash_length: Annotated[
+        int,
+        typer.Option(
+            "--hash-length",
+            min=6,
+            max=8,
+            help="Short hash length used in the model+revision S3/local prefix",
+        ),
+    ] = 8,
+    sso_login: Annotated[
+        bool,
+        typer.Option("--sso-login/--no-sso-login", help="Run `aws sso login` before syncing"),
+    ] = True,
+    infer_model_from_env: Annotated[
+        bool,
+        typer.Option(
+            "--infer-model-from-env",
+            help="Use GPU_EMBED_MODEL / GPU_EMBED_MODEL_REVISION for path naming",
+        ),
+    ] = False,
+    allow_flat_layout: Annotated[
+        bool,
+        typer.Option(
+            "--allow-flat-layout",
+            help=(
+                "Allow legacy flat exports under <export-root>/<vocabulary>/part-*.parquet "
+                "(no model_version partition)"
+            ),
+        ),
+    ] = False,
+    backfill_from_logs: Annotated[
+        bool,
+        typer.Option(
+            "--backfill-from-logs",
+            help="Parse logs and upsert missing model hash mappings before resolving model info",
+        ),
+    ] = False,
+    log_dir: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_LOG_DIR", help="Directory containing gpu-embed logs"),
+    ] = None,
+    vocabulary_id: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--vocabulary-id",
+            help="Limit export/sync to these vocabulary IDs (repeatable or comma-delimited)",
+        ),
+    ] = None,
+    namespace: Annotated[
+        str | None,
+        typer.Option("--namespace", help="Limit export/sync to this identity namespace"),
+    ] = None,
+    shard_rows: Annotated[
+        int,
+        typer.Option("--shard-rows", min=1, help="Maximum rows per parquet shard file"),
+    ] = 50_000,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite existing local parquet shard files"),
+    ] = False,
+    compression: Annotated[
+        str,
+        typer.Option("--compression", help="Parquet compression codec"),
+    ] = "snappy",
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print planned actions without exporting or syncing"),
+    ] = False,
+) -> None:
+    """Authenticate (optional) and sync an existing model-version parquet export to S3."""
+    from gpu_embedder import store as st
+    from gpu_embedder.report import list_model_versions
+
+    cfg_overrides: dict[str, Any] = {}
+    if db is not None:
+        cfg_overrides["db"] = db
+    if log_dir is not None:
+        cfg_overrides["log_dir"] = log_dir
+    cfg = EmbedConfig(**cfg_overrides)
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    if backfill_from_logs:
+        result = _backfill_model_registry_from_logs(conn, log_dir=cfg.log_dir)
+        if result is not None:
+            added, failed = result
+            typer.echo(f"Backfill complete from logs: {added} mapping(s) upserted, {failed} failed.")
+
+    versions = list_model_versions(conn)
+    if not versions:
+        typer.echo("No embeddings found in the database.")
+        raise typer.Exit(0)
+
+    allowed_poolings = {"cls", "mean"}
+    requested_pooling = pooling.lower() if pooling is not None else None
+    if requested_pooling is not None and requested_pooling not in allowed_poolings:
+        typer.echo(
+            "ERROR: unsupported pooling. "
+            f"Choose one of: {', '.join(sorted(allowed_poolings))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    registry = {row.model_version: row for row in st.list_model_registry(conn)}
+
+    def _pooling_of(model_version: str) -> str:
+        entry = registry.get(model_version)
+        return entry.pooling if entry is not None else "cls"
+
+    candidates = list(versions)
+    if model_version_prefix:
+        candidates = [v for v in candidates if v.model_version.startswith(model_version_prefix)]
+        if not candidates:
+            typer.echo(
+                f"No model version starting with '{model_version_prefix}' found.",
+                err=True,
+            )
+            raise typer.Exit(1)
+    if requested_pooling is not None:
+        candidates = [v for v in candidates if _pooling_of(v.model_version) == requested_pooling]
+        if not candidates:
+            typer.echo(
+                f"No model version with pooling='{requested_pooling}' matches the "
+                "given filters.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+    if len(candidates) > 1:
+        typer.echo(
+            "Selection matches multiple model versions. Re-run with a longer "
+            "--model-version prefix (and optionally --pooling).",
+            err=True,
+        )
+        for candidate in candidates[:10]:
+            typer.echo(
+                f"  {candidate.short_hash}…  pooling={_pooling_of(candidate.model_version)} "
+                f"rows={candidate.count:,}",
+                err=True,
+            )
+        raise typer.Exit(1)
+
+    selected_model_version = candidates[0].model_version
+    selected_entry = registry.get(selected_model_version)
+    if infer_model_from_env:
+        model_id = cfg.model
+        revision_label = cfg.model_revision or "default"
+    else:
+        model_id = selected_entry.model_id if selected_entry is not None else "unknown-model"
+        revision_label = (
+            selected_entry.model_revision
+            if selected_entry is not None and selected_entry.model_revision is not None
+            else "default"
+        )
+    model_component = _safe_prefix_component(model_id, fallback="unknown-model")
+    revision_component = _safe_prefix_component(revision_label, fallback="default")
+    revision_short = _short_hash_component(revision_component, hash_length)
+    model_version_short = _short_hash_component(selected_model_version, hash_length)
+    prefix_dir = f"{model_component}__rev-{revision_short}__mv-{model_version_short}"
+
+    output_dir = export_root / prefix_dir
+    s3_base = s3_root.rstrip("/") + "/"
+    s3_prefix_root = s3_base + prefix_dir + "/"
+
+    # Preferred (new) layout:
+    #   <export-root>/<model>__rev-<hash>__mv-<hash>/vocabulary_id=.../part-*.parquet
+    preferred_flat_dir = output_dir
+    # Transitional layout (older prefixed layout with inner model_version dir):
+    #   <export-root>/<model>__rev-<hash>__mv-<hash>/model_version=<full-hash>/...
+    preferred_partition_dir = output_dir / f"model_version={selected_model_version}"
+    # Legacy layout (existing exports before sync-s3 path-prefixing):
+    #   <export-root>/model_version=<full-hash>/...
+    legacy_partition_dir = export_root / f"model_version={selected_model_version}"
+
+    flat_layout_glob = export_root.glob("*/*.parquet")
+    has_flat_layout = any(True for _ in flat_layout_glob)
+
+    if preferred_flat_dir.exists() and preferred_flat_dir.is_dir() and any(preferred_flat_dir.glob("vocabulary_id=*")):
+        local_sync_dir = preferred_flat_dir
+        layout_mode = "preferred-flat"
+    elif preferred_partition_dir.exists() and preferred_partition_dir.is_dir():
+        local_sync_dir = preferred_partition_dir
+        layout_mode = "preferred-model-version"
+    elif legacy_partition_dir.exists() and legacy_partition_dir.is_dir():
+        local_sync_dir = legacy_partition_dir
+        layout_mode = "legacy-model-version"
+        typer.echo(
+            "Note: using legacy export layout under --export-root "
+            f"({legacy_partition_dir})."
+        )
+    elif allow_flat_layout and has_flat_layout:
+        local_sync_dir = export_root
+        layout_mode = "legacy-flat"
+        typer.echo(
+            "Note: using flat legacy export layout under --export-root "
+            f"({export_root})."
+        )
+    else:
+        local_sync_dir = preferred_partition_dir
+        layout_mode = "missing"
+
+    if layout_mode in {"preferred-flat", "legacy-flat"}:
+        s3_dest = s3_prefix_root
+    else:
+        s3_dest = s3_prefix_root + f"model_version={selected_model_version}/"
+
+    typer.echo("Planned sync")
+    typer.echo(f"  Store:         {cfg.db}")
+    typer.echo(f"  model_id:      {model_id}")
+    typer.echo(f"  revision:      {revision_label}")
+    typer.echo(f"  model_version: {selected_model_version}")
+    typer.echo(f"  local export:  {output_dir}")
+    typer.echo(f"  preferred flat:{preferred_flat_dir}")
+    typer.echo(f"  preferred part:{preferred_partition_dir}")
+    typer.echo(f"  legacy part:   {legacy_partition_dir}")
+    typer.echo(f"  flat layout:   {export_root}")
+    typer.echo(f"  sync source:   {local_sync_dir}")
+    typer.echo(f"  s3 destination:{s3_dest}")
+
+    if dry_run:
+        typer.echo("Dry run: no export or sync performed.")
+        raise typer.Exit(0)
+
+    if not local_sync_dir.exists() or not local_sync_dir.is_dir():
+        typer.echo(
+            "ERROR: no local export found for the selected model version in either "
+            "preferred or legacy layout. Run `gpu-embed export` first (or re-run "
+            "with --dry-run to inspect paths). If your export root is flat by "
+            "vocabulary, pass --allow-flat-layout.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if shutil.which("aws") is None:
+        typer.echo("ERROR: aws CLI executable was not found on PATH.", err=True)
+        raise typer.Exit(1)
+
+    env = os.environ.copy()
+    env["AWS_PAGER"] = ""
+
+    if sso_login:
+        sso_cmd = ["aws"]
+        if profile:
+            sso_cmd.extend(["--profile", profile])
+        sso_cmd.extend(["sso", "login"])
+        typer.echo("Running AWS SSO login …")
+        subprocess.run(sso_cmd, check=True, env=env)
+
+    sync_cmd = ["aws"]
+    if profile:
+        sync_cmd.extend(["--profile", profile])
+    sync_cmd.extend(["s3", "sync", local_sync_dir.as_posix(), s3_dest])
+
+    typer.echo("Syncing existing parquet export to S3 …")
+    subprocess.run(sync_cmd, check=True, env=env)
+    typer.echo("S3 sync complete.")
 
 
 # ---------------------------------------------------------------------------
