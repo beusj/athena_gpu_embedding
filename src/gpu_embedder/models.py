@@ -166,15 +166,18 @@ CREATE TABLE IF NOT EXISTS csv_fingerprints (
 );
 """
 
-# Caches the SHA-256 digest of HuggingFace model weights keyed by
-# (model_id, revision) so compute_model_version does not re-hash the
-# ~440 MB weights file on every run.  Invalidated automatically when
-# the user changes --model or --model-revision.
+# Caches the model_version digest keyed by (model_id, revision, pooling) so
+# compute_model_version does not re-hash the ~440 MB weights file on every run.
+# Invalidated automatically when the user changes --model, --model-revision, or
+# --pooling.  pooling is part of the key because it is folded into the digest:
+# without it a mean run would get a stale cls cache hit and silently reuse the
+# cls model_version (the exact collision the fold prevents).
 MODEL_VERSION_CACHE_DDL = """
 CREATE TABLE IF NOT EXISTS model_version_cache (
     model_id  TEXT NOT NULL,
     revision  TEXT NOT NULL,
+    pooling   TEXT NOT NULL DEFAULT 'cls',
     sha256    TEXT NOT NULL,
-    PRIMARY KEY (model_id, revision)
+    PRIMARY KEY (model_id, revision, pooling)
 );
 """

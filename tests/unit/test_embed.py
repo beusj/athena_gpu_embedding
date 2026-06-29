@@ -70,6 +70,31 @@ def _fake_tokenizer(batch_size: int | None = None) -> MagicMock:
     return tok
 
 
+def _fixed_tokenizer(input_ids: list[Any], attention_mask: list[Any]) -> MagicMock:
+    """Tokenizer returning explicit input_ids + attention_mask (for mean pooling)."""
+    import torch
+
+    tok = MagicMock()
+    def _call(texts: list[str], **kwargs: Any) -> dict[str, Any]:
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
+    tok.side_effect = _call
+    return tok
+
+
+def _fixed_model(hidden_states: list[Any]) -> MagicMock:
+    """Model returning a fixed last_hidden_state of shape (N, L, H)."""
+    import torch
+
+    out = MagicMock()
+    out.last_hidden_state = torch.tensor(hidden_states, dtype=torch.float)
+    model = MagicMock()
+    model.return_value = out
+    return model
+
+
 # ---------------------------------------------------------------------------
 # compute_model_version
 # ---------------------------------------------------------------------------
@@ -131,6 +156,25 @@ class TestComputeModelVersion:
         fp16 = compute_model_version(tmp_path, precision="fp16")
         assert len({bare, int8, fp16}) == 3
         assert all(len(v) == 64 for v in (int8, fp16))
+
+    def test_cls_pooling_keeps_bare_weights_digest(self, tmp_path: Path) -> None:
+        # Regression guard: pooling="cls" must not change the digest, so existing
+        # CLS stores (SapBERT, BioLORD-CLS) keep their model_version — no re-embed.
+        weights = tmp_path / "model.safetensors"
+        weights.write_bytes(b"weights")
+        bare = hashlib.sha256(b"weights").hexdigest()
+        assert compute_model_version(tmp_path) == bare
+        assert compute_model_version(tmp_path, pooling="cls") == bare
+
+    def test_mean_pooling_yields_distinct_version(self, tmp_path: Path) -> None:
+        weights = tmp_path / "model.safetensors"
+        weights.write_bytes(b"weights")
+        cls = compute_model_version(tmp_path, pooling="cls")
+        mean = compute_model_version(tmp_path, pooling="mean")
+        assert cls != mean
+        assert len(mean) == 64
+        # Stable across calls for the same weights + pooling.
+        assert compute_model_version(tmp_path, pooling="mean") == mean
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +246,48 @@ class TestEmbedBatch:
     def test_returns_numpy_not_tensor(self) -> None:
         result = embed_batch(["x"], _fake_model(), _fake_tokenizer(), "cpu")
         assert isinstance(result, np.ndarray)
+
+
+class TestMeanPooling:
+    def test_mean_is_mask_weighted_average(self) -> None:
+        # One sequence, 3 tokens, hidden dim 2. The third token is padding.
+        # Mean over real tokens = ([1,0] + [3,4]) / 2 = [2, 2] → L2-normalised.
+        hidden = [[[1.0, 0.0], [3.0, 4.0], [100.0, 100.0]]]
+        mask = [[1, 1, 0]]
+        result = embed_batch(
+            ["seq"], _fixed_model(hidden), _fixed_tokenizer([[0, 0, 0]], mask), "cpu",
+            pooling="mean",
+        )
+        expected = np.array([[2.0, 2.0]]) / np.linalg.norm([2.0, 2.0])
+        np.testing.assert_allclose(result, expected, atol=1e-6)
+
+    def test_mean_differs_from_cls(self) -> None:
+        hidden = [[[1.0, 0.0], [3.0, 4.0], [100.0, 100.0]]]
+        mask = [[1, 1, 0]]
+        tok = _fixed_tokenizer([[0, 0, 0]], mask)
+        mean_res = embed_batch(["seq"], _fixed_model(hidden), tok, "cpu", pooling="mean")
+        cls_res = embed_batch(["seq"], _fixed_model(hidden), tok, "cpu", pooling="cls")
+        # CLS takes token 0 ([1,0] → [1,0]); mean is [2,2] normalised — distinct.
+        assert not np.allclose(mean_res, cls_res)
+        np.testing.assert_allclose(cls_res, np.array([[1.0, 0.0]]), atol=1e-6)
+
+    def test_mean_is_padding_invariant(self) -> None:
+        # Same two real tokens, different right-padding length → same mean vector.
+        short = embed_batch(
+            ["seq"],
+            _fixed_model([[[1.0, 0.0], [3.0, 4.0]]]),
+            _fixed_tokenizer([[0, 0]], [[1, 1]]),
+            "cpu",
+            pooling="mean",
+        )
+        padded = embed_batch(
+            ["seq"],
+            _fixed_model([[[1.0, 0.0], [3.0, 4.0], [99.0, 99.0], [99.0, 99.0]]]),
+            _fixed_tokenizer([[0, 0, 0, 0]], [[1, 1, 0, 0]]),
+            "cpu",
+            pooling="mean",
+        )
+        np.testing.assert_allclose(short, padded, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

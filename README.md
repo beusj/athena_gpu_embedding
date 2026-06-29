@@ -72,12 +72,18 @@ gpu_embedding/
 cp .env.example .env
 # edit .env — set GPU_EMBED_VOCAB_DIR, GPU_EMBED_DEVICE, etc.
 
-# 2. Install project + dev deps (requires uv ≥ 0.4)
-uv sync --group dev
+# 2. Install project + dev deps (requires uv ≥ 0.4). Pick a torch backend:
+uv sync --group dev --extra gpu   # CUDA 13.0 (Linux/Windows); CPU/MPS on macOS
+#   or, for a GPU-free environment (CI, laptops, running the tests):
+uv sync --group dev --extra cpu   # CPU-only torch wheels — small and fast
 
 # 3. Place Athena vocabulary files in athena_vocab/
 #    (or set GPU_EMBED_VOCAB_DIR in .env to your download location)
 ```
+
+`cpu` and `gpu` are mutually exclusive extras (enforced by `[tool.uv].conflicts`);
+choose exactly one. The `cpu` extra is the right choice for running the test
+suite, which mocks the model and never needs CUDA.
 
 The embedding model is downloaded from Hugging Face on first run and cached
 locally via the normal `~/.cache/huggingface` path.
@@ -96,12 +102,13 @@ use `--ingest-engine python` to switch the ingest path.
 > recreate it:
 > ```bash
 > uv venv --python 3.13
-> uv sync --group dev
+> uv sync --group dev --extra gpu
 > ```
 
-`pyproject.toml` includes a `[tool.uv.sources]` entry that routes `torch` to
-the CUDA 13.0 index on Linux and Windows, so a plain `uv sync` automatically
-installs the CUDA build — no extra step needed after the initial sync.
+`pyproject.toml` routes `torch` to a backend-specific index via the `gpu` / `cpu`
+extras (see `[tool.uv.sources]`): `uv sync --extra gpu` installs the CUDA 13.0
+build on Linux/Windows (CPU/MPS on macOS), while `uv sync --extra cpu` installs
+small CPU-only wheels — ideal for CI and for running the test suite without a GPU.
 
 To install or upgrade torch independently (e.g. into a fresh venv or when
 testing a different backend), use uv's built-in `--torch-backend` flag:
@@ -129,6 +136,40 @@ If `cuda.is_available()` is still `False` after syncing:
 - `--torch-backend=auto` resolves the right backend for your installed driver
   automatically; use it to sanity-check what uv would pick.
 
+### Testing without a GPU (CI, sandboxes, Claude Code on the web)
+
+**The unit tests never need a GPU or CUDA** — they mock the model, so there is no
+real forward pass. The `cpu` extra exists specifically for these GPU-free
+environments. This is the recommended setup for running the suite.
+
+**Open-network CI or a local machine** — use the `cpu` extra, which pulls small
+CPU-only wheels from the PyTorch index:
+
+```bash
+uv sync --group dev --extra cpu
+uv run pytest
+```
+
+**Network-restricted sandboxes** (e.g. Claude Code on the web, some CI runners)
+often allow `pypi.org` but **block `download.pytorch.org`**. There the `cpu`
+extra can't fetch its wheels, so install a CPU-capable torch straight from PyPI
+instead (larger, bundles CUDA libs, but runs fine on CPU):
+
+```bash
+uv venv
+uv pip install "torch>=2.3"          # CPU-capable build from PyPI
+uv pip install --no-deps -e .        # project without re-resolving the torch index
+uv pip install duckdb typer pydantic pydantic-settings python-dotenv \
+  transformers tqdm numpy pyarrow pytest pytest-cov pytest-asyncio ruff mypy
+uv run pytest
+```
+
+For **Claude Code on the web**, this is automated: `.claude/hooks/session-start.sh`
+runs the PyPI-based setup above on session start so `uv run pytest` works
+out of the box (see `.claude/settings.json`). The hook only runs in the remote
+environment (`CLAUDE_CODE_REMOTE=true`); local development uses the `uv sync`
+commands above.
+
 ---
 
 ## Choosing an embedding model
@@ -143,17 +184,18 @@ Two strong choices for OMOP/Athena concept text:
 | **BioLORD-2023** (`FremyCompany/BioLORD-2023`) | [model card](https://huggingface.co/FremyCompany/BioLORD-2023) | [BioLORD-2023: Semantic Textual Representations Fusing LLM and Clinical Knowledge Graph Insights — arXiv:2311.16075](https://arxiv.org/abs/2311.16075) |
 
 - **SapBERT** is tuned for biomedical *entity* representations (synonym/alias
-  matching) and is the default. It works directly with this tool's CLS-token
-  pooling.
+  matching) and is the default. It works directly with this tool's default
+  CLS-token pooling (`--pooling cls`).
 - **BioLORD-2023** targets clinical *sentence* similarity and often performs
   better on longer, descriptive concept names. It is a `sentence-transformers`
-  model trained with **mean** pooling, whereas this pipeline currently pools the
-  CLS token — so treat it as a candidate to evaluate (and adjust pooling to
-  reproduce its published behaviour) rather than a zero-change swap.
+  model trained with **mean** pooling, so run it with `--pooling mean` to
+  reproduce its published behaviour:
+  `gpu-embed embed --model FremyCompany/BioLORD-2023 --pooling mean`.
 
 Whichever model you choose, the `model_version` digest (a SHA-256 of the
-weights) keeps each model's embeddings from being silently mixed with another's
-in the same store. Pin `--model-revision` for reproducible downloads.
+weights, with non-default pooling folded in) keeps each model's embeddings from
+being silently mixed with another's — or with a different pooling of the same
+weights — in the same store. Pin `--model-revision` for reproducible downloads.
 
 ---
 
@@ -287,6 +329,7 @@ That path uses a source adapter rather than the Athena `CONCEPT.csv` ingest.
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
 | `--max-length` | `128` | Tokenizer max sequence length |
+| `--pooling` | `cls` | Token pooling: `cls` (SapBERT default) or `mean` (e.g. BioLORD-2023). Non-default pooling is folded into `model_version` |
 | `--upsert-every-batches` | `250` | Checkpoint writes every N embedding batches |
 | `--ingest-engine` | `duckdb` | CSV ingest engine: `duckdb` (default) or `python` fallback |
 | `--device` | auto | `cuda`, `cpu`, or `mps` |
@@ -405,23 +448,37 @@ Shows mappings between `model_version` hashes and model metadata, including
 | `--backfill-from-logs` | false | Parse `GPU_EMBED_LOG_DIR` logs for model/revision lines and upsert derived hash mappings |
 | `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
 
-### `export` — write sharded parquet by vocabulary directory
+### `export` — write Hive-partitioned parquet by model and vocabulary
 
 ```
 gpu-embed export [OPTIONS] OUTPUT_DIR
 ```
 
-Exports rows from `concept_embeddings` into parquet files under:
+Exports rows from `concept_embeddings` into Hive-partitioned parquet files:
 
-`OUTPUT_DIR/<vocabulary_id>/part-00000.parquet`
+`OUTPUT_DIR/model_version=<digest>/vocabulary_id=<value>/part-00000.parquet`
 
-Sharding is controlled by `--shard-rows` (rows per file).
+This mirrors the parquet store / `migrate-store` layout, so a single uniform
+Hive-partitioned layout is used everywhere (S3, Snowflake external stages).
+Because the path includes `model_version=<digest>`, exporting more than one
+model version into the same `OUTPUT_DIR` is safe — different versions land in
+separate partitions instead of colliding on `part-*.parquet` filenames.
+
+Pooling is folded into `model_version` (see "Choosing an embedding model"), so a
+`cls` and a `mean` export of the same weights automatically land under distinct
+`model_version=` partitions. When a `--model-version` prefix (or the default
+"most recent") matches **both** poolings, the selection is ambiguous: the command
+lists the candidates and exits, asking you to add `--pooling {cls,mean}`. Use
+`gpu-embed model-registry` to see which versions are `cls` vs `mean` first.
+
+Within each partition, sharding is controlled by `--shard-rows` (rows per file).
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `OUTPUT_DIR` | _(required)_ | Destination directory for parquet output |
 | `--db` | `embeddings.duckdb` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
+| `--pooling` | _(none)_ | Disambiguate by pooling (`cls` or `mean`); required when the selection matches both |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
 | `--namespace` | _(all)_ | Export only this identity namespace |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
@@ -548,8 +605,13 @@ gpu-embed embed /data/vocab/CONCEPT.csv \
 # Show what model versions are stored and concept counts by vocabulary/domain
 gpu-embed status
 
-# Export most recent model version into sharded parquet by vocabulary directory
+# Export most recent model version into Hive-partitioned parquet
+# (model_version=<digest>/vocabulary_id=<value>/part-*.parquet)
+# Errors and lists candidates if the selection matches both cls and mean.
 gpu-embed export exports/parquet --shard-rows 50000
+
+# Export the mean-pooled BioLORD-2023 embeddings (disambiguate by pooling)
+gpu-embed export exports/parquet --pooling mean
 
 # Export only SNOMED and LOINC for a specific model version prefix
 gpu-embed export exports/parquet \
