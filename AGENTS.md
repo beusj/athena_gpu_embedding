@@ -142,6 +142,16 @@ from `cli.py`.
 - `compute_model_version()` must hash the actual weights on disk (not the model
   name string) — use SHA-256 over the `pytorch_model.bin` or `model.safetensors`
   file. This should be stable across runs for the same checkpoint.
+- **Quantization belongs in the `model_version`, not a per-row column.** Runtime
+  quantization changes the embeddings but not the weights file, so it must be
+  folded into the digest or fp32 and quantized variants collide on the primary
+  key. `compute_model_version(..., precision=, quantization_scheme=)` does this
+  *only when non-default* (`fp32`/`none` returns the bare weights hash, so
+  existing stores are unaffected). When you add a real quantized path, thread
+  the same precision/quantization into `compute_model_version`,
+  `upsert_model_registry`, **and** the `model_version_cache` key
+  (`get_cached_model_version`), and keep `model_registry` as the human-readable
+  provenance. Today the project is FP32-only, so callers pass the defaults.
 
 ### DuckDB
 

@@ -111,6 +111,27 @@ class TestComputeModelVersion:
         expected = hashlib.sha256(b"pytorch weights").hexdigest()
         assert version == expected
 
+    def test_fp32_none_keeps_bare_weights_digest(self, tmp_path: Path) -> None:
+        weights = tmp_path / "model.safetensors"
+        weights.write_bytes(b"weights")
+        bare = hashlib.sha256(b"weights").hexdigest()
+        # Default and explicit fp32/none must equal the unsuffixed weights hash
+        # so existing stores keep their model_version after this change.
+        assert compute_model_version(tmp_path) == bare
+        assert (
+            compute_model_version(tmp_path, precision="fp32", quantization_scheme="none")
+            == bare
+        )
+
+    def test_quantization_yields_distinct_version(self, tmp_path: Path) -> None:
+        weights = tmp_path / "model.safetensors"
+        weights.write_bytes(b"weights")
+        bare = compute_model_version(tmp_path)
+        int8 = compute_model_version(tmp_path, quantization_scheme="int8")
+        fp16 = compute_model_version(tmp_path, precision="fp16")
+        assert len({bare, int8, fp16}) == 3
+        assert all(len(v) == 64 for v in (int8, fp16))
+
 
 # ---------------------------------------------------------------------------
 # embed_batch

@@ -77,12 +77,39 @@ class Embedder(Protocol):
 # Model version
 # ---------------------------------------------------------------------------
 
-def compute_model_version(model_id_or_path: str | Path, revision: str | None = None) -> str:
-    """Return a SHA-256 hex digest of the model weights file.
+def _apply_precision_quant(
+    weights_digest: str, precision: str, quantization_scheme: str
+) -> str:
+    """Fold non-default precision/quantization into the model_version digest.
 
-    Tries model.safetensors first, then pytorch_model.bin.  If neither is
-    found at a local path, falls back to hashing the model ID string (used in
-    tests with non-existent paths).
+    ``fp32`` + ``none`` returns the bare weights digest unchanged, so stores
+    hashed before this existed keep their ``model_version`` (no mass re-embed).
+    Any other precision/quantization yields a distinct digest, so a quantized
+    run gets a separate ``(namespace, concept_id, model_version)`` identity
+    instead of colliding with — and overwriting — the fp32 embeddings of the
+    same weights. Provenance stays human-readable in ``model_registry``.
+    """
+    if precision == "fp32" and quantization_scheme == "none":
+        return weights_digest
+    suffix = f"|precision={precision}|quantization={quantization_scheme}"
+    return hashlib.sha256((weights_digest + suffix).encode()).hexdigest()
+
+
+def compute_model_version(
+    model_id_or_path: str | Path,
+    revision: str | None = None,
+    *,
+    precision: str = "fp32",
+    quantization_scheme: str = "none",
+) -> str:
+    """Return the model_version digest for a checkpoint.
+
+    Base digest is the SHA-256 of the model weights file (model.safetensors,
+    then pytorch_model.bin; falls back to hashing the model ID string when no
+    weights file is found, as in tests with non-existent paths). When
+    *precision*/*quantization_scheme* are non-default they are folded into the
+    digest so quantized variants of the same weights get distinct versions; the
+    default fp32/none returns the bare weights digest (stable across upgrades).
     """
     base = Path(model_id_or_path)
     if base.is_dir():
@@ -116,6 +143,7 @@ def compute_model_version(model_id_or_path: str | Path, revision: str | None = N
                 logger.debug("Could not resolve HF cache path for %s", model_id_or_path)
                 candidates = []
 
+    weights_digest: str | None = None
     for candidate in candidates:
         if candidate.exists():
             logger.info("Hashing weights file: %s", candidate)
@@ -123,13 +151,17 @@ def compute_model_version(model_id_or_path: str | Path, revision: str | None = N
             with candidate.open("rb") as fh:
                 for chunk in iter(lambda: fh.read(1 << 20), b""):
                     h.update(chunk)
-            return h.hexdigest()
+            weights_digest = h.hexdigest()
+            break
 
-    # Fallback: hash the model ID string (deterministic for the same string)
-    logger.warning(
-        "No weights file found for %s; using hash of model ID string", model_id_or_path
-    )
-    return hashlib.sha256(str(model_id_or_path).encode()).hexdigest()
+    if weights_digest is None:
+        # Fallback: hash the model ID string (deterministic for the same string)
+        logger.warning(
+            "No weights file found for %s; using hash of model ID string", model_id_or_path
+        )
+        weights_digest = hashlib.sha256(str(model_id_or_path).encode()).hexdigest()
+
+    return _apply_precision_quant(weights_digest, precision, quantization_scheme)
 
 
 # ---------------------------------------------------------------------------
