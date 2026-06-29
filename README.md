@@ -191,7 +191,7 @@ The `cpt4` subcommand will:
 
 ## CLI usage
 
-The tool has seven subcommands:
+The tool has eight subcommands:
 
 ```
 gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
@@ -199,6 +199,7 @@ gpu-embed export    [OPTIONS] OUTPUT_DIR      — export DB rows to sharded parq
 gpu-embed status    [OPTIONS]                — show what is stored in the DB
 gpu-embed model-registry [OPTIONS]           — show hash -> model/revision mappings
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
+gpu-embed cleanup   [OPTIONS]                — delete embeddings for a model/vocabularies
 gpu-embed migrate-store [OPTIONS]            — materialize/initialize the parquet store
 gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 ```
@@ -431,6 +432,52 @@ When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
 | `--model-version` | _(most recent)_ | Limit comparison to the version starting with this prefix |
 | `--show-complete` / `--gaps-only` | `show-complete` | Include or hide fully-embedded groups |
 | `--csv`, `-o` | _(none)_ | Write the aggregated coverage report to a CSV file |
+
+### `cleanup` — delete embeddings for a model / vocabularies
+
+```
+gpu-embed cleanup [OPTIONS]
+```
+
+Permanently deletes stored embeddings for **one model version**, restricted to
+either **all** of its vocabularies or a chosen subset. It is cautious by design:
+
+- It previews exactly what will be removed (model, vocabularies, and the count)
+  before touching anything.
+- It requires confirmation. Deleting a *subset* of vocabularies asks a `y/N`
+  question; deleting an *entire* model version requires retyping the model
+  version's 16-character hash prefix.
+- `--dry-run` shows the plan and stops without deleting.
+- `--yes` / `-y` skips the prompt for scripted use.
+
+Run it with no options for a guided flow: it lists stored model versions (with
+their `model_id`, e.g. `FremyCompany/BioLORD-2023`), then lists that model's
+vocabularies with counts so you can pick numbers or choose `A` for all.
+
+After a delete it also invalidates the affected `csv_fingerprints` so a later
+`embed` run re-reads the source CSVs (the fingerprints otherwise claim the file
+was fully ingested). When a model version is left with zero embeddings, its
+`model_registry` and weight-hash cache entries are removed too.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db` | `embeddings.duckdb` | Embedding store path to clean up |
+| `--model-version` | _(interactive)_ | Model version hash prefix to delete (must match exactly one) |
+| `--vocabulary-id` | _(interactive)_ | Vocabulary IDs to delete (repeatable or comma-delimited) |
+| `--all-vocabularies` | `false` | Delete every vocabulary for the model version |
+| `--dry-run` | `false` | Show what would be deleted, then stop |
+| `--yes`, `-y` | `false` | Skip the confirmation prompt |
+
+```bash
+# Guided, fully interactive: choose model, then vocabularies
+gpu-embed cleanup
+
+# Delete just the BioLORD SNOMED + LOINC embeddings, no prompt
+gpu-embed cleanup --model-version 3f2a9c --vocabulary-id SNOMED,LOINC --yes
+
+# Preview removing an entire model version without deleting
+gpu-embed cleanup --model-version 3f2a9c --all-vocabularies --dry-run
+```
 
 ### Examples
 
