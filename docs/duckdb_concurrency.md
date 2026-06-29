@@ -82,3 +82,32 @@ For **live** reads mid-run → Option 1 (in-process, cursor-per-thread). Option 
 tens-of-GB copy cost makes it unsuitable for anything more than infrequent
 snapshots — do not reach for it as the default just because it is the least
 code.
+
+---
+
+## Benchmark (2026-06): does a file-based backend make concurrency cheap?
+
+The cross-process lock above is a property of the **DuckDB-table** backend
+only. The file-based backends (Options 3 above) sidestep it — many reader
+processes can scan the files while embed writes — so the concurrency question
+is entangled with the storage-backend question. A storage-only benchmark
+(2M rows = 2 model_versions × 1M, then a 200k re-embed) was run to see whether a
+file backend is viable now that the write path is append-only and Arrow-native.
+Full numbers and caveats live in `adr_parquet_store_rejected.md` (2026-06
+addendum); the concurrency-relevant takeaways:
+
+- The current **parquet** backend already gives lock-free multi-reader access
+  and flat append writes (~6.9s/100k at 2M, no growth), but reads carry a
+  dedup-view cost (~710ms full COUNT) and accumulate duplicates with **no
+  compaction**.
+- **delta-rs** (Delta Lake without Spark/JVM) gives the same lock-free
+  multi-reader concurrency *plus* an ACID transaction log (readers see only
+  committed snapshots), true MERGE upserts with zero duplicates, partition-
+  pruned reads, and cheap OPTIMIZE compaction — at the fastest writes measured
+  (~1.2s/100k). It is the one option that resolves both the concurrency goal of
+  this doc and the read-side weakness of the current parquet path.
+
+So if cross-process embed-vs-export/status concurrency is a hard requirement,
+moving to a file/lakehouse backend (delta-rs preferred) is a cleaner answer than
+the in-process or snapshot workarounds above — at the cost of a backend change.
+Spark is **not** required for this and is rejected (the data fits one node).
