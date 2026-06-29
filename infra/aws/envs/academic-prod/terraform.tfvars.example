@@ -1,0 +1,27 @@
+aws_region                     = "us-east-1"
+environment                    = "academic-prod"
+s3_bucket_name                 = "replace-with-academic-prod-bucket"
+manage_storage_resources       = true
+precreated_bucket_name         = null
+precreated_bucket_arn          = null
+precreated_prefix_scope        = null
+s3_prefix_root                 = "gpu-embed"
+kms_key_arn                    = null
+batch_instance_families        = ["g5", "g6e"]
+batch_spot_enabled             = true
+batch_on_demand_base_capacity  = 1
+batch_vcpus                    = 4
+batch_memory                   = 32768
+batch_ecr_image_uri            = "<account_id>.dkr.ecr.us-east-1.amazonaws.com/gpu-embedder:latest"
+batch_subnet_ids               = ["subnet-xxxxx", "subnet-yyyyy"]
+batch_vpc_id                   = "vpc-xxxxxxxxxxxxxxxxx"
+use_precreated_iam_roles       = false
+precreated_batch_job_role_arn  = null
+precreated_batch_task_execution_role_arn = null
+precreated_batch_service_role_arn = null
+precreated_batch_instance_profile_arn = null
+precreated_batch_spot_fleet_role_arn = null
+
+tags = {
+  Owner = "replace-with-team"
+}

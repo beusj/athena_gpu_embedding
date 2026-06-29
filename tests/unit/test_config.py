@@ -11,13 +11,20 @@ class TestEmbedConfigDefaults:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.vocab_dir == Path("athena_vocab")
         assert cfg.db == Path("embeddings.duckdb")
+        assert cfg.log_dir == Path("logs")
+        assert cfg.log_max_bytes == 2 * 1024 * 1024
+        assert cfg.log_max_files == 5
         assert cfg.model == "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
         assert cfg.model_revision is None
         assert cfg.batch_size == 256
         assert cfg.max_length == 128
+        assert cfg.upsert_every_batches == 250
+        assert cfg.ingest_engine == "duckdb"
+        assert cfg.write_mode == "ndjson"
         assert cfg.text_fields == ["concept_name"]
         assert cfg.separator == " "
         assert cfg.force is False
@@ -27,6 +34,7 @@ class TestEmbedConfigDefaults:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.device in ("cuda", "mps", "cpu")
 
@@ -35,6 +43,7 @@ class TestEmbedConfigDefaults:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(device="cpu", _env_file=None)  # type: ignore[call-arg]
         assert cfg.device == "cpu"
 
@@ -45,6 +54,7 @@ class TestEmbedConfigTextFields:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(text_fields=["concept_code", "concept_name"], _env_file=None)  # type: ignore[call-arg]
         assert cfg.text_fields == ["concept_code", "concept_name"]
 
@@ -53,6 +63,7 @@ class TestEmbedConfigTextFields:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(text_fields="concept_code,concept_name", _env_file=None)  # type: ignore[call-arg]
         assert cfg.text_fields == ["concept_code", "concept_name"]
 
@@ -61,6 +72,7 @@ class TestEmbedConfigTextFields:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(text_fields=" concept_code , concept_name ", _env_file=None)  # type: ignore[call-arg]
         assert cfg.text_fields == ["concept_code", "concept_name"]
 
@@ -71,6 +83,7 @@ class TestEmbedConfigRevision:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.model_revision is None
 
@@ -79,5 +92,33 @@ class TestEmbedConfigRevision:
 
         monkeypatch.delenv("GPU_EMBED_MODEL_REVISION", raising=False)
         monkeypatch.delenv("GPU_EMBED_TEXT_FIELDS", raising=False)
+        monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(model_revision="abc123def456", _env_file=None)  # type: ignore[call-arg]
         assert cfg.model_revision == "abc123def456"
+
+
+class TestEmbedConfigWriteMode:
+    def test_write_mode_env_override(self, monkeypatch) -> None:
+        from gpu_embedder.config import EmbedConfig
+
+        monkeypatch.setenv("GPU_EMBED_WRITE_MODE", "direct")
+        cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.write_mode == "direct"
+
+
+class TestEmbedConfigCheckpointing:
+    def test_upsert_every_batches_env_override(self, monkeypatch) -> None:
+        from gpu_embedder.config import EmbedConfig
+
+        monkeypatch.setenv("GPU_EMBED_UPSERT_EVERY_BATCHES", "7")
+        cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
+        assert cfg.upsert_every_batches == 7
+
+    def test_upsert_every_batches_must_be_positive(self, monkeypatch) -> None:
+        import pytest
+
+        from gpu_embedder.config import EmbedConfig
+
+        monkeypatch.setenv("GPU_EMBED_UPSERT_EVERY_BATCHES", "0")
+        with pytest.raises(ValueError, match="must be greater than 0"):
+            EmbedConfig(_env_file=None)  # type: ignore[call-arg]

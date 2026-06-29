@@ -27,6 +27,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_cached_snapshot(model_id: str, revision: str | None) -> Path | None:
+    """Return a local Hugging Face snapshot if one is already cached."""
+    import huggingface_hub  # type: ignore[import-untyped]
+
+    try:
+        snapshot = huggingface_hub.snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_files_only=True,
+        )
+    except Exception:
+        return None
+    return Path(snapshot)
+
+
+def _resolve_model_source(model_id: str, revision: str | None) -> tuple[Path | str, bool]:
+    """Resolve a model path from cache first, then fall back to Hub download."""
+    local_path = Path(model_id)
+    if local_path.exists():
+        return local_path, True
+
+    cached = _resolve_cached_snapshot(model_id, revision)
+    if cached is not None:
+        return cached, True
+
+    return model_id, False
+
+
 # ---------------------------------------------------------------------------
 # Protocol for unit-test injection
 # ---------------------------------------------------------------------------
@@ -49,14 +77,40 @@ class Embedder(Protocol):
 # Model version
 # ---------------------------------------------------------------------------
 
-def compute_model_version(model_id_or_path: str | Path) -> str:
-    """Return a SHA-256 hex digest of the model weights file.
+def _apply_precision_quant(
+    weights_digest: str, precision: str, quantization_scheme: str
+) -> str:
+    """Fold non-default precision/quantization into the model_version digest.
 
-    Tries model.safetensors first, then pytorch_model.bin.  If neither is
-    found at a local path, falls back to hashing the model ID string (used in
-    tests with non-existent paths).
+    ``fp32`` + ``none`` returns the bare weights digest unchanged, so stores
+    hashed before this existed keep their ``model_version`` (no mass re-embed).
+    Any other precision/quantization yields a distinct digest, so a quantized
+    run gets a separate ``(namespace, concept_id, model_version)`` identity
+    instead of colliding with — and overwriting — the fp32 embeddings of the
+    same weights. Provenance stays human-readable in ``model_registry``.
     """
-    candidates: list[Path] = []
+    if precision == "fp32" and quantization_scheme == "none":
+        return weights_digest
+    suffix = f"|precision={precision}|quantization={quantization_scheme}"
+    return hashlib.sha256((weights_digest + suffix).encode()).hexdigest()
+
+
+def compute_model_version(
+    model_id_or_path: str | Path,
+    revision: str | None = None,
+    *,
+    precision: str = "fp32",
+    quantization_scheme: str = "none",
+) -> str:
+    """Return the model_version digest for a checkpoint.
+
+    Base digest is the SHA-256 of the model weights file (model.safetensors,
+    then pytorch_model.bin; falls back to hashing the model ID string when no
+    weights file is found, as in tests with non-existent paths). When
+    *precision*/*quantization_scheme* are non-default they are folded into the
+    digest so quantized variants of the same weights get distinct versions; the
+    default fp32/none returns the bare weights digest (stable across upgrades).
+    """
     base = Path(model_id_or_path)
     if base.is_dir():
         candidates = [
@@ -64,23 +118,32 @@ def compute_model_version(model_id_or_path: str | Path) -> str:
             base / "pytorch_model.bin",
         ]
     else:
-        # Try HuggingFace cache layout
-        import huggingface_hub  # type: ignore[import-untyped]
-
-        try:
-            cache_dir = Path(
-                huggingface_hub.snapshot_download(
-                    str(model_id_or_path),
-                    local_files_only=True,
-                )
-            )
+        cached = _resolve_cached_snapshot(str(model_id_or_path), revision)
+        if cached is not None:
             candidates = [
-                cache_dir / "model.safetensors",
-                cache_dir / "pytorch_model.bin",
+                cached / "model.safetensors",
+                cached / "pytorch_model.bin",
             ]
-        except Exception:
-            logger.debug("Could not resolve HF cache path for %s", model_id_or_path)
+        else:
+            try:
+                import huggingface_hub  # type: ignore[import-untyped]
 
+                cache_dir = Path(
+                    huggingface_hub.snapshot_download(
+                        repo_id=str(model_id_or_path),
+                        revision=revision,
+                        local_files_only=False,
+                    )
+                )
+                candidates = [
+                    cache_dir / "model.safetensors",
+                    cache_dir / "pytorch_model.bin",
+                ]
+            except Exception:
+                logger.debug("Could not resolve HF cache path for %s", model_id_or_path)
+                candidates = []
+
+    weights_digest: str | None = None
     for candidate in candidates:
         if candidate.exists():
             logger.info("Hashing weights file: %s", candidate)
@@ -88,13 +151,17 @@ def compute_model_version(model_id_or_path: str | Path) -> str:
             with candidate.open("rb") as fh:
                 for chunk in iter(lambda: fh.read(1 << 20), b""):
                     h.update(chunk)
-            return h.hexdigest()
+            weights_digest = h.hexdigest()
+            break
 
-    # Fallback: hash the model ID string (deterministic for the same string)
-    logger.warning(
-        "No weights file found for %s; using hash of model ID string", model_id_or_path
-    )
-    return hashlib.sha256(str(model_id_or_path).encode()).hexdigest()
+    if weights_digest is None:
+        # Fallback: hash the model ID string (deterministic for the same string)
+        logger.warning(
+            "No weights file found for %s; using hash of model ID string", model_id_or_path
+        )
+        weights_digest = hashlib.sha256(str(model_id_or_path).encode()).hexdigest()
+
+    return _apply_precision_quant(weights_digest, precision, quantization_scheme)
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +184,30 @@ def load_model(
     from transformers import AutoModel, AutoTokenizer  # type: ignore[import-untyped]
 
     rev_label = revision or "default"
-    logger.info("Loading tokenizer from %s (revision=%s)", model_id, rev_label)
-    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    source, cached = _resolve_model_source(model_id, revision)
+    source_label = str(source)
+    cache_state = "cached" if cached else "download"
 
     logger.info(
-        "Loading model from %s → device=%s (FP32, revision=%s)", model_id, device, rev_label
+        "Loading tokenizer from %s (revision=%s, source=%s)",
+        model_id,
+        rev_label,
+        cache_state,
     )
-    model = AutoModel.from_pretrained(model_id, revision=revision)
+    tokenizer = AutoTokenizer.from_pretrained(
+        source,
+        revision=revision,
+        local_files_only=cached,
+    )
+
+    logger.info(
+        "Loading model from %s → device=%s (FP32, revision=%s, source=%s)",
+        model_id,
+        device,
+        rev_label,
+        source_label,
+    )
+    model = AutoModel.from_pretrained(source, revision=revision, local_files_only=cached)
     model = model.float()  # enforce FP32 — never call .half()
     model = model.to(device)
     model = model.eval()
@@ -192,19 +276,51 @@ def embed_all(
     text_fields: list[str],
     separator: str,
     model_version: str,
+    *,
+    precomputed_texts: dict[int, str] | None = None,
 ) -> list[EmbeddedRow]:
     """Embed all rows in batches, returning EmbeddedRow objects.
 
     Progress is shown via tqdm.  On any exception within a batch the error is
     logged and re-raised — no partial writes.
+
+    *precomputed_texts* maps ``concept_id`` → embed text; when supplied the
+    caller has already built the text (e.g. for change detection) and we reuse
+    it instead of recomputing ``build_embed_text`` per row.
     """
+    total_batches = max((len(rows) + batch_size - 1) // batch_size, 1)
+    logger.info(
+        "Embedding %d rows in %d batches of up to %d on %s",
+        len(rows),
+        total_batches,
+        batch_size,
+        device,
+    )
+
     result: list[EmbeddedRow] = []
     now = datetime.now(tz=UTC)
 
-    for start in tqdm(range(0, len(rows), batch_size), desc="Embedding", unit="batch"):
+    progress = tqdm(
+        range(0, len(rows), batch_size),
+        desc=f"Embedding ({device})",
+        unit="batch",
+        total=total_batches,
+        leave=True,
+    )
+    for batch_index, start in enumerate(progress, start=1):
         batch = rows[start : start + batch_size]
-        texts = [build_embed_text(r, text_fields, separator) for r in batch]
+        if precomputed_texts is not None:
+            texts = [precomputed_texts[r.concept_id] for r in batch]
+        else:
+            texts = [build_embed_text(r, text_fields, separator) for r in batch]
         try:
+            logger.info(
+                "Embedding batch %d/%d (%d rows)",
+                batch_index,
+                total_batches,
+                len(batch),
+            )
+            progress.set_postfix(rows=f"{start + 1}-{start + len(batch)}")
             vecs: np.ndarray = embed_batch(texts, model, tokenizer, device, max_length)
         except Exception:
             logger.error(

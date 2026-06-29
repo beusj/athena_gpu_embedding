@@ -1,10 +1,12 @@
 {
 	"folders": [
 		{
-			"path": "../../llm_concept_mapping"
+			"name": "gpu_embedding",
+			"path": "."
 		},
 		{
-			"path": "."
+			"name": "llm_concept_mapping",
+			"path": "../../llm_concept_mapping"
 		}
 	],
 	"settings": {
