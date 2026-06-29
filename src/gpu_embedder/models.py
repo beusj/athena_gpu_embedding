@@ -89,6 +89,7 @@ DEFAULT_VOCABULARY_IDS: tuple[str, ...] = (
     "Ethnicity",         # demographics
     "ABMS",              # provider board certifications / specialties
     "NUCC",              # provider taxonomy / specialties
+    "Medicare Specialty",  # CMS provider/supplier specialty codes
 )
 
 # Reserved sentinel value for `--vocabulary-id` that disables the highest-yield

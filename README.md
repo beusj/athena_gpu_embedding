@@ -308,7 +308,7 @@ vocabularies:
 | Drugs | `RxNorm`, `RxNorm Extension`, `NDC` |
 | Labs / measurements | `LOINC` |
 | Demographics | `Race`, `Ethnicity` |
-| Providers | `ABMS`, `NUCC` |
+| Providers | `ABMS`, `NUCC`, `Medicare Specialty` |
 
 To override:
 
