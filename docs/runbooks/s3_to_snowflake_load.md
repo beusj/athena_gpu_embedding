@@ -13,7 +13,7 @@ copying to S3, and loading into Snowflake.
 
 ## Prerequisites
 
-- Embeddings store available (default local source: `embeddings.duckdb`)
+- Embeddings store available (default local source: `embeddings.lance`)
 - AWS CLI installed and configured (default profile or named profile)
 - S3 bucket + path chosen for parquet dataset
 - Snowflake `STORAGE INTEGRATION` with read access to the bucket path
@@ -23,7 +23,7 @@ copying to S3, and loading into Snowflake.
 Use `export` as the standard handoff path from the local store:
 
 ```bash
-uv run gpu-embed export exports/parquet --db embeddings.duckdb
+uv run gpu-embed export exports/parquet --db embeddings.lance
 ```
 
 Export output is written as Hive-partitioned parquet:
@@ -37,7 +37,7 @@ vocabulary/namespace); `migrate-store` mirrors the **full** store (every model
 version and all rows) for platform portability:
 
 ```bash
-uv run gpu-embed migrate-store --db embeddings.duckdb
+uv run gpu-embed migrate-store --db embeddings.lance
 ```
 
 which creates the same partition layout under `embeddings/`:
@@ -124,7 +124,7 @@ vocabulary subsets, or custom shard sizing):
 
 ```bash
 uv run gpu-embed export exports/parquet \
-  --db embeddings.duckdb \
+  --db embeddings.lance \
   --model-version <model_version_prefix> \
   --vocabulary-id SNOMED,LOINC \
   --shard-rows 50000

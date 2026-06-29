@@ -235,7 +235,7 @@ The `cpt4` subcommand will:
 
 ## CLI usage
 
-The tool has eight subcommands:
+The tool has ten subcommands:
 
 ```
 gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
@@ -721,7 +721,7 @@ and idempotent `MERGE` are documented in:
 Quick start:
 
 ```bash
-uv run gpu-embed export exports/parquet --db embeddings.duckdb --shard-rows 50000
+uv run gpu-embed export exports/parquet --db embeddings.lance --shard-rows 50000
 AWS_PAGER="" aws s3 sync exports/parquet s3://<your-bucket>/concept_embeddings/
 # Optional named profile: add --profile <aws-profile> or set AWS_PROFILE
 ```
