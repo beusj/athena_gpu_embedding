@@ -489,6 +489,7 @@ Canonical digest input (pinned attributes, sorted JSON):
 - revision
 - backend
 - quantization
+- pooling
 - dimension
 - normalize
 

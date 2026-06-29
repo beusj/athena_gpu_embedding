@@ -643,7 +643,7 @@ class TestDeleteModelMetadata:
             model_id="FremyCompany/BioLORD-2023",
             model_revision=None,
         )
-        upsert_model_version_cache(conn, "FremyCompany/BioLORD-2023", None, "mvA")
+        upsert_model_version_cache(conn, "FremyCompany/BioLORD-2023", None, "cls", "mvA")
 
         delete_model_metadata(conn, "mvA")
 

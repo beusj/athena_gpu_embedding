@@ -234,6 +234,14 @@ def embed_cmd(
         int | None,
         typer.Option(envvar="GPU_EMBED_MAX_LENGTH", help="Tokenizer max sequence length"),
     ] = None,
+    pooling: Annotated[
+        str | None,
+        typer.Option(
+            "--pooling",
+            envvar="GPU_EMBED_POOLING",
+            help="Token pooling: cls (SapBERT default) or mean (e.g. BioLORD-2023)",
+        ),
+    ] = None,
     upsert_every_batches: Annotated[
         int | None,
         typer.Option(
@@ -346,6 +354,8 @@ def embed_cmd(
         cfg_overrides["batch_size"] = batch_size
     if max_length is not None:
         cfg_overrides["max_length"] = max_length
+    if pooling is not None:
+        cfg_overrides["pooling"] = pooling
     if upsert_every_batches is not None:
         cfg_overrides["upsert_every_batches"] = upsert_every_batches
     if ingest_engine is not None:
@@ -476,7 +486,7 @@ def embed_cmd(
     from gpu_embedder.embed import build_embed_text, compute_model_version, embed_all, load_model
 
     _cached_mv = None if cfg.force else st.get_cached_model_version(
-        conn, cfg.model, cfg.model_revision
+        conn, cfg.model, cfg.model_revision, cfg.pooling
     )
     if _cached_mv is not None:
         model_version = _cached_mv
@@ -484,10 +494,14 @@ def embed_cmd(
     else:
         typer.echo(
             f"Hashing model weights for {cfg.model} "
-            f"(revision={cfg.model_revision or 'default'}) …"
+            f"(revision={cfg.model_revision or 'default'}, pooling={cfg.pooling}) …"
         )
-        model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
-        st.upsert_model_version_cache(conn, cfg.model, cfg.model_revision, model_version)
+        model_version = compute_model_version(
+            cfg.model, revision=cfg.model_revision, pooling=cfg.pooling
+        )
+        st.upsert_model_version_cache(
+            conn, cfg.model, cfg.model_revision, cfg.pooling, model_version
+        )
     if source_mode:
         hash_extra = {
             "input_kind": "source_parquet",
@@ -699,6 +713,7 @@ def embed_cmd(
         model_revision=cfg.model_revision,
         precision="fp32",
         quantization_scheme="none",
+        pooling=cfg.pooling,
     )
 
     # Texts to feed the tokenizer, keyed by concept_id; reused for change
@@ -776,6 +791,7 @@ def embed_cmd(
             cfg.text_fields,
             cfg.separator,
             model_version,
+            pooling=cfg.pooling,
             precomputed_texts=texts_for_embed,
         )
         total_embed_seconds += time.perf_counter() - embed_started
@@ -968,6 +984,16 @@ def export_cmd(
             ),
         ),
     ] = None,
+    pooling: Annotated[
+        str | None,
+        typer.Option(
+            "--pooling",
+            help=(
+                "Disambiguate by pooling strategy: cls or mean. Required when the "
+                "selection matches both a cls and a mean version of the same weights"
+            ),
+        ),
+    ] = None,
     vocabulary_id: Annotated[
         list[str] | None,
         typer.Option(
@@ -1020,6 +1046,16 @@ def export_cmd(
         )
         raise typer.Exit(1)
 
+    allowed_poolings = {"cls", "mean"}
+    requested_pooling = pooling.lower() if pooling is not None else None
+    if requested_pooling is not None and requested_pooling not in allowed_poolings:
+        typer.echo(
+            "ERROR: unsupported pooling. "
+            f"Choose one of: {', '.join(sorted(allowed_poolings))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     conn = st.open_db(cfg.db)
     st.ensure_schema(conn)
 
@@ -1028,18 +1064,55 @@ def export_cmd(
         typer.echo("No embeddings found in the database.")
         raise typer.Exit(0)
 
-    selected_model_version: str
+    # Map each stored model_version to its pooling + model_id via the registry.
+    # Versions absent from the registry (legacy stores) are treated as cls, matching
+    # the registry's COALESCE(pooling, 'cls') default.
+    registry = {e.model_version: e for e in st.list_model_registry(conn)}
+
+    def _pooling_of(model_version: str) -> str:
+        entry = registry.get(model_version)
+        return entry.pooling if entry is not None else "cls"
+
+    # Candidate versions, most-recent-first, narrowed by --model-version and --pooling.
+    candidates = list(versions)
     if model_version_prefix:
-        matched = [v for v in versions if v.model_version.startswith(model_version_prefix)]
-        if not matched:
+        candidates = [
+            v for v in candidates if v.model_version.startswith(model_version_prefix)
+        ]
+        if not candidates:
             typer.echo(
                 f"No model version starting with '{model_version_prefix}' found.",
                 err=True,
             )
             raise typer.Exit(1)
-        selected_model_version = matched[0].model_version
-    else:
-        selected_model_version = versions[0].model_version
+    if requested_pooling is not None:
+        candidates = [v for v in candidates if _pooling_of(v.model_version) == requested_pooling]
+        if not candidates:
+            typer.echo(
+                f"No model version with pooling='{requested_pooling}' matches the "
+                "given filters.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+    distinct_poolings = {_pooling_of(v.model_version) for v in candidates}
+    if requested_pooling is None and len(distinct_poolings) > 1:
+        typer.echo(
+            "ERROR: selection is ambiguous across pooling strategies. Re-run with "
+            "--pooling {cls|mean}. Candidates:",
+            err=True,
+        )
+        for v in candidates:
+            entry = registry.get(v.model_version)
+            model_id_label = entry.model_id if entry is not None else "(unregistered)"
+            typer.echo(
+                f"  {v.short_hash}…  pooling={_pooling_of(v.model_version):4}  "
+                f"{v.count:,} row(s)  {model_id_label}",
+                err=True,
+            )
+        raise typer.Exit(1)
+
+    selected_model_version = candidates[0].model_version
 
     normalized_vocabulary_ids = _split_multi_values(vocabulary_id)
 
@@ -1078,11 +1151,13 @@ def export_cmd(
     # layout (`model_version=<digest>/vocabulary_id=<value>/`). Keeping the two
     # layouts identical means a single uniform stage layout in S3/Snowflake and
     # lets exports of different model versions coexist under one OUTPUT_DIR
-    # without colliding on `part-*.parquet` filenames.
+    # without colliding on `part-*.parquet` filenames. Pooling is already folded
+    # into the digest, so cls and mean land under distinct model_version dirs.
     model_dir = output_dir / f"model_version={selected_model_version}"
     model_dir.mkdir(parents=True, exist_ok=True)
+    selected_pooling = _pooling_of(selected_model_version)
     typer.echo(f"Export root: {output_dir}")
-    typer.echo(f"model_version={selected_model_version[:16]}…")
+    typer.echo(f"model_version={selected_model_version[:16]}…  pooling={selected_pooling}")
     typer.echo(
         f"Sharding by up to {shard_rows:,} row(s) per file with {normalized_compression} "
         "compression."
@@ -1349,9 +1424,10 @@ def model_registry_cmd(
     typer.echo(f"Registry source: {cfg.db}/_meta/model_registry")
     typer.echo()
     typer.echo(
-        f"{'MODEL VERSION':18}  {'RECORDED AT':20}  {'REVISION':12}  {'PRECISION':9}  {'QUANT':9}  MODEL ID"
+        f"{'MODEL VERSION':18}  {'RECORDED AT':20}  {'REVISION':12}  "
+        f"{'PRECISION':9}  {'QUANT':9}  {'POOLING':7}  MODEL ID"
     )
-    typer.echo("-" * 132)
+    typer.echo("-" * 140)
     for row in rows:
         revision_label = row.model_revision or "default"
         typer.echo(
@@ -1360,6 +1436,7 @@ def model_registry_cmd(
             f"{revision_label[:12]:12}  "
             f"{row.precision[:9]:9}  "
             f"{row.quantization_scheme[:9]:9}  "
+            f"{row.pooling[:7]:7}  "
             f"{row.model_id}"
         )
     typer.echo()

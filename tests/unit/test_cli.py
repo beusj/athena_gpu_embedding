@@ -221,7 +221,9 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     def fake_load_model(model_id: str, device: str, revision: str | None = None):
         return object(), object()
 
-    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+    def fake_compute_model_version(
+        model_id: str, revision: str | None = None, *, pooling: str = "cls"
+    ) -> str:
         return "test-model-version"
 
     def fake_embed_all(
@@ -235,6 +237,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
         separator,
         model_version,
         *,
+        pooling: str = "cls",
         precomputed_texts=None,
     ):
         return [
@@ -270,6 +273,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
         model_revision: str | None,
         precision: str = "fp32",
         quantization_scheme: str = "none",
+        pooling: str = "cls",
     ) -> None:
         return None
 
@@ -304,10 +308,10 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     ) -> None:
         return None
 
-    def fake_get_cached_model_version(conn, model_id: str, revision) -> None:  # type: ignore[no-untyped-def]
+    def fake_get_cached_model_version(conn, model_id: str, revision, pooling: str = "cls") -> None:  # type: ignore[no-untyped-def]
         return None  # always miss — compute_model_version (also mocked) is called
 
-    def fake_upsert_model_version_cache(conn, model_id: str, revision, sha256: str) -> None:  # type: ignore[no-untyped-def]
+    def fake_upsert_model_version_cache(conn, model_id: str, revision, pooling: str, sha256: str) -> None:  # type: ignore[no-untyped-def]
         return None
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
@@ -378,7 +382,9 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     def fake_load_model(model_id: str, device: str, revision: str | None = None):
         return object(), object()
 
-    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+    def fake_compute_model_version(
+        model_id: str, revision: str | None = None, *, pooling: str = "cls"
+    ) -> str:
         return "test-model-version"
 
     def fake_open_db(path: Path):
@@ -405,7 +411,7 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     def fake_upsert_csv_fingerprint(conn, *, csv_path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
         recorded_fingerprints.append(csv_path)
 
-    def fake_get_cached_model_version(conn, model_id: str, revision):  # type: ignore[no-untyped-def]
+    def fake_get_cached_model_version(conn, model_id: str, revision, pooling: str = "cls"):  # type: ignore[no-untyped-def]
         return "test-model-version"
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
@@ -450,7 +456,7 @@ def test_embed_accepts_comma_delimited_vocabulary_id(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
     monkeypatch.setattr(
         "gpu_embedder.store.get_cached_model_version",
-        lambda conn, model_id, revision: "test-model-version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
     )
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
@@ -484,7 +490,7 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
     monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
     monkeypatch.setattr(
         "gpu_embedder.store.get_cached_model_version",
-        lambda conn, model_id, revision: "test-model-version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
     )
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
@@ -524,7 +530,7 @@ def test_embed_defaults_to_highest_yield_vocabularies(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
     monkeypatch.setattr(
         "gpu_embedder.store.get_cached_model_version",
-        lambda conn, model_id, revision: "test-model-version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
     )
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
@@ -555,7 +561,7 @@ def test_embed_all_sentinel_embeds_every_vocabulary(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.ensure_schema", lambda conn: None)
     monkeypatch.setattr(
         "gpu_embedder.store.get_cached_model_version",
-        lambda conn, model_id, revision: "test-model-version",
+        lambda conn, model_id, revision, pooling="cls": "test-model-version",
     )
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", lambda conn, csv_path, model_version, filter_hash: None)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", lambda conn, **kwargs: None)
@@ -587,7 +593,7 @@ def test_embed_source_parquet_uses_source_adapter_defaults(monkeypatch, tmp_path
     def fake_ensure_schema(conn) -> None:  # type: ignore[no-untyped-def]
         return None
 
-    def fake_get_cached_model_version(conn, model_id: str, revision):  # type: ignore[no-untyped-def]
+    def fake_get_cached_model_version(conn, model_id: str, revision, pooling: str = "cls"):  # type: ignore[no-untyped-def]
         return "test-model-version"
 
     def fake_get_csv_fingerprint(conn, csv_path: str, model_version: str, filter_hash: str):  # type: ignore[no-untyped-def]
@@ -781,6 +787,95 @@ def test_export_writes_sharded_parquet_by_model_and_vocabulary(tmp_path: Path) -
     assert loinc_count is not None
     assert snomed_count[0] == 3
     assert loinc_count[0] == 1
+
+
+def _seed_pooled_version(
+    conn, *, model_version: str, model_id: str, pooling: str
+) -> None:
+    """Store two SNOMED rows under model_version + a matching registry entry."""
+    upsert_model_registry(
+        conn,
+        model_version=model_version,
+        model_id=model_id,
+        model_revision=None,
+        pooling=pooling,
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        EmbeddedRow(
+            concept=ConceptRow(
+                concept_id=i,
+                concept_name=f"SNOMED {i}",
+                domain_id="Condition",
+                vocabulary_id="SNOMED",
+            ),
+            embedding=[0.1 * i] * 768,
+            embed_text=f"SNOMED {i}",
+            model_version=model_version,
+            embedded_at=now,
+        )
+        for i in range(1, 3)
+    ]
+    upsert_rows(conn, rows)
+
+
+def test_export_ambiguous_pooling_requires_flag(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    out_dir = tmp_path / "parquet"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    model_id = "FremyCompany/BioLORD-2023"
+    _seed_pooled_version(conn, model_version="vcls", model_id=model_id, pooling="cls")
+    _seed_pooled_version(conn, model_version="vmean", model_id=model_id, pooling="mean")
+    conn.close()
+
+    result = runner.invoke(app, ["export", str(out_dir), "--db", str(db_path)])
+
+    # Ambiguous across cls/mean -> refuses and writes nothing.
+    assert result.exit_code == 1
+    assert not any(out_dir.glob("**/*.parquet")) if out_dir.exists() else True
+
+
+def test_export_pooling_selects_matching_version(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    out_dir = tmp_path / "parquet"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    model_id = "FremyCompany/BioLORD-2023"
+    _seed_pooled_version(conn, model_version="vcls", model_id=model_id, pooling="cls")
+    _seed_pooled_version(conn, model_version="vmean", model_id=model_id, pooling="mean")
+    conn.close()
+
+    result = runner.invoke(
+        app, ["export", str(out_dir), "--db", str(db_path), "--pooling", "mean"]
+    )
+    assert result.exit_code == 0
+
+    # Pooling is folded into model_version, so the mean run lands under its own
+    # model_version= partition; the cls version is not exported.
+    mean_dir = out_dir / "model_version=vmean"
+    cls_dir = out_dir / "model_version=vcls"
+    assert (mean_dir / "vocabulary_id=SNOMED").is_dir()
+    assert not cls_dir.exists()
+
+
+def test_export_rejects_invalid_pooling(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(conn, model_version="vcls", model_id="m/x", pooling="cls")
+    conn.close()
+
+    result = runner.invoke(
+        app, ["export", str(tmp_path / "out"), "--db", str(db_path), "--pooling", "bogus"]
+    )
+    assert result.exit_code == 1
 
 
 def test_model_registry_lists_entries(tmp_path: Path) -> None:

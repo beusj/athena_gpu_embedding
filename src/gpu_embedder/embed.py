@@ -2,7 +2,8 @@
 
 Key invariants (see AGENTS.md):
 - FP32 only — never call .half() or set torch_dtype.
-- CLS-token pooling, L2-normalized output.
+- Pooling is selectable (default ``cls``; mask-aware ``mean`` available),
+  L2-normalized output. Non-default pooling is folded into model_version.
 - model_version is a SHA-256 digest of the weights file on disk.
 - Tensors are moved off GPU before collection (.cpu().numpy()).
 """
@@ -77,21 +78,32 @@ class Embedder(Protocol):
 # Model version
 # ---------------------------------------------------------------------------
 
-def _apply_precision_quant(
-    weights_digest: str, precision: str, quantization_scheme: str
+def _apply_run_variant(
+    weights_digest: str,
+    precision: str,
+    quantization_scheme: str,
+    pooling: str = "cls",
 ) -> str:
-    """Fold non-default precision/quantization into the model_version digest.
+    """Fold non-default run variants into the model_version digest.
 
-    ``fp32`` + ``none`` returns the bare weights digest unchanged, so stores
-    hashed before this existed keep their ``model_version`` (no mass re-embed).
-    Any other precision/quantization yields a distinct digest, so a quantized
-    run gets a separate ``(namespace, concept_id, model_version)`` identity
-    instead of colliding with — and overwriting — the fp32 embeddings of the
-    same weights. Provenance stays human-readable in ``model_registry``.
+    A "run variant" is something that changes the embeddings without changing
+    the weights file — precision, quantization, or pooling strategy. The full
+    default (``fp32`` + ``none`` + ``cls``) returns the bare weights digest
+    unchanged, so stores hashed before this existed keep their ``model_version``
+    (no mass re-embed). Any non-default variant yields a distinct digest, so it
+    gets a separate ``(namespace, concept_id, model_version)`` identity instead
+    of colliding with — and overwriting — the embeddings of the same weights
+    pooled/quantized differently. Provenance stays human-readable in
+    ``model_registry``.
+
+    ``pooling="cls"`` adds no suffix, so the precision/quantization digests
+    predating pooling support are preserved byte-for-byte.
     """
-    if precision == "fp32" and quantization_scheme == "none":
+    if precision == "fp32" and quantization_scheme == "none" and pooling == "cls":
         return weights_digest
     suffix = f"|precision={precision}|quantization={quantization_scheme}"
+    if pooling != "cls":
+        suffix += f"|pooling={pooling}"
     return hashlib.sha256((weights_digest + suffix).encode()).hexdigest()
 
 
@@ -101,15 +113,17 @@ def compute_model_version(
     *,
     precision: str = "fp32",
     quantization_scheme: str = "none",
+    pooling: str = "cls",
 ) -> str:
     """Return the model_version digest for a checkpoint.
 
     Base digest is the SHA-256 of the model weights file (model.safetensors,
     then pytorch_model.bin; falls back to hashing the model ID string when no
     weights file is found, as in tests with non-existent paths). When
-    *precision*/*quantization_scheme* are non-default they are folded into the
-    digest so quantized variants of the same weights get distinct versions; the
-    default fp32/none returns the bare weights digest (stable across upgrades).
+    *precision*/*quantization_scheme*/*pooling* are non-default they are folded
+    into the digest so variants of the same weights get distinct versions; the
+    default fp32/none/cls returns the bare weights digest (stable across
+    upgrades).
     """
     base = Path(model_id_or_path)
     if base.is_dir():
@@ -161,7 +175,7 @@ def compute_model_version(
         )
         weights_digest = hashlib.sha256(str(model_id_or_path).encode()).hexdigest()
 
-    return _apply_precision_quant(weights_digest, precision, quantization_scheme)
+    return _apply_run_variant(weights_digest, precision, quantization_scheme, pooling)
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +238,14 @@ def embed_batch(
     tokenizer: object,
     device: str,
     max_length: int = 128,
+    pooling: str = "cls",
 ) -> np.ndarray:
     """Embed a list of strings and return float32 (N, 768) array.
 
-    CLS-token pooling + L2 normalisation.  Tensors are moved off GPU before
-    returning so callers never accumulate GPU memory across batches.
+    Pooling is ``cls`` (CLS token, SapBERT default) or ``mean`` (mask-aware
+    average over tokens, for sentence-transformers models like BioLORD-2023),
+    followed by L2 normalisation. Tensors are moved off GPU before returning so
+    callers never accumulate GPU memory across batches.
     """
     enc = tokenizer(  # type: ignore[operator]
         texts,
@@ -242,14 +259,21 @@ def embed_batch(
     with torch.no_grad():
         out = model(**enc)  # type: ignore[operator]
 
-    # CLS pooling
-    cls_vecs: torch.Tensor = out.last_hidden_state[:, 0, :]  # (N, 768)
+    if pooling == "mean":
+        # Mask-aware mean pooling: average only over real (non-padding) tokens
+        # so the result is independent of right-padding length.
+        mask = enc["attention_mask"].unsqueeze(-1).float()  # (N, L, 1)
+        summed = (out.last_hidden_state * mask).sum(dim=1)  # (N, 768)
+        vecs: torch.Tensor = summed / mask.sum(dim=1).clamp(min=1e-9)
+    else:
+        # CLS pooling
+        vecs = out.last_hidden_state[:, 0, :]  # (N, 768)
 
     # L2 normalise
-    norms = cls_vecs.norm(dim=1, keepdim=True).clamp(min=1e-12)
-    cls_vecs = cls_vecs / norms
+    norms = vecs.norm(dim=1, keepdim=True).clamp(min=1e-12)
+    vecs = vecs / norms
 
-    return cls_vecs.cpu().float().numpy()
+    return vecs.cpu().float().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +301,7 @@ def embed_all(
     separator: str,
     model_version: str,
     *,
+    pooling: str = "cls",
     precomputed_texts: dict[int, str] | None = None,
 ) -> list[EmbeddedRow]:
     """Embed all rows in batches, returning EmbeddedRow objects.
@@ -321,7 +346,9 @@ def embed_all(
                 len(batch),
             )
             progress.set_postfix(rows=f"{start + 1}-{start + len(batch)}")
-            vecs: np.ndarray = embed_batch(texts, model, tokenizer, device, max_length)
+            vecs: np.ndarray = embed_batch(
+                texts, model, tokenizer, device, max_length, pooling
+            )
         except Exception:
             logger.error(
                 "embed_batch failed on rows %d-%d", start, start + len(batch) - 1

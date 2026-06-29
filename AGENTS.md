@@ -137,14 +137,19 @@ from `cli.py`.
 - Model: `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` (768-dim) is the
   configurable default (`--model` / `GPU_EMBED_MODEL`); any 768-dim biomedical
   encoder is accepted. See the README's "Choosing an embedding model" for
-  alternatives such as BioLORD-2023. The invariants below (FP32, CLS pooling,
-  768-dim store column) hold regardless of which model is selected.
+  alternatives such as BioLORD-2023. The invariants below (FP32, 768-dim store
+  column, `.cpu().numpy()` collection) hold regardless of which model is
+  selected. Pooling is selectable rather than fixed (see below).
 - Pin the revision via `GPU_EMBED_MODEL_REVISION` (commit hash, branch, or tag)
   so downloads are reproducible. Pass as `revision=` to both
   `AutoModel.from_pretrained` and `AutoTokenizer.from_pretrained`. `None` uses
   the upstream default branch (not recommended for production).
 - Always run in **FP32** (`model.float()`). Never call `.half()`.
-- Pool strategy: **CLS token** (`last_hidden_state[:, 0, :]`), L2-normalized.
+- Pool strategy: **selectable** (`--pooling` / `GPU_EMBED_POOLING`), default
+  `cls` (CLS token, `last_hidden_state[:, 0, :]`); `mean` is mask-aware mean
+  pooling for sentence-transformers models (e.g. BioLORD-2023). Output is
+  L2-normalized either way. **Pooling is part of `model_version`** — non-default
+  pooling is folded into the digest (see the run-variant note below).
 - Tokenize with `max_length=128`, `truncation=True`, `padding=True`.
 - Process in batches (`batch_size` from config). Move tensors to device; do not
   accumulate GPU tensors across batches (call `.cpu().numpy()` before
@@ -152,16 +157,20 @@ from `cli.py`.
 - `compute_model_version()` must hash the actual weights on disk (not the model
   name string) — use SHA-256 over the `pytorch_model.bin` or `model.safetensors`
   file. This should be stable across runs for the same checkpoint.
-- **Quantization belongs in the `model_version`, not a per-row column.** Runtime
-  quantization changes the embeddings but not the weights file, so it must be
-  folded into the digest or fp32 and quantized variants collide on the primary
-  key. `compute_model_version(..., precision=, quantization_scheme=)` does this
-  *only when non-default* (`fp32`/`none` returns the bare weights hash, so
-  existing stores are unaffected). When you add a real quantized path, thread
-  the same precision/quantization into `compute_model_version`,
-  `upsert_model_registry`, **and** the `model_version_cache` key
-  (`get_cached_model_version`), and keep `model_registry` as the human-readable
-  provenance. Today the project is FP32-only, so callers pass the defaults.
+- **Run variants belong in the `model_version`, not a per-row column.** Anything
+  that changes the embeddings without changing the weights file — quantization,
+  precision, **or pooling strategy** — must be folded into the digest, or
+  otherwise-identical variants collide on the primary key. For example, a `mean`
+  run reusing the `cls` `model_version` would be seen as "already embedded" and
+  silently skipped. `compute_model_version(..., precision=, quantization_scheme=,
+  pooling=)` folds these in *only when non-default* (`fp32`/`none`/`cls` returns
+  the bare weights hash, so existing stores are unaffected). When you add a new
+  run variant, thread it through all three call sites —
+  `compute_model_version`, `upsert_model_registry`, **and** the
+  `model_version_cache` key (`get_cached_model_version` /
+  `upsert_model_version_cache`, whose PK includes the variant) — and keep
+  `model_registry` as the human-readable provenance. Pooling is wired this way;
+  precision/quantization default to fp32/none (the project is FP32-only).
 
 ### DuckDB
 
