@@ -345,17 +345,31 @@ Shows mappings between `model_version` hashes and model metadata, including
 gpu-embed export [OPTIONS] OUTPUT_DIR
 ```
 
-Exports rows from `concept_embeddings` into parquet files under:
+Exports rows from `concept_embeddings` into parquet files under a per-model
+directory so different models — and different poolings of the same weights — never
+collide:
 
-`OUTPUT_DIR/<vocabulary_id>/part-00000.parquet`
+`OUTPUT_DIR/<model_id>__<pooling>/<vocabulary_id>/part-00000.parquet`
 
-Sharding is controlled by `--shard-rows` (rows per file).
+The model directory is the model id slugified (`/` → `__`) with the pooling
+appended, e.g. `FremyCompany__BioLORD-2023__mean/` (falling back to
+`model-<version-prefix>__<pooling>/` for versions absent from the registry). A
+`_manifest.json` recording the resolved model version, pooling, filters, and row
+count is written at the model directory root. Sharding is controlled by
+`--shard-rows` (rows per file).
+
+Because a single set of weights can now produce both a `cls` and a `mean` version
+(see "Choosing an embedding model"), a selection that matches both poolings is
+**ambiguous**: the command lists the candidates and exits, asking you to add
+`--pooling`. Use `gpu-embed model-registry` to see which versions are `cls` vs
+`mean` before exporting.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `OUTPUT_DIR` | _(required)_ | Destination directory for parquet output |
 | `--db` | `embeddings.duckdb` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
+| `--pooling` | _(none)_ | Disambiguate by pooling (`cls` or `mean`); required when the selection matches both |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
 | `--namespace` | _(all)_ | Export only this identity namespace |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
@@ -436,8 +450,11 @@ gpu-embed embed /data/vocab/CONCEPT.csv \
 # Show what model versions are stored and concept counts by vocabulary/domain
 gpu-embed status
 
-# Export most recent model version into sharded parquet by vocabulary directory
+# Export most recent model version into sharded parquet (errors if cls/mean are ambiguous)
 gpu-embed export exports/parquet --shard-rows 50000
+
+# Export the mean-pooled BioLORD-2023 embeddings (disambiguate by pooling)
+gpu-embed export exports/parquet --pooling mean
 
 # Export only SNOMED and LOINC for a specific model version prefix
 gpu-embed export exports/parquet \

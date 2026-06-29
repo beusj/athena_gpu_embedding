@@ -11,6 +11,7 @@ and store.  cli.py is excluded from coverage requirements.
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import re
@@ -19,7 +20,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from glob import glob
 from pathlib import Path
 from typing import Annotated
@@ -63,6 +64,23 @@ def _split_multi_values(values: list[str] | None) -> list[str]:
     for value in values:
         normalized.extend(piece.strip() for piece in value.split(",") if piece.strip())
     return normalized
+
+
+def _model_dir_name(model_id: str | None, pooling: str, model_version: str) -> str:
+    """Directory name identifying one exported model, keeping pooling separate.
+
+    Uses a slugified ``model_id`` when known (e.g. ``FremyCompany/BioLORD-2023`` ->
+    ``FremyCompany__BioLORD-2023``), falling back to ``model-<version[:12]>`` for
+    versions absent from the registry. Pooling is appended so cls and mean exports
+    of the same weights land in distinct trees instead of colliding.
+    """
+    if model_id:
+        slug = re.sub(r"[^0-9A-Za-z._-]+", "_", model_id.replace("/", "__")).strip("_")
+    else:
+        slug = ""
+    if not slug:
+        slug = f"model-{model_version[:12]}"
+    return f"{slug}__{pooling}"
 
 
 def _extract_model_pairs_from_logs(log_dir: Path) -> list[tuple[str, str | None]]:
@@ -820,6 +838,16 @@ def export_cmd(
             ),
         ),
     ] = None,
+    pooling: Annotated[
+        str | None,
+        typer.Option(
+            "--pooling",
+            help=(
+                "Disambiguate by pooling strategy: cls or mean. Required when the "
+                "selection matches both a cls and a mean version of the same weights"
+            ),
+        ),
+    ] = None,
     vocabulary_id: Annotated[
         list[str] | None,
         typer.Option(
@@ -872,6 +900,16 @@ def export_cmd(
         )
         raise typer.Exit(1)
 
+    allowed_poolings = {"cls", "mean"}
+    requested_pooling = pooling.lower() if pooling is not None else None
+    if requested_pooling is not None and requested_pooling not in allowed_poolings:
+        typer.echo(
+            "ERROR: unsupported pooling. "
+            f"Choose one of: {', '.join(sorted(allowed_poolings))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     conn = st.open_db(cfg.db)
     st.ensure_schema(conn)
 
@@ -880,18 +918,55 @@ def export_cmd(
         typer.echo("No embeddings found in the database.")
         raise typer.Exit(0)
 
-    selected_model_version: str
+    # Map each stored model_version to its pooling + model_id via the registry.
+    # Versions absent from the registry (legacy stores) are treated as cls, matching
+    # the registry's COALESCE(pooling, 'cls') default.
+    registry = {e.model_version: e for e in st.list_model_registry(conn)}
+
+    def _pooling_of(model_version: str) -> str:
+        entry = registry.get(model_version)
+        return entry.pooling if entry is not None else "cls"
+
+    # Candidate versions, most-recent-first, narrowed by --model-version and --pooling.
+    candidates = list(versions)
     if model_version_prefix:
-        matched = [v for v in versions if v.model_version.startswith(model_version_prefix)]
-        if not matched:
+        candidates = [
+            v for v in candidates if v.model_version.startswith(model_version_prefix)
+        ]
+        if not candidates:
             typer.echo(
                 f"No model version starting with '{model_version_prefix}' found.",
                 err=True,
             )
             raise typer.Exit(1)
-        selected_model_version = matched[0].model_version
-    else:
-        selected_model_version = versions[0].model_version
+    if requested_pooling is not None:
+        candidates = [v for v in candidates if _pooling_of(v.model_version) == requested_pooling]
+        if not candidates:
+            typer.echo(
+                f"No model version with pooling='{requested_pooling}' matches the "
+                "given filters.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+    distinct_poolings = {_pooling_of(v.model_version) for v in candidates}
+    if requested_pooling is None and len(distinct_poolings) > 1:
+        typer.echo(
+            "ERROR: selection is ambiguous across pooling strategies. Re-run with "
+            "--pooling {cls|mean}. Candidates:",
+            err=True,
+        )
+        for v in candidates:
+            entry = registry.get(v.model_version)
+            model_id_label = entry.model_id if entry is not None else "(unregistered)"
+            typer.echo(
+                f"  {v.short_hash}…  pooling={_pooling_of(v.model_version):4}  "
+                f"{v.count:,} row(s)  {model_id_label}",
+                err=True,
+            )
+        raise typer.Exit(1)
+
+    selected_model_version = candidates[0].model_version
 
     normalized_vocabulary_ids = _split_multi_values(vocabulary_id)
 
@@ -925,9 +1000,15 @@ def export_cmd(
         typer.echo("No rows match the requested export filters.")
         raise typer.Exit(0)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    typer.echo(f"Export root: {output_dir}")
-    typer.echo(f"model_version={selected_model_version[:16]}…")
+    selected_entry = registry.get(selected_model_version)
+    selected_pooling = _pooling_of(selected_model_version)
+    selected_model_id = selected_entry.model_id if selected_entry is not None else None
+    model_dir = output_dir / _model_dir_name(
+        selected_model_id, selected_pooling, selected_model_version
+    )
+    model_dir.mkdir(parents=True, exist_ok=True)
+    typer.echo(f"Export root: {model_dir}")
+    typer.echo(f"model_version={selected_model_version[:16]}…  pooling={selected_pooling}")
     typer.echo(
         f"Sharding by up to {shard_rows:,} row(s) per file with {normalized_compression} "
         "compression."
@@ -952,7 +1033,7 @@ def export_cmd(
     for vocab in vocabularies_to_export:
         vocab_value = vocab
         vocab_label = vocab_value if vocab_value is not None else "_null"
-        vocab_dir = output_dir / vocab_label
+        vocab_dir = model_dir / vocab_label
         vocab_dir.mkdir(parents=True, exist_ok=True)
 
         count_row = conn.execute(
@@ -1026,6 +1107,22 @@ def export_cmd(
             )
             total_files_written += 1
             total_rows_exported += end_rn - start_rn + 1
+
+    manifest = {
+        "model_version": selected_model_version,
+        "model_id": selected_model_id,
+        "model_revision": selected_entry.model_revision if selected_entry is not None else None,
+        "pooling": selected_pooling,
+        "namespace": namespace,
+        "vocabulary_ids": [v for v in vocabularies_to_export if v is not None],
+        "rows_exported": total_rows_exported,
+        "compression": normalized_compression,
+        "shard_rows": shard_rows,
+        "exported_at": datetime.now(tz=UTC).isoformat(),
+    }
+    (model_dir / "_manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
 
     typer.echo(
         "Export complete. "
@@ -1190,9 +1287,10 @@ def model_registry_cmd(
     typer.echo(f"Registry source: {cfg.db}/_meta/model_registry")
     typer.echo()
     typer.echo(
-        f"{'MODEL VERSION':18}  {'RECORDED AT':20}  {'REVISION':12}  {'PRECISION':9}  {'QUANT':9}  MODEL ID"
+        f"{'MODEL VERSION':18}  {'RECORDED AT':20}  {'REVISION':12}  "
+        f"{'PRECISION':9}  {'QUANT':9}  {'POOLING':7}  MODEL ID"
     )
-    typer.echo("-" * 132)
+    typer.echo("-" * 140)
     for row in rows:
         revision_label = row.model_revision or "default"
         typer.echo(
@@ -1201,6 +1299,7 @@ def model_registry_cmd(
             f"{revision_label[:12]:12}  "
             f"{row.precision[:9]:9}  "
             f"{row.quantization_scheme[:9]:9}  "
+            f"{row.pooling[:7]:7}  "
             f"{row.model_id}"
         )
     typer.echo()

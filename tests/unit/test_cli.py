@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -578,22 +579,25 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
 
-    snomed_files = sorted((out_dir / "SNOMED").glob("*.parquet"))
-    loinc_files = sorted((out_dir / "LOINC").glob("*.parquet"))
+    # No registry entry for "v1" -> treated as cls, slug falls back to model-<version>.
+    model_dir = out_dir / "model-v1__cls"
+    snomed_files = sorted((model_dir / "SNOMED").glob("*.parquet"))
+    loinc_files = sorted((model_dir / "LOINC").glob("*.parquet"))
 
     assert len(snomed_files) == 2
     assert len(loinc_files) == 1
+    assert (model_dir / "_manifest.json").exists()
 
     from duckdb import connect
 
     verify_conn = connect()
     snomed_count = verify_conn.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
-        [str(out_dir / "SNOMED" / "*.parquet")],
+        [str(model_dir / "SNOMED" / "*.parquet")],
     ).fetchone()
     loinc_count = verify_conn.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
-        [str(out_dir / "LOINC" / "*.parquet")],
+        [str(model_dir / "LOINC" / "*.parquet")],
     ).fetchone()
     verify_conn.close()
 
@@ -601,6 +605,98 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
     assert loinc_count is not None
     assert snomed_count[0] == 3
     assert loinc_count[0] == 1
+
+
+def _seed_pooled_version(
+    conn, *, model_version: str, model_id: str, pooling: str
+) -> None:
+    """Store two SNOMED rows under model_version + a matching registry entry."""
+    upsert_model_registry(
+        conn,
+        model_version=model_version,
+        model_id=model_id,
+        model_revision=None,
+        pooling=pooling,
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        EmbeddedRow(
+            concept=ConceptRow(
+                concept_id=i,
+                concept_name=f"SNOMED {i}",
+                domain_id="Condition",
+                vocabulary_id="SNOMED",
+            ),
+            embedding=[0.1 * i] * 768,
+            embed_text=f"SNOMED {i}",
+            model_version=model_version,
+            embedded_at=now,
+        )
+        for i in range(1, 3)
+    ]
+    upsert_rows(conn, rows)
+
+
+def test_export_ambiguous_pooling_requires_flag(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    out_dir = tmp_path / "parquet"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    model_id = "FremyCompany/BioLORD-2023"
+    _seed_pooled_version(conn, model_version="vcls", model_id=model_id, pooling="cls")
+    _seed_pooled_version(conn, model_version="vmean", model_id=model_id, pooling="mean")
+    conn.close()
+
+    result = runner.invoke(app, ["export", str(out_dir), "--db", str(db_path)])
+
+    # Ambiguous across cls/mean -> refuses and writes nothing.
+    assert result.exit_code == 1
+    assert not any(out_dir.glob("**/*.parquet")) if out_dir.exists() else True
+
+
+def test_export_pooling_selects_matching_version(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+    out_dir = tmp_path / "parquet"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    model_id = "FremyCompany/BioLORD-2023"
+    _seed_pooled_version(conn, model_version="vcls", model_id=model_id, pooling="cls")
+    _seed_pooled_version(conn, model_version="vmean", model_id=model_id, pooling="mean")
+    conn.close()
+
+    result = runner.invoke(
+        app, ["export", str(out_dir), "--db", str(db_path), "--pooling", "mean"]
+    )
+    assert result.exit_code == 0
+
+    mean_dir = out_dir / "FremyCompany__BioLORD-2023__mean"
+    cls_dir = out_dir / "FremyCompany__BioLORD-2023__cls"
+    assert (mean_dir / "SNOMED").is_dir()
+    assert not cls_dir.exists()
+
+    manifest = json.loads((mean_dir / "_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["model_version"] == "vmean"
+    assert manifest["pooling"] == "mean"
+    assert manifest["model_id"] == model_id
+
+
+def test_export_rejects_invalid_pooling(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings.duckdb"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    _seed_pooled_version(conn, model_version="vcls", model_id="m/x", pooling="cls")
+    conn.close()
+
+    result = runner.invoke(
+        app, ["export", str(tmp_path / "out"), "--db", str(db_path), "--pooling", "bogus"]
+    )
+    assert result.exit_code == 1
 
 
 def test_model_registry_lists_entries(tmp_path: Path) -> None:
