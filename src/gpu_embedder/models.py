@@ -1,18 +1,36 @@
-"""Pydantic models, filter spec, and DuckDB schema DDL."""
+"""Dataclass models, filter spec, and DuckDB schema DDL.
+
+`ConceptRow`/`EmbeddedRow` are plain ``slots`` dataclasses rather than Pydantic
+models: at ingest time we build millions of these per run, and Pydantic
+`BaseModel` instantiation is ~4× slower than a slots dataclass (it dominated CSV
+load).  The light coercion the old validators did — ``concept_id`` → int and
+empty/``"NULL"`` → ``None`` — is now pushed into the DuckDB scan (see
+``ingest.py``), so the row objects are built from already-typed values.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from pydantic import BaseModel, field_validator
+# Default namespace for OHDSI Athena standard/target concepts.  Source-concept
+# datasets (local codes, free text) pass a distinct namespace so they cannot
+# collide with Athena concept_ids on the (namespace, concept_id, model_version)
+# primary key.
+DEFAULT_NAMESPACE = "athena"
 
 # ---------------------------------------------------------------------------
 # Athena concept row
 # ---------------------------------------------------------------------------
 
-class ConceptRow(BaseModel):
-    """One row from an Athena CONCEPT.csv file."""
+@dataclass(slots=True)
+class ConceptRow:
+    """One concept row from an Athena CONCEPT.csv file or a source dataset.
+
+    Field values are expected pre-coerced: ``concept_id`` is an ``int`` and the
+    nullable string columns are ``None`` (not ``""``/``"NULL"``).  Ingestion is
+    responsible for that coercion.
+    """
 
     concept_id: int
     concept_name: str
@@ -24,31 +42,16 @@ class ConceptRow(BaseModel):
     valid_start_date: str | None = None
     valid_end_date: str | None = None
     invalid_reason: str | None = None  # None means valid
-
-    @field_validator(
-        "domain_id",
-        "vocabulary_id",
-        "concept_class_id",
-        "standard_concept",
-        "concept_code",
-        "valid_start_date",
-        "valid_end_date",
-        "invalid_reason",
-        mode="before",
-    )
-    @classmethod
-    def empty_to_none(cls, v: object) -> object:
-        """Treat empty strings and the literal string 'NULL' as None."""
-        if isinstance(v, str) and (v == "" or v.upper() == "NULL"):
-            return None
-        return v
+    # Provenance/identity dimension; part of the embedding primary key.
+    namespace: str = DEFAULT_NAMESPACE
 
 
 # ---------------------------------------------------------------------------
 # Embedded row (ConceptRow + vector + metadata)
 # ---------------------------------------------------------------------------
 
-class EmbeddedRow(BaseModel):
+@dataclass(slots=True)
+class EmbeddedRow:
     """A ConceptRow plus its embedding vector and run metadata."""
 
     concept: ConceptRow
@@ -79,6 +82,7 @@ class FilterSpec:
 
 SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS concept_embeddings (
+    namespace           TEXT      NOT NULL DEFAULT 'athena',
     concept_id          BIGINT    NOT NULL,
     concept_name        TEXT      NOT NULL,
     domain_id           TEXT,
@@ -91,7 +95,7 @@ CREATE TABLE IF NOT EXISTS concept_embeddings (
     embed_text          TEXT      NOT NULL,
     model_version       TEXT      NOT NULL,
     embedded_at         TIMESTAMP NOT NULL,
-    PRIMARY KEY (concept_id, model_version)
+    PRIMARY KEY (namespace, concept_id, model_version)
 );
 """
 

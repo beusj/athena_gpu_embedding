@@ -13,8 +13,11 @@ orchestration, no LLM calls, no network I/O beyond the initial HuggingFace
 model download.
 
 Key invariants:
-- **Idempotent by default.** `(concept_id, model_version)` is the unique key;
-  rows that already exist are silently skipped unless `--force` is passed.
+- **Idempotent by default.** `(namespace, concept_id, model_version)` is the
+  unique key; rows that already exist are silently skipped unless `--force` is
+  passed. `namespace` defaults to `athena` for Athena standard concepts; source
+  datasets pass a distinct namespace so their (possibly colliding) `concept_id`s
+  stay separate.
 - **FP32 only.** No fp16/bf16 quantization. The `embed.py` module must never
   call `.half()` or `.to(torch.bfloat16)` on the model or tensors.
 - **One embedding model at a time.** `model_version` is a SHA-256 digest of the
@@ -49,7 +52,7 @@ uv run gpu-embed --help   # CLI entry point
 src/gpu_embedder/
 ├── cli.py        # Typer app; `embed` + `cpt4` subcommands; thin — delegates to other modules
 ├── config.py     # EmbedConfig (Pydantic BaseSettings); env prefix GPU_EMBED_; loads .env
-├── models.py     # ConceptRow (Pydantic), DuckDB DDL constant, FilterSpec
+├── models.py     # ConceptRow / EmbeddedRow (slots dataclasses), DuckDB DDL constants, FilterSpec
 ├── ingest.py     # read_csv() → filter_rows(); pure, no I/O side effects
 ├── embed.py      # load_model(), compute_model_version(), embed_batch()
 └── store.py      # open_db(), ensure_schema(), classify_rows_requiring_embedding(), upsert_rows()
@@ -68,8 +71,14 @@ from `cli.py`.
 - Line length **100**. Ruff with `py312` target.
 - All public functions have type annotations. No `Any` except in explicit shim
   code (mark with `# type: ignore[misc]` and a comment explaining why).
-- **Pydantic models are the contract between modules.** `ingest.py` returns
+- **Typed dataclasses are the contract between modules.** `ingest.py` returns
   `list[ConceptRow]`; `embed.py` consumes it. No raw dicts across boundaries.
+  `ConceptRow`/`EmbeddedRow` are `@dataclass(slots=True)` (not Pydantic) because
+  millions are built per run and Pydantic instantiation dominated CSV load. The
+  light coercion the old validators did (`concept_id`→int, empty/`"NULL"`→None)
+  now lives in the DuckDB scan SELECT (`ingest._coerced_scan_columns`); keep
+  validation/coercion there, not in per-row Python. `EmbedConfig` stays Pydantic
+  `BaseSettings` (it's config, not a hot path).
 - **`.env` is the single source of truth for local config.** `EmbedConfig`
   must call `model_config = SettingsConfigDict(env_file=".env", extra="ignore")`
   so that any `.env` present is loaded automatically. Never hard-code paths or
@@ -82,7 +91,8 @@ from `cli.py`.
   `athena_vocab/`). When no explicit `CSV_PATH` arguments are given, the CLI
   reads `<vocab_dir>/CONCEPT.csv`.
 - **DuckDB is the default CSV engine.** Read/filter Athena TSVs through DuckDB
-  before Pydantic validation so large files are narrowed early.
+  and coerce types in the scan SELECT so large files are narrowed and typed
+  before any Python-level row objects are built.
 - `ingest_engine` can be set to `python` for a pure-Python fallback, but the
   default path should remain DuckDB.
 - Athena CSVs use **tab-separated values** (`\t`) with a header row. Always

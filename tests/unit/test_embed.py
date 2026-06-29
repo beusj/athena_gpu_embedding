@@ -34,7 +34,7 @@ def _make_row(**kwargs: Any) -> ConceptRow:
         "invalid_reason": None,
     }
     defaults.update(kwargs)
-    return ConceptRow.model_validate(defaults)
+    return ConceptRow(**defaults)
 
 
 def _fake_model_output(batch_size: int, hidden: int = 768) -> MagicMock:

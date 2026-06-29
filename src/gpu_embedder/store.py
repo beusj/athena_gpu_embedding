@@ -39,6 +39,7 @@ EMBEDDING_DIM = 768
 # Column order shared by the concept_embeddings table, the parquet shards, and
 # the Arrow tables we build for bulk loading.  Keep these in lockstep.
 _EMBEDDING_COLUMNS = (
+    "namespace",
     "concept_id",
     "concept_name",
     "domain_id",
@@ -80,6 +81,7 @@ def _embedded_rows_to_arrow(rows: list[EmbeddedRow]) -> pa.Table:
     ]
     return pa.table(
         {
+            "namespace": pa.array([r.concept.namespace for r in rows], type=pa.string()),
             "concept_id": pa.array([r.concept.concept_id for r in rows], type=pa.int64()),
             "concept_name": pa.array([r.concept.concept_name for r in rows], type=pa.string()),
             "domain_id": pa.array([r.concept.domain_id for r in rows], type=pa.string()),
@@ -181,6 +183,7 @@ def _create_empty_view(conn: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE OR REPLACE VIEW concept_embeddings AS
         SELECT
+            CAST(NULL AS VARCHAR) AS namespace,
             CAST(NULL AS BIGINT) AS concept_id,
             CAST(NULL AS VARCHAR) AS concept_name,
             CAST(NULL AS VARCHAR) AS domain_id,
@@ -220,6 +223,7 @@ def _refresh_view(conn: duckdb.DuckDBPyConnection, parquet_root: Path) -> None:
         """
         CREATE OR REPLACE VIEW concept_embeddings AS
         SELECT
+            COALESCE(namespace, 'athena') AS namespace,
             concept_id,
             concept_name,
             domain_id,
@@ -236,7 +240,7 @@ def _refresh_view(conn: duckdb.DuckDBPyConnection, parquet_root: Path) -> None:
             SELECT
                 *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY concept_id, model_version
+                    PARTITION BY COALESCE(namespace, 'athena'), concept_id, model_version
                     ORDER BY CAST(embedded_at AS TIMESTAMP) DESC, filename DESC
                 ) AS _rownum
             FROM (
@@ -315,6 +319,7 @@ def _copy_relation_to_partitioned_shards(
             f"""
             CREATE TEMP TABLE temp_partition_ranked AS
             SELECT
+                namespace,
                 concept_id,
                 concept_name,
                 domain_id,
@@ -356,6 +361,7 @@ def _copy_relation_to_partitioned_shards(
                     f"""
                     COPY (
                         SELECT
+                            namespace,
                             concept_id,
                             concept_name,
                             domain_id,
@@ -443,9 +449,29 @@ def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContex
             logger.info("Legacy concept_embeddings is empty; skipping migration")
             return
 
+        # Legacy tables predating the namespace column need it synthesised as
+        # 'athena' so the partition copy (which selects namespace) succeeds.
+        has_namespace = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_catalog = 'legacy'
+              AND table_schema = 'main'
+              AND table_name = 'concept_embeddings'
+              AND column_name = 'namespace'
+            """
+        ).fetchone()
+        if has_namespace and int(has_namespace[0]) > 0:
+            legacy_source = "legacy.concept_embeddings"
+        else:
+            legacy_source = (
+                "(SELECT *, 'athena' AS namespace "
+                "FROM legacy.concept_embeddings) AS legacy_src"
+            )
+
         migrated_files = _copy_relation_to_partitioned_shards(
             conn,
-            "legacy.concept_embeddings",
+            legacy_source,
             ctx.parquet_root,
             log_progress=True,
         )
@@ -484,6 +510,20 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
     if ctx.backend == "duckdb":
         conn.execute(SCHEMA_DDL)
+        # Backfill the namespace column on tables created before it existed.
+        # (A DuckDB table's PRIMARY KEY cannot be widened in place; pre-existing
+        # DBs keep the old (concept_id, model_version) key, which is still
+        # correct as long as they only hold athena-namespace concepts. Mixing in
+        # source concepts requires a rebuilt DB.)
+        conn.execute(
+            """
+            ALTER TABLE concept_embeddings
+            ADD COLUMN IF NOT EXISTS namespace TEXT DEFAULT 'athena'
+            """
+        )
+        conn.execute(
+            "UPDATE concept_embeddings SET namespace = 'athena' WHERE namespace IS NULL"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS model_registry (
@@ -538,18 +578,20 @@ def classify_rows_requiring_embedding(
     """Return rows requiring embedding plus (new_count, changed_count, unchanged_count).
 
     A row requires embedding when either:
-    - `(concept_id, model_version)` has no stored embedding, or
+    - `(namespace, concept_id, model_version)` has no stored embedding, or
     - stored `embed_text` differs from the current candidate text.
     """
     if not rows:
         return ([], 0, 0, 0)
 
+    namespaces = [row.namespace for row in rows]
     concept_ids = [row.concept_id for row in rows]
     embed_texts = [candidate_texts[row.concept_id] for row in rows]
     conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
     conn.execute(
         """
         CREATE TEMP TABLE _candidate_embed_texts (
+            namespace VARCHAR,
             concept_id BIGINT,
             embed_text VARCHAR
         )
@@ -559,12 +601,13 @@ def classify_rows_requiring_embedding(
     # overhead, which is severe for millions of concepts.
     conn.execute(
         "INSERT INTO _candidate_embed_texts"
-        " SELECT unnest(?::BIGINT[]), unnest(?::VARCHAR[])",
-        [concept_ids, embed_texts],
+        " SELECT unnest(?::VARCHAR[]), unnest(?::BIGINT[]), unnest(?::VARCHAR[])",
+        [namespaces, concept_ids, embed_texts],
     )
     result = conn.execute(
         """
         SELECT
+            c.namespace,
             c.concept_id,
             CASE
                 WHEN e.concept_id IS NULL THEN 'new'
@@ -573,22 +616,23 @@ def classify_rows_requiring_embedding(
             END AS status
         FROM _candidate_embed_texts c
         LEFT JOIN concept_embeddings e
-          ON e.concept_id = c.concept_id
+          ON e.namespace = c.namespace
+         AND e.concept_id = c.concept_id
          AND e.model_version = ?
         """,
         [model_version],
     ).fetchall()
     conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
 
-    status_by_id = {int(row[0]): str(row[1]) for row in result}
+    status_by_key = {(str(row[0]), int(row[1])): str(row[2]) for row in result}
     need_embed = {
-        concept_id
-        for concept_id, status in status_by_id.items()
+        key
+        for key, status in status_by_key.items()
         if status in {"new", "changed"}
     }
-    new_count = sum(1 for status in status_by_id.values() if status == "new")
-    changed_count = sum(1 for status in status_by_id.values() if status == "changed")
-    unchanged_count = sum(1 for status in status_by_id.values() if status == "unchanged")
+    new_count = sum(1 for status in status_by_key.values() if status == "new")
+    changed_count = sum(1 for status in status_by_key.values() if status == "changed")
+    unchanged_count = sum(1 for status in status_by_key.values() if status == "unchanged")
     logger.info(
         "classify_rows_requiring_embedding: %d candidates, %d new, %d changed, %d unchanged "
         "(model_version=%s)",
@@ -598,7 +642,12 @@ def classify_rows_requiring_embedding(
         unchanged_count,
         model_version[:8],
     )
-    return ([row for row in rows if row.concept_id in need_embed], new_count, changed_count, unchanged_count)
+    return (
+        [row for row in rows if (row.namespace, row.concept_id) in need_embed],
+        new_count,
+        changed_count,
+        unchanged_count,
+    )
 
 
 def _append_rows_as_parquet_shards(
@@ -680,12 +729,26 @@ def upsert_rows(
     logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
 
 
-def count_rows(conn: duckdb.DuckDBPyConnection, model_version: str) -> int:
-    """Return the number of stored embeddings for *model_version*."""
-    result = conn.execute(
-        "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ?",
-        [model_version],
-    ).fetchone()
+def count_rows(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+    namespace: str | None = None,
+) -> int:
+    """Return the number of stored embeddings for *model_version*.
+
+    When *namespace* is given, count only that namespace; otherwise count across
+    all namespaces.
+    """
+    if namespace is None:
+        result = conn.execute(
+            "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ?",
+            [model_version],
+        ).fetchone()
+    else:
+        result = conn.execute(
+            "SELECT COUNT(*) FROM concept_embeddings WHERE model_version = ? AND namespace = ?",
+            [model_version, namespace],
+        ).fetchone()
     return int(result[0]) if result else 0
 
 
