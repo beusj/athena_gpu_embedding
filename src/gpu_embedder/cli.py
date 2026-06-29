@@ -1398,7 +1398,11 @@ def export_cmd(
                 total_files_skipped += 1
                 continue
 
-            escaped_output_path = shard_path.as_posix().replace("'", "''")
+            # Write to a sibling .tmp file first, then atomically rename to the
+            # final path on success.  This ensures a re-run never silently skips
+            # a shard that was left incomplete by an interrupted previous export.
+            tmp_path = shard_path.with_suffix(".parquet.tmp")
+            escaped_tmp_path = tmp_path.as_posix().replace("'", "''")
             export_sql = f"""
                 COPY (
                     SELECT
@@ -1441,13 +1445,18 @@ def export_cmd(
                           {ns_predicate}
                     ) ranked
                     WHERE rn BETWEEN ? AND ?
-                ) TO '{escaped_output_path}'
+                ) TO '{escaped_tmp_path}'
                 (FORMAT PARQUET, COMPRESSION {normalized_compression})
             """
-            conn.execute(
-                export_sql,
-                [selected_model_version, vocab_value, vocab_value, *ns_param, start_rn, end_rn],
-            )
+            try:
+                conn.execute(
+                    export_sql,
+                    [selected_model_version, vocab_value, vocab_value, *ns_param, start_rn, end_rn],
+                )
+                tmp_path.replace(shard_path)  # atomic on same filesystem
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
             total_files_written += 1
             total_rows_exported += end_rn - start_rn + 1
 
