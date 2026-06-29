@@ -19,13 +19,87 @@ from pathlib import Path
 from typing import Literal
 
 import duckdb
+import numpy as np
+import pyarrow as pa
 
-from gpu_embedder.models import ConceptRow, EmbeddedRow, SCHEMA_DDL, CSV_FINGERPRINTS_DDL, MODEL_VERSION_CACHE_DDL
+from gpu_embedder.models import (
+    CSV_FINGERPRINTS_DDL,
+    MODEL_VERSION_CACHE_DDL,
+    SCHEMA_DDL,
+    ConceptRow,
+    EmbeddedRow,
+)
 
 logger = logging.getLogger(__name__)
 TARGET_ROWS_PER_SHARD = 250_000
 NULL_VOCAB_PARTITION = "_null"
 MODEL_REGISTRY_SUBDIR = Path("_meta") / "model_registry"
+EMBEDDING_DIM = 768
+
+# Column order shared by the concept_embeddings table, the parquet shards, and
+# the Arrow tables we build for bulk loading.  Keep these in lockstep.
+_EMBEDDING_COLUMNS = (
+    "concept_id",
+    "concept_name",
+    "domain_id",
+    "vocabulary_id",
+    "concept_class_id",
+    "standard_concept",
+    "concept_code",
+    "invalid_reason",
+    "embedding",
+    "embed_text",
+    "model_version",
+    "embedded_at",
+)
+
+
+def _embedded_rows_to_arrow(rows: list[EmbeddedRow]) -> pa.Table:
+    """Build a columnar Arrow table from EmbeddedRow objects for bulk loading.
+
+    DuckDB ingests Arrow tables natively (zero-copy, fully vectorised), which is
+    dramatically faster than ``executemany`` for the wide ``FLOAT[768]`` column
+    — the per-row Python→DuckDB binding is the dominant cost otherwise.  The
+    embedding is encoded as a fixed-size list of float32 so it maps directly to
+    the ``FLOAT[768]`` column type.
+    """
+    embeddings = np.asarray([r.embedding for r in rows], dtype=np.float32)
+    if embeddings.shape != (len(rows), EMBEDDING_DIM):
+        raise ValueError(
+            f"Expected embeddings of shape ({len(rows)}, {EMBEDDING_DIM}), "
+            f"got {embeddings.shape}"
+        )
+    embedding_arr = pa.FixedSizeListArray.from_arrays(
+        pa.array(embeddings.reshape(-1)), EMBEDDING_DIM
+    )
+    # DuckDB TIMESTAMP is timezone-naive; drop tzinfo (values are UTC) so the
+    # Arrow timestamp maps cleanly without an implicit conversion.
+    embedded_at = [
+        r.embedded_at.replace(tzinfo=None) if r.embedded_at.tzinfo else r.embedded_at
+        for r in rows
+    ]
+    return pa.table(
+        {
+            "concept_id": pa.array([r.concept.concept_id for r in rows], type=pa.int64()),
+            "concept_name": pa.array([r.concept.concept_name for r in rows], type=pa.string()),
+            "domain_id": pa.array([r.concept.domain_id for r in rows], type=pa.string()),
+            "vocabulary_id": pa.array([r.concept.vocabulary_id for r in rows], type=pa.string()),
+            "concept_class_id": pa.array(
+                [r.concept.concept_class_id for r in rows], type=pa.string()
+            ),
+            "standard_concept": pa.array(
+                [r.concept.standard_concept for r in rows], type=pa.string()
+            ),
+            "concept_code": pa.array([r.concept.concept_code for r in rows], type=pa.string()),
+            "invalid_reason": pa.array(
+                [r.concept.invalid_reason for r in rows], type=pa.string()
+            ),
+            "embedding": embedding_arr,
+            "embed_text": pa.array([r.embed_text for r in rows], type=pa.string()),
+            "model_version": pa.array([r.model_version for r in rows], type=pa.string()),
+            "embedded_at": pa.array(embedded_at, type=pa.timestamp("us")),
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -201,6 +275,13 @@ def _copy_relation_to_partitioned_shards(
     total_partitions = len(partitions)
     estimated_total_files = sum(ceil(int(row_count) / TARGET_ROWS_PER_SHARD) for *_, row_count in partitions)
 
+    # Zero-padded nanosecond stamp used as the leading filename component so a
+    # lexical ``filename DESC`` sort is chronological.  The dedup view breaks
+    # equal-``embedded_at`` ties by ``filename DESC``; a random UUID would pick
+    # an arbitrary (possibly stale) shard, whereas this guarantees the most
+    # recently written shard for a concept wins.
+    write_seq = f"{time.time_ns():020d}"
+
     total_files = 0
     completed_rows = 0
     completed_partitions = 0
@@ -266,7 +347,10 @@ def _copy_relation_to_partitioned_shards(
             for shard_idx in range(shard_count):
                 start_rn = shard_idx * TARGET_ROWS_PER_SHARD + 1
                 end_rn = min((shard_idx + 1) * TARGET_ROWS_PER_SHARD, partition_row_count)
-                shard_path = partition_dir / f"part-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
+                shard_path = (
+                    partition_dir
+                    / f"part-{write_seq}-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
+                )
                 escaped_shard = shard_path.as_posix().replace("'", "''")
                 conn.execute(
                     f"""
@@ -599,72 +683,21 @@ def _append_rows_as_parquet_shards(
     ctx = _get_context(conn)
     if ctx.parquet_root is None:
         raise RuntimeError("Parquet root not available for parquet append")
-    conn.execute("DROP TABLE IF EXISTS temp_embeddings")
-    conn.execute(
-        """
-        CREATE TEMP TABLE temp_embeddings (
-            concept_id BIGINT,
-            concept_name VARCHAR,
-            domain_id VARCHAR,
-            vocabulary_id VARCHAR,
-            concept_class_id VARCHAR,
-            standard_concept VARCHAR,
-            concept_code VARCHAR,
-            invalid_reason VARCHAR,
-            embedding FLOAT[768],
-            embed_text VARCHAR,
-            model_version VARCHAR,
-            embedded_at TIMESTAMP
+
+    # Register the batch as an Arrow table and let DuckDB read it directly,
+    # avoiding per-row executemany binding of the FLOAT[768] embedding column.
+    arrow_batch = _embedded_rows_to_arrow(rows)
+    conn.register("temp_embeddings", arrow_batch)
+    try:
+        _copy_relation_to_partitioned_shards(
+            conn,
+            "temp_embeddings",
+            ctx.parquet_root,
+            log_progress=False,
         )
-        """
-    )
+    finally:
+        conn.unregister("temp_embeddings")
 
-    records = [
-        (
-            r.concept.concept_id,
-            r.concept.concept_name,
-            r.concept.domain_id,
-            r.concept.vocabulary_id,
-            r.concept.concept_class_id,
-            r.concept.standard_concept,
-            r.concept.concept_code,
-            r.concept.invalid_reason,
-            r.embedding,
-            r.embed_text,
-            r.model_version,
-            r.embedded_at,
-        )
-        for r in rows
-    ]
-
-    conn.executemany(
-        """
-        INSERT INTO temp_embeddings (
-            concept_id,
-            concept_name,
-            domain_id,
-            vocabulary_id,
-            concept_class_id,
-            standard_concept,
-            concept_code,
-            invalid_reason,
-            embedding,
-            embed_text,
-            model_version,
-            embedded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        records,
-    )
-
-    _copy_relation_to_partitioned_shards(
-        conn,
-        "temp_embeddings",
-        ctx.parquet_root,
-        log_progress=False,
-    )
-
-    conn.execute("DROP TABLE IF EXISTS temp_embeddings")
     if refresh_view:
         _refresh_view(conn, ctx.parquet_root)
 
@@ -693,58 +726,22 @@ def upsert_rows(
     ctx = _get_context(conn)
 
     if ctx.backend == "duckdb":
-        records = [
-            (
-                r.concept.concept_id,
-                r.concept.concept_name,
-                r.concept.domain_id,
-                r.concept.vocabulary_id,
-                r.concept.concept_class_id,
-                r.concept.standard_concept,
-                r.concept.concept_code,
-                r.concept.invalid_reason,
-                r.embedding,
-                r.embed_text,
-                r.model_version,
-                r.embedded_at,
+        # Register the batch as an Arrow table and merge in one SQL statement.
+        # DuckDB reads Arrow natively, so this avoids both per-row executemany
+        # binding (catastrophically slow for the FLOAT[768] column) and the
+        # primary-key index maintenance of a row-by-row insert.
+        arrow_batch = _embedded_rows_to_arrow(rows)
+        columns = ", ".join(_EMBEDDING_COLUMNS)
+        conn.register("_upsert_batch", arrow_batch)
+        try:
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO concept_embeddings ({columns})
+                SELECT {columns} FROM _upsert_batch
+                """
             )
-            for r in rows
-        ]
-        # Bulk-load into a temp table (no PK index) then merge in one SQL
-        # statement.  This avoids per-row primary key lookup overhead that
-        # makes executemany slow on large tables.
-        conn.execute("DROP TABLE IF EXISTS _upsert_batch")
-        conn.execute(
-            """
-            CREATE TEMP TABLE _upsert_batch (
-                concept_id BIGINT,
-                concept_name VARCHAR,
-                domain_id VARCHAR,
-                vocabulary_id VARCHAR,
-                concept_class_id VARCHAR,
-                standard_concept VARCHAR,
-                concept_code VARCHAR,
-                invalid_reason VARCHAR,
-                embedding FLOAT[768],
-                embed_text VARCHAR,
-                model_version VARCHAR,
-                embedded_at TIMESTAMP
-            )
-            """
-        )
-        conn.executemany(
-            """
-            INSERT INTO _upsert_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            records,
-        )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO concept_embeddings
-            SELECT * FROM _upsert_batch
-            """
-        )
-        conn.execute("DROP TABLE IF EXISTS _upsert_batch")
+        finally:
+            conn.unregister("_upsert_batch")
         logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
         return
 

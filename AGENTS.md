@@ -138,13 +138,24 @@ from `cli.py`.
 - Schema DDL lives in `models.py` as a module-level constant string
   `SCHEMA_DDL`. `store.py` calls `conn.execute(SCHEMA_DDL)` with `IF NOT
   EXISTS`; never drop or alter existing tables.
-- The embedding column is `FLOAT[768]` (DuckDB array type). Insert as a Python
-  `list[float]` — do not serialize to JSON or bytes.
+- The embedding column is `FLOAT[768]` (DuckDB array type). `EmbeddedRow.embedding`
+  stays a Python `list[float]` across module boundaries — do not serialize to
+  JSON or bytes.
+- **Bulk writes go through Arrow, never `executemany`.** `store.py` builds a
+  columnar `pyarrow.Table` (embedding as a `FixedSizeList` of float32) via
+  `_embedded_rows_to_arrow()`, registers it with `conn.register(...)`, and runs a
+  single `INSERT OR REPLACE ... SELECT`. `executemany` binds row-by-row across
+  the Python→DuckDB boundary and is catastrophically slow for the wide
+  `FLOAT[768]` column (~100×+ slower); do not reintroduce it for embedding writes.
+  Likewise, pass scalar columns to `classify_rows_requiring_embedding()` as a
+  single `unnest(?::T[])` array, not via per-row `executemany`.
 - `get_existing_ids(conn, model_version)` returns a `set[int]` of `concept_id`s
-  that already have an embedding for that model version. Check before embedding,
-  not after.
-- All writes use a single `executemany` / `INSERT OR REPLACE` per batch, not
-  row-by-row.
+  already embedded for a model version. The live ingest path instead uses
+  `classify_rows_requiring_embedding()`, which also re-embeds rows whose
+  `embed_text` changed; prefer it for new code.
+- The store context is tracked in a `weakref.WeakKeyDictionary` keyed by the
+  connection object — not `id(conn)` (which leaks and can alias a closed
+  connection after the id is recycled).
 - DuckDB connection is opened **once** per CLI invocation and passed down;
   modules do not open their own connections.
 
