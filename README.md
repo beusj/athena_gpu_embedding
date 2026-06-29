@@ -1,7 +1,9 @@
 # gpu-embedder
 
-Batch-embed OHDSI Athena concept CSVs with SapBERT (FP32, GPU) and persist the
-vectors to parquet shards, with DuckDB as the query interface layer.
+Batch-embed OHDSI Athena concept CSVs with a biomedical embedding model
+(SapBERT by default; configurable — see
+[Choosing an embedding model](#choosing-an-embedding-model)) in FP32 on a GPU,
+persisting the vectors to a local DuckDB table (`embeddings.duckdb` by default).
 Already-embedded concepts are skipped unless `--force` is passed, so runs are
 safe to restart or extend incrementally.
 
@@ -23,15 +25,17 @@ safe to restart or extend incrementally.
    (`vocabulary_id`, `domain_id`, `concept_class_id`, `standard_concept`,
    `invalid_reason`) so you only embed what you need. CSV scan + filter are
    pushed through **DuckDB by default** before Pydantic validation.
-3. **Embeds** the filtered concept names with
+3. **Embeds** the filtered concept names with a biomedical embedding model —
    [SapBERT](https://huggingface.co/cambridgeltl/SapBERT-from-PubMedBERT-fulltext)
-   running in FP32 on a CUDA GPU (falls back to CPU when no GPU is available,
-   but will be slow).
-4. **Writes** each concept's vector plus its metadata into a local parquet
-  store (`embeddings/` by default), partitioned by `model_version`.
-  DuckDB remains the query engine over that store.
-5. **Skips** rows whose `(concept_id, model_version)` pair already exists in
-   the store. Pass `--force` to re-embed unconditionally.
+   by default, configurable via `--model` (see
+   [Choosing an embedding model](#choosing-an-embedding-model)) — running in FP32
+   on a CUDA GPU (falls back to CPU when no GPU is available, but will be slow).
+4. **Writes** each concept's vector plus its metadata into a local DuckDB table
+  (`embeddings.duckdb` by default). A directory path instead selects the opt-in
+  parquet-sharded store, a migration/export artifact rather than the recommended
+  live store (see [Storage model and migration](#storage-model-and-migration)).
+5. **Skips** rows whose `(namespace, concept_id, model_version)` key already
+   exists in the store. Pass `--force` to re-embed unconditionally.
 
 ---
 
@@ -52,8 +56,8 @@ gpu_embedding/
 │       ├── config.py       # Settings (Pydantic BaseSettings + env)
 │       ├── models.py       # Pydantic row models + contracts
 │       ├── ingest.py       # DuckDB-backed CSV scan + filter → ConceptRow records
-│       ├── embed.py        # SapBERT FP32 tokenize + forward pass
-│       └── store.py        # DuckDB query layer over parquet shards
+│       ├── embed.py        # FP32 tokenize + forward pass (CLS-pooled, L2-normalized)
+│       └── store.py        # native DuckDB table store (+ optional parquet shards & query view)
 └── tests/
     ├── unit/
     └── integration/
@@ -75,7 +79,7 @@ uv sync --group dev
 #    (or set GPU_EMBED_VOCAB_DIR in .env to your download location)
 ```
 
-The SapBERT model is downloaded from Hugging Face on first run and cached
+The embedding model is downloaded from Hugging Face on first run and cached
 locally via the normal `~/.cache/huggingface` path.
 
 DuckDB is also the default engine for reading and filtering Athena TSVs, so
@@ -127,6 +131,32 @@ If `cuda.is_available()` is still `False` after syncing:
 
 ---
 
+## Choosing an embedding model
+
+SapBERT is the default, but any Hugging Face biomedical encoder that produces a
+768-dimensional vector can be selected with `--model` (or `GPU_EMBED_MODEL`).
+Two strong choices for OMOP/Athena concept text:
+
+| Model | Hugging Face | Paper |
+|-------|--------------|-------|
+| **SapBERT** (`cambridgeltl/SapBERT-from-PubMedBERT-fulltext`) | [model card](https://huggingface.co/cambridgeltl/SapBERT-from-PubMedBERT-fulltext) | [Self-Alignment Pretraining for Biomedical Entity Representations (NAACL 2021) — arXiv:2010.11784](https://arxiv.org/abs/2010.11784) |
+| **BioLORD-2023** (`FremyCompany/BioLORD-2023`) | [model card](https://huggingface.co/FremyCompany/BioLORD-2023) | [BioLORD-2023: Semantic Textual Representations Fusing LLM and Clinical Knowledge Graph Insights — arXiv:2311.16075](https://arxiv.org/abs/2311.16075) |
+
+- **SapBERT** is tuned for biomedical *entity* representations (synonym/alias
+  matching) and is the default. It works directly with this tool's CLS-token
+  pooling.
+- **BioLORD-2023** targets clinical *sentence* similarity and often performs
+  better on longer, descriptive concept names. It is a `sentence-transformers`
+  model trained with **mean** pooling, whereas this pipeline currently pools the
+  CLS token — so treat it as a candidate to evaluate (and adjust pooling to
+  reproduce its published behaviour) rather than a zero-change swap.
+
+Whichever model you choose, the `model_version` digest (a SHA-256 of the
+weights) keeps each model's embeddings from being silently mixed with another's
+in the same store. Pin `--model-revision` for reproducible downloads.
+
+---
+
 ## CPT-4 population (requires UMLS license)
 
 Athena ships CPT-4 concepts as a stub; the actual concept names are populated
@@ -161,7 +191,7 @@ The `cpt4` subcommand will:
 
 ## CLI usage
 
-The tool has five subcommands:
+The tool has seven subcommands:
 
 ```
 gpu-embed embed     [OPTIONS] [CSV_PATH...]   — batch embed concepts
@@ -169,6 +199,7 @@ gpu-embed export    [OPTIONS] OUTPUT_DIR      — export DB rows to sharded parq
 gpu-embed status    [OPTIONS]                — show what is stored in the DB
 gpu-embed model-registry [OPTIONS]           — show hash -> model/revision mappings
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
+gpu-embed migrate-store [OPTIONS]            — materialize/initialize the parquet store
 gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 ```
 
@@ -449,11 +480,13 @@ AWS_PAGER="" aws s3 sync exports/parquet s3://<your-bucket>/concept_embeddings/
 
 ## Logical schema
 
-The store is physically parquet but exposed through a DuckDB view named
-`concept_embeddings` with the following logical columns:
+The default store is a native DuckDB table named `concept_embeddings` (in the
+opt-in parquet store mode the same columns are exposed through a DuckDB view of
+that name). Logical columns:
 
 ```sql
-CREATE VIEW concept_embeddings AS SELECT
+CREATE TABLE concept_embeddings (
+    namespace           TEXT      NOT NULL DEFAULT 'athena',
     concept_id          BIGINT    NOT NULL,
     concept_name        TEXT      NOT NULL,
     domain_id           TEXT,
@@ -462,14 +495,16 @@ CREATE VIEW concept_embeddings AS SELECT
     standard_concept    TEXT,
     concept_code        TEXT,
     invalid_reason      TEXT,
-    embedding           FLOAT[768] NOT NULL,   -- SapBERT CLS vector
+    embedding           FLOAT[768] NOT NULL,   -- model embedding (CLS-pooled, L2-normalized)
     embed_text          TEXT      NOT NULL,    -- exact string that was embedded
     model_version       TEXT      NOT NULL,    -- SHA-256 digest of model weights
-    embedded_at         TIMESTAMP NOT NULL;
+    embedded_at         TIMESTAMP NOT NULL,
+    PRIMARY KEY (namespace, concept_id, model_version)
+);
 ```
 
 The `model_version` digest ensures that embeddings from different model
-checkpoints are never silently mixed.
+checkpoints (or different models entirely) are never silently mixed.
 
 ---
 
@@ -481,9 +516,9 @@ so an empty `.env` is valid for local GPU runs against `athena_vocab/`.
 ```dotenv
 # Paths
 GPU_EMBED_VOCAB_DIR=athena_vocab
-GPU_EMBED_DB=embeddings
+GPU_EMBED_DB=embeddings.duckdb   # native DuckDB table (default); a directory path selects the parquet store
 
-# Model
+# Model (see "Choosing an embedding model"; e.g. FremyCompany/BioLORD-2023)
 GPU_EMBED_MODEL=cambridgeltl/SapBERT-from-PubMedBERT-fulltext
 GPU_EMBED_MODEL_REVISION=       # HF commit hash / branch / tag; blank = default branch
 GPU_EMBED_DEVICE=auto
