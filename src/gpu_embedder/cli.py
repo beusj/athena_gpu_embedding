@@ -32,7 +32,11 @@ from typer.main import get_command
 from gpu_embedder import __version__
 from gpu_embedder.config import EmbedConfig
 from gpu_embedder.ingest import compute_csv_fingerprint, filter_spec_hash, read_csv
-from gpu_embedder.models import FilterSpec
+from gpu_embedder.models import (
+    ALL_VOCABULARIES_SENTINEL,
+    DEFAULT_VOCABULARY_IDS,
+    FilterSpec,
+)
 
 app = typer.Typer(
     name="gpu-embed",
@@ -343,6 +347,26 @@ def embed_cmd(
 
     # Build filter spec
     normalized_vocabulary_ids = _split_multi_values(vocabulary_id)
+
+    # Resolve the vocabulary filter default. With no --vocabulary-id, embedding
+    # every vocabulary in CONCEPT.csv is rarely intended, so default to the
+    # curated highest-yield set. The reserved sentinel "all" (case-insensitive)
+    # is the explicit escape hatch back to "embed everything".
+    if any(v.lower() == ALL_VOCABULARIES_SENTINEL for v in normalized_vocabulary_ids):
+        normalized_vocabulary_ids = []
+        typer.echo("Embedding all vocabularies (--vocabulary-id all).")
+    elif not normalized_vocabulary_ids:
+        normalized_vocabulary_ids = list(DEFAULT_VOCABULARY_IDS)
+        typer.echo(
+            "No --vocabulary-id given; defaulting to highest-yield vocabularies: "
+            + ", ".join(normalized_vocabulary_ids)
+            + ".\nPass --vocabulary-id all to embed every vocabulary instead."
+        )
+        if "CPT4" in normalized_vocabulary_ids:
+            typer.echo(
+                "Note: CPT4 concept names are blank in the raw Athena download until "
+                "you run `gpu-embed cpt4` (requires a UMLS license)."
+            )
 
     spec = FilterSpec(
         vocabulary_ids=normalized_vocabulary_ids,

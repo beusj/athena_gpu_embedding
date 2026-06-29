@@ -104,6 +104,12 @@ from `cli.py`.
   a single column type (e.g. `--vocabulary-id LOINC --vocabulary-id SNOMED`
   keeps rows where vocabulary is LOINC _or_ SNOMED).
 - The shorthand `--invalid-reason valid` must map to `NULL / ""` (both).
+- **`--vocabulary-id` defaults to a curated highest-yield set, not "all".** When
+  no `--vocabulary-id` is given, `cli.py` materializes `DEFAULT_VOCABULARY_IDS`
+  (in `models.py`) into the `FilterSpec` so the filter, fingerprint, and
+  `filter_spec_hash` all stay consistent. The reserved sentinel
+  `--vocabulary-id all` clears the filter to embed every vocabulary. Keep the
+  default as exact, case-sensitive Athena `vocabulary_id` strings.
 
 ### CPT-4 population
 
