@@ -1005,7 +1005,7 @@ def export_cmd(
         ),
     ] = "snappy",
 ) -> None:
-    """Export embeddings from the store to sharded parquet files by vocabulary directory."""
+    """Export embeddings to Hive-partitioned parquet by model_version and vocabulary."""
     from gpu_embedder import store as st
     from gpu_embedder.report import list_model_versions
 
@@ -1074,6 +1074,13 @@ def export_cmd(
         raise typer.Exit(0)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Hive-style partition root mirroring the parquet store / `migrate-store`
+    # layout (`model_version=<digest>/vocabulary_id=<value>/`). Keeping the two
+    # layouts identical means a single uniform stage layout in S3/Snowflake and
+    # lets exports of different model versions coexist under one OUTPUT_DIR
+    # without colliding on `part-*.parquet` filenames.
+    model_dir = output_dir / f"model_version={selected_model_version}"
+    model_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"Export root: {output_dir}")
     typer.echo(f"model_version={selected_model_version[:16]}…")
     typer.echo(
@@ -1099,8 +1106,8 @@ def export_cmd(
 
     for vocab in vocabularies_to_export:
         vocab_value = vocab
-        vocab_label = vocab_value if vocab_value is not None else "_null"
-        vocab_dir = output_dir / vocab_label
+        vocab_label = vocab_value if vocab_value is not None else st.NULL_VOCAB_PARTITION
+        vocab_dir = model_dir / f"vocabulary_id={vocab_label}"
         vocab_dir.mkdir(parents=True, exist_ok=True)
 
         count_row = conn.execute(
