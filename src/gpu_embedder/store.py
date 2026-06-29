@@ -278,7 +278,7 @@ def _copy_relation_to_partitioned_shards(
                         FROM temp_partition_ranked
                         WHERE rn BETWEEN ? AND ?
                     ) TO '{escaped_shard}'
-                    (FORMAT PARQUET, COMPRESSION ZSTD)
+                    (FORMAT PARQUET, COMPRESSION SNAPPY)
                     """,
                     [start_rn, end_rn],
                 )
@@ -391,6 +391,8 @@ def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set
 def _append_rows_as_parquet_shards(
     conn: duckdb.DuckDBPyConnection,
     rows: list[EmbeddedRow],
+    *,
+    refresh_view: bool,
 ) -> None:
     if not rows:
         return
@@ -462,13 +464,16 @@ def _append_rows_as_parquet_shards(
     )
 
     conn.execute("DROP TABLE IF EXISTS temp_embeddings")
-    _refresh_view(conn, ctx.parquet_root)
+    if refresh_view:
+        _refresh_view(conn, ctx.parquet_root)
 
 
 def upsert_rows(
     conn: duckdb.DuckDBPyConnection,
     rows: list[EmbeddedRow],
     mode: Literal["ndjson", "direct"] = "ndjson",
+    *,
+    refresh_view: bool = True,
 ) -> None:
     """Insert or replace a batch of EmbeddedRow objects.
 
@@ -480,7 +485,7 @@ def upsert_rows(
     if mode not in {"ndjson", "direct"}:
         raise ValueError(f"Unsupported write mode: {mode}")
 
-    _append_rows_as_parquet_shards(conn, rows)
+    _append_rows_as_parquet_shards(conn, rows, refresh_view=refresh_view)
 
     logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
 
@@ -609,7 +614,7 @@ def upsert_model_registry(
             FROM temp_model_registry_merged
             ORDER BY model_version
         ) TO '__REGISTRY_PATH__'
-        (FORMAT PARQUET, COMPRESSION ZSTD)
+        (FORMAT PARQUET, COMPRESSION SNAPPY)
         """.replace("__REGISTRY_PATH__", registry_path.as_posix().replace("'", "''"))
     )
 

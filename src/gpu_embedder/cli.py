@@ -442,7 +442,12 @@ def embed_cmd(
         total_embed_seconds += time.perf_counter() - embed_started
 
         write_started = time.perf_counter()
-        st.upsert_rows(conn, embedded_chunk, mode=cfg.write_mode)
+        st.upsert_rows(
+            conn,
+            embedded_chunk,
+            mode=cfg.write_mode,
+            refresh_view=False,
+        )
         total_write_seconds += time.perf_counter() - write_started
 
         total_embedded += len(embedded_chunk)
@@ -455,6 +460,9 @@ def embed_cmd(
 
     typer.echo(f"Embedding phase: {total_embed_seconds:.2f}s for {total_embedded} rows.")
     typer.echo(f"Write phase: {total_write_seconds:.2f}s for {total_embedded} rows.")
+
+    # Refresh logical view once after all checkpoint shards are written.
+    st.ensure_schema(conn)
 
     total = st.count_rows(conn, model_version)
     typer.echo(
@@ -646,7 +654,7 @@ def export_cmd(
             "--compression",
             help="Parquet compression codec (for example zstd or snappy)",
         ),
-    ] = "zstd",
+    ] = "snappy",
 ) -> None:
     """Export embeddings from the store to sharded parquet files by vocabulary directory."""
     from gpu_embedder import store as st

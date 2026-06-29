@@ -257,7 +257,13 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     ) -> None:
         return None
 
-    def fake_upsert_rows(conn, embedded_rows, mode: str = "ndjson") -> None:  # type: ignore[no-untyped-def]
+    def fake_upsert_rows(  # type: ignore[no-untyped-def]
+        conn,
+        embedded_rows,
+        mode: str = "ndjson",
+        *,
+        refresh_view: bool = True,
+    ) -> None:
         upsert_sizes.append(len(embedded_rows))
 
     def fake_count_rows(conn, model_version: str) -> int:  # type: ignore[no-untyped-def]

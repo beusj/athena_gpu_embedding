@@ -183,6 +183,9 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
   `_meta/model_registry/part-*.parquet` with one deduplicated row per
   `model_version` (`model_id`, `model_revision`, `recorded_at`).
 - `concept_embeddings` is exposed as a DuckDB view for all reads and exports.
+- New shard writes default to Snappy compression for faster write throughput;
+  existing shards with other codecs (for example ZSTD) remain readable and do
+  not require conversion.
 - If `--db` / `GPU_EMBED_DB` points to an existing legacy `.duckdb` file,
   rows are auto-migrated one time into a sibling parquet directory with the
   same basename (for example `embeddings.duckdb` → `embeddings/`).
@@ -295,7 +298,7 @@ Sharding is controlled by `--shard-rows` (rows per file).
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
-| `--compression` | `zstd` | Parquet codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `uncompressed` |
+| `--compression` | `snappy` | Parquet codec: `zstd`, `snappy`, `gzip`, `brotli`, `lz4`, `uncompressed` |
 | `--overwrite` | false | Replace existing shard files if present |
 
 ### `coverage` — identify unembedded concepts
