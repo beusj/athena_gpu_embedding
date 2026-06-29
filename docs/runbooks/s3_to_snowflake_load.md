@@ -26,26 +26,30 @@ Use `export` as the standard handoff path from the local store:
 uv run gpu-embed export exports/parquet --db embeddings.duckdb
 ```
 
-Export output is written as:
+Export output is written as Hive-partitioned parquet:
 
-`exports/parquet/<vocabulary_id>/part-*.parquet`
+`exports/parquet/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
 
-If you need to mirror the full store layout for platform portability, use:
+This matches the parquet store / `migrate-store` layout, so the S3 tree and
+Snowflake external stage use one uniform layout regardless of which tool wrote
+it. `export` is the curated path (a single model version, optionally filtered by
+vocabulary/namespace); `migrate-store` mirrors the **full** store (every model
+version and all rows) for platform portability:
 
 ```bash
 uv run gpu-embed migrate-store --db embeddings.duckdb
 ```
 
-which creates:
+which creates the same partition layout under `embeddings/`:
 
 `embeddings/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
 
-Model hash provenance for mirrored store layout is stored at:
+Model hash provenance for the mirrored store layout is stored at:
 
 `embeddings/_meta/model_registry/part-*.parquet`
 
 ```bash
-uv run python -c "from pathlib import Path; print(len(list(Path('exports/parquet').glob('*/*.parquet'))))"
+uv run python -c "from pathlib import Path; print(len(list(Path('exports/parquet').glob('model_version=*/vocabulary_id=*/*.parquet'))))"
 ```
 
 If you are using `migrate-store` on a large dataset, throughput may slow as
@@ -107,9 +111,10 @@ Expected layout (export flow):
 
 ```text
 s3://<your-bucket>/concept_embeddings/
-  SNOMED/part-00000.parquet
-  LOINC/part-00000.parquet
-  _null/part-00000.parquet
+  model_version=<sha256>/
+    vocabulary_id=SNOMED/part-00000.parquet
+    vocabulary_id=LOINC/part-00000.parquet
+    vocabulary_id=_null/part-00000.parquet
 ```
 
 ### Optional: curated export flow

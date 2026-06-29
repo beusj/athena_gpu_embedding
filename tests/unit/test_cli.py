@@ -678,7 +678,7 @@ def test_migrate_store_invokes_store_initialization(monkeypatch, tmp_path: Path)
     assert "ensure" in calls
 
 
-def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
+def test_export_writes_sharded_parquet_by_model_and_vocabulary(tmp_path: Path) -> None:
     runner = CliRunner()
     db_path = tmp_path / "embeddings.duckdb"
     out_dir = tmp_path / "parquet"
@@ -757,8 +757,9 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
 
-    snomed_files = sorted((out_dir / "SNOMED").glob("*.parquet"))
-    loinc_files = sorted((out_dir / "LOINC").glob("*.parquet"))
+    model_dir = out_dir / "model_version=v1"
+    snomed_files = sorted((model_dir / "vocabulary_id=SNOMED").glob("*.parquet"))
+    loinc_files = sorted((model_dir / "vocabulary_id=LOINC").glob("*.parquet"))
 
     assert len(snomed_files) == 2
     assert len(loinc_files) == 1
@@ -768,11 +769,11 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
     verify_conn = connect()
     snomed_count = verify_conn.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
-        [str(out_dir / "SNOMED" / "*.parquet")],
+        [str(model_dir / "vocabulary_id=SNOMED" / "*.parquet")],
     ).fetchone()
     loinc_count = verify_conn.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
-        [str(out_dir / "LOINC" / "*.parquet")],
+        [str(model_dir / "vocabulary_id=LOINC" / "*.parquet")],
     ).fetchone()
     verify_conn.close()
 

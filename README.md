@@ -405,7 +405,7 @@ Shows mappings between `model_version` hashes and model metadata, including
 | `--backfill-from-logs` | false | Parse `GPU_EMBED_LOG_DIR` logs for model/revision lines and upsert derived hash mappings |
 | `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
 
-### `export` — write sharded parquet by vocabulary directory
+### `export` — write Hive-partitioned parquet by model and vocabulary
 
 ```
 gpu-embed export [OPTIONS] OUTPUT_DIR
@@ -413,9 +413,15 @@ gpu-embed export [OPTIONS] OUTPUT_DIR
 
 Exports rows from `concept_embeddings` into parquet files under:
 
-`OUTPUT_DIR/<vocabulary_id>/part-00000.parquet`
+`OUTPUT_DIR/model_version=<digest>/vocabulary_id=<value>/part-00000.parquet`
 
-Sharding is controlled by `--shard-rows` (rows per file).
+This mirrors the parquet store / `migrate-store` layout, so a single uniform
+Hive-partitioned layout is used everywhere (S3, Snowflake external stages).
+Because the path includes `model_version=<digest>`, exporting more than one
+model version into the same `OUTPUT_DIR` is safe — different versions land in
+separate partitions instead of colliding on `part-*.parquet` filenames.
+
+Within each partition, sharding is controlled by `--shard-rows` (rows per file).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -548,7 +554,8 @@ gpu-embed embed /data/vocab/CONCEPT.csv \
 # Show what model versions are stored and concept counts by vocabulary/domain
 gpu-embed status
 
-# Export most recent model version into sharded parquet by vocabulary directory
+# Export most recent model version into Hive-partitioned parquet
+# (model_version=<digest>/vocabulary_id=<value>/part-*.parquet)
 gpu-embed export exports/parquet --shard-rows 50000
 
 # Export only SNOMED and LOINC for a specific model version prefix
