@@ -176,8 +176,8 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 
 ### Storage model and migration
 
-- Default store path is `embeddings/` (directory).
-- Data is stored as parquet files under
+- Default store path is `embeddings.duckdb` (file) for fast local upserts.
+- Directory paths (for example `embeddings/`) use parquet-sharded storage under
   `model_version=<digest>/vocabulary_id=<value>/part-*.parquet`.
 - Model provenance is stored alongside shards under
   `_meta/model_registry/part-*.parquet` with one deduplicated row per
@@ -186,10 +186,10 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 - New shard writes default to Snappy compression for faster write throughput;
   existing shards with other codecs (for example ZSTD) remain readable and do
   not require conversion.
-- If `--db` / `GPU_EMBED_DB` points to an existing legacy `.duckdb` file,
-  rows are auto-migrated one time into a sibling parquet directory with the
-  same basename (for example `embeddings.duckdb` → `embeddings/`).
-- No manual pre-export is required for migration.
+- Use `gpu-embed export ...` as the standard Snowflake handoff path.
+- Use `gpu-embed migrate-store --db embeddings.duckdb` only when you need a
+  full parquet mirror of the local store (`embeddings/`).
+- Local embedding runs can continue to use `embeddings.duckdb` directly.
 
 #### Migration runtime notes
 
@@ -220,7 +220,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` (used when no explicit path given) |
-| `--db` | `embeddings` | Embedding store path (directory recommended; legacy `.duckdb` auto-migrates) |
+| `--db` | `embeddings.duckdb` | Embedding store path (default fast local DuckDB file; directory enables parquet store mode) |
 | `--batch-size` | `256` | Rows per GPU forward pass |
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
@@ -261,7 +261,7 @@ breakdown of embedded concept counts. No source CSV is required.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings` | Embedding store path to inspect |
+| `--db` | `embeddings.duckdb` | Embedding store path to inspect |
 | `--model-version` | _(most recent)_ | Show breakdown for the version starting with this prefix |
 
 ### `model-registry` — inspect model hash provenance
@@ -270,12 +270,15 @@ breakdown of embedded concept counts. No source CSV is required.
 gpu-embed model-registry [OPTIONS]
 ```
 
-Shows mappings between `model_version` hashes and model metadata recorded in
-`_meta/model_registry/*.parquet`.
+Shows mappings between `model_version` hashes and model metadata, including
+`model_id`, `model_revision`, `precision`, and `quantization_scheme`.
+
+- In `.duckdb` store mode, metadata is stored in the `model_registry` table.
+- In parquet store mode, metadata is stored in `_meta/model_registry/*.parquet`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings` | Embedding store path to inspect |
+| `--db` | `embeddings.duckdb` | Embedding store path to inspect |
 | `--backfill-from-logs` | false | Parse `GPU_EMBED_LOG_DIR` logs for model/revision lines and upsert derived hash mappings |
 | `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
 
@@ -294,7 +297,7 @@ Sharding is controlled by `--shard-rows` (rows per file).
 | Flag | Default | Description |
 |------|---------|-------------|
 | `OUTPUT_DIR` | _(required)_ | Destination directory for parquet output |
-| `--db` | `embeddings` | Embedding store path to export from |
+| `--db` | `embeddings.duckdb` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
@@ -321,7 +324,7 @@ When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings` | Embedding store path to compare against |
+| `--db` | `embeddings.duckdb` | Embedding store path to compare against |
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` |
 | `--model-version` | _(most recent)_ | Limit comparison to the version starting with this prefix |
 | `--show-complete` / `--gaps-only` | `show-complete` | Include or hide fully-embedded groups |
@@ -412,7 +415,7 @@ and idempotent `MERGE` are documented in:
 Quick start:
 
 ```bash
-uv run gpu-embed export exports/parquet --db embeddings --shard-rows 50000
+uv run gpu-embed export exports/parquet --db embeddings.duckdb --shard-rows 50000
 AWS_PAGER="" aws s3 sync exports/parquet s3://<your-bucket>/concept_embeddings/
 # Optional named profile: add --profile <aws-profile> or set AWS_PROFILE
 ```

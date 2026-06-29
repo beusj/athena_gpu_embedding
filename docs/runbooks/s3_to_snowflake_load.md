@@ -1,7 +1,7 @@
 # S3 to Snowflake Load Runbook
 
-This runbook covers the operational flow for moving parquet-backed embeddings
-from the local store to S3 and loading them into Snowflake.
+This runbook covers the operational flow for exporting embeddings to parquet,
+copying to S3, and loading into Snowflake.
 
 ## Scope
 
@@ -13,38 +13,44 @@ from the local store to S3 and loading them into Snowflake.
 
 ## Prerequisites
 
-- Embeddings store available (default: `embeddings/`)
+- Embeddings store available (default local source: `embeddings.duckdb`)
 - AWS CLI installed and configured (default profile or named profile)
 - S3 bucket + path chosen for parquet dataset
 - Snowflake `STORAGE INTEGRATION` with read access to the bucket path
 
-## 1) Validate local embeddings parquet store
+## 1) Export parquet handoff dataset
 
-By default, embeddings are stored as:
-
-`embeddings/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
-
-Model hash provenance is stored alongside the dataset at:
-
-`embeddings/_meta/model_registry/part-*.parquet`
+Use `export` as the standard handoff path from the local store:
 
 ```bash
-uv run gpu-embed migrate-store --db embeddings
-uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/vocabulary_id=*/*.parquet'))))"
+uv run gpu-embed export exports/parquet --db embeddings.duckdb
 ```
 
-If you are migrating from a legacy `.duckdb` file and have not migrated yet,
-run once to trigger automatic migration:
+Export output is written as:
+
+`exports/parquet/<vocabulary_id>/part-*.parquet`
+
+If you need to mirror the full store layout for platform portability, use:
 
 ```bash
 uv run gpu-embed migrate-store --db embeddings.duckdb
 ```
 
-This creates `embeddings/model_version=.../vocabulary_id=.../*.parquet` and no manual pre-export is required.
+which creates:
 
-During large migrations, throughput may slow as bigger partitions are processed.
-Treat this as expected if migration progress logs keep advancing (`partitions`,
-`rows`, `files`, `eta_minutes`).
+`embeddings/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
+
+Model hash provenance for mirrored store layout is stored at:
+
+`embeddings/_meta/model_registry/part-*.parquet`
+
+```bash
+uv run python -c "from pathlib import Path; print(len(list(Path('exports/parquet').glob('*/*.parquet'))))"
+```
+
+If you are using `migrate-store` on a large dataset, throughput may slow as
+bigger partitions are processed. Treat this as expected if migration progress
+logs keep advancing (`partitions`, `rows`, `files`, `eta_minutes`).
 
 ## 2) Authenticate to AWS CLI
 
@@ -85,7 +91,7 @@ Use `cp --recursive` for a full push:
 
 ```bash
 AWS_PAGER="" aws s3 cp \
-  --recursive embeddings \
+  --recursive exports/parquet \
   s3://<your-bucket>/concept_embeddings/
 ```
 
@@ -93,17 +99,17 @@ Use `sync` for repeat runs:
 
 ```bash
 AWS_PAGER="" aws s3 sync \
-  embeddings \
+  exports/parquet \
   s3://<your-bucket>/concept_embeddings/
 ```
 
-Expected layout:
+Expected layout (export flow):
 
 ```text
 s3://<your-bucket>/concept_embeddings/
-  model_version=<sha256>/vocabulary_id=SNOMED/part-00000.parquet
-  model_version=<sha256>/vocabulary_id=LOINC/part-00000.parquet
-  model_version=<sha256>/vocabulary_id=_null/part-00000.parquet
+  SNOMED/part-00000.parquet
+  LOINC/part-00000.parquet
+  _null/part-00000.parquet
 ```
 
 ### Optional: curated export flow
@@ -113,7 +119,7 @@ vocabulary subsets, or custom shard sizing):
 
 ```bash
 uv run gpu-embed export exports/parquet \
-  --db embeddings \
+  --db embeddings.duckdb \
   --model-version <model_version_prefix> \
   --vocabulary-id SNOMED,LOINC \
   --shard-rows 50000

@@ -14,7 +14,7 @@ class TestEmbedConfigDefaults:
         monkeypatch.delenv("GPU_EMBED_INGEST_ENGINE", raising=False)
         cfg = EmbedConfig(_env_file=None)  # type: ignore[call-arg]
         assert cfg.vocab_dir == Path("athena_vocab")
-        assert cfg.db == Path("embeddings")
+        assert cfg.db == Path("embeddings.duckdb")
         assert cfg.log_dir == Path("logs")
         assert cfg.log_max_bytes == 2 * 1024 * 1024
         assert cfg.log_max_files == 5

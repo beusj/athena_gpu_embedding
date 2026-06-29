@@ -1,7 +1,8 @@
-"""DuckDB-backed query layer over parquet-sharded embedding storage.
+"""Storage layer for local DuckDB tables and parquet-sharded stores.
 
 The DuckDB connection is opened once per CLI invocation and passed down.
-Data is persisted in parquet shards partitioned by model_version.
+`*.duckdb` paths use native DuckDB tables (fast local writes), while directory
+paths use parquet shards partitioned by model_version and vocabulary_id.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Literal
 
 import duckdb
 
-from gpu_embedder.models import EmbeddedRow
+from gpu_embedder.models import EmbeddedRow, SCHEMA_DDL
 
 logger = logging.getLogger(__name__)
 TARGET_ROWS_PER_SHARD = 250_000
@@ -28,8 +29,9 @@ MODEL_REGISTRY_SUBDIR = Path("_meta") / "model_registry"
 
 @dataclass(frozen=True)
 class _StoreContext:
-    parquet_root: Path
-    legacy_db_path: Path | None = None
+    backend: Literal["duckdb", "parquet"]
+    db_path: Path | None = None
+    parquet_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,8 @@ class ModelRegistryEntry:
     model_version: str
     model_id: str
     model_revision: str | None
+    precision: str
+    quantization_scheme: str
     recorded_at: datetime
 
 
@@ -45,14 +49,12 @@ _CONTEXTS: dict[int, _StoreContext] = {}
 
 def _resolve_paths(path: Path) -> _StoreContext:
     if path.suffix.lower() == ".duckdb":
-        parquet_root = path.with_suffix("")
-        legacy_db_path = path if path.exists() and path.is_file() else None
-        return _StoreContext(parquet_root=parquet_root, legacy_db_path=legacy_db_path)
+        return _StoreContext(backend="duckdb", db_path=path)
 
     if path.exists() and path.is_file():
         raise ValueError(f"Expected directory path for parquet store, found file: {path}")
 
-    return _StoreContext(parquet_root=path, legacy_db_path=None)
+    return _StoreContext(backend="parquet", parquet_root=path)
 
 
 def _get_context(conn: duckdb.DuckDBPyConnection) -> _StoreContext:
@@ -321,11 +323,15 @@ def _copy_relation_to_partitioned_shards(
 
 
 def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContext) -> None:
-    if ctx.legacy_db_path is None or _has_parquet_data(ctx.parquet_root):
+    if ctx.parquet_root is None:
         return
 
-    logger.info("Migrating legacy DuckDB store %s -> %s", ctx.legacy_db_path, ctx.parquet_root)
-    escaped_legacy = str(ctx.legacy_db_path).replace("'", "''")
+    legacy_db_path = ctx.parquet_root.with_suffix(".duckdb")
+    if not legacy_db_path.exists() or not legacy_db_path.is_file() or _has_parquet_data(ctx.parquet_root):
+        return
+
+    logger.info("Migrating legacy DuckDB store %s -> %s", legacy_db_path, ctx.parquet_root)
+    escaped_legacy = str(legacy_db_path).replace("'", "''")
     conn.execute(f"ATTACH '{escaped_legacy}' AS legacy (READ_ONLY)")
     try:
         has_table = conn.execute(
@@ -359,18 +365,71 @@ def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContex
 
 
 def open_db(path: Path) -> duckdb.DuckDBPyConnection:
-    """Open the DuckDB query engine for a parquet-backed store rooted at *path*."""
+    """Open storage backend for *path*.
+
+    - ``*.duckdb`` paths use native DuckDB table-backed storage (fast local writes).
+    - Directory paths use parquet-sharded storage with DuckDB as query layer.
+    """
     ctx = _resolve_paths(path)
-    ctx.parquet_root.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(":memory:")
+
+    if ctx.backend == "duckdb":
+        assert ctx.db_path is not None
+        ctx.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = duckdb.connect(str(ctx.db_path))
+        logger.info("Opened duckdb-backed store at %s", ctx.db_path)
+    else:
+        assert ctx.parquet_root is not None
+        ctx.parquet_root.mkdir(parents=True, exist_ok=True)
+        conn = duckdb.connect(":memory:")
+        logger.info("Opened parquet-backed store at %s", ctx.parquet_root)
+
     _CONTEXTS[id(conn)] = ctx
-    logger.info("Opened parquet-backed store at %s", ctx.parquet_root)
     return conn
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """Ensure view-backed schema over parquet shards (idempotent)."""
+    """Ensure schema for active backend (idempotent)."""
     ctx = _get_context(conn)
+
+    if ctx.backend == "duckdb":
+        conn.execute(SCHEMA_DDL)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_registry (
+                model_version VARCHAR PRIMARY KEY,
+                model_id VARCHAR NOT NULL,
+                model_revision VARCHAR,
+                precision VARCHAR NOT NULL,
+                quantization_scheme VARCHAR NOT NULL,
+                recorded_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            ALTER TABLE model_registry
+            ADD COLUMN IF NOT EXISTS precision VARCHAR DEFAULT 'fp32'
+            """
+        )
+        conn.execute(
+            """
+            ALTER TABLE model_registry
+            ADD COLUMN IF NOT EXISTS quantization_scheme VARCHAR DEFAULT 'none'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE model_registry
+            SET
+                precision = COALESCE(precision, 'fp32'),
+                quantization_scheme = COALESCE(quantization_scheme, 'none')
+            WHERE precision IS NULL OR quantization_scheme IS NULL
+            """
+        )
+        logger.debug("DuckDB-backed schema ensured")
+        return
+
+    assert ctx.parquet_root is not None
     ctx.parquet_root.mkdir(parents=True, exist_ok=True)
     _migrate_legacy_if_needed(conn, ctx)
     _refresh_view(conn, ctx.parquet_root)
@@ -398,6 +457,8 @@ def _append_rows_as_parquet_shards(
         return
 
     ctx = _get_context(conn)
+    if ctx.parquet_root is None:
+        raise RuntimeError("Parquet root not available for parquet append")
     conn.execute("DROP TABLE IF EXISTS temp_embeddings")
     conn.execute(
         """
@@ -485,6 +546,52 @@ def upsert_rows(
     if mode not in {"ndjson", "direct"}:
         raise ValueError(f"Unsupported write mode: {mode}")
 
+    if not rows:
+        logger.info("Upserted 0 rows in total (mode=%s)", mode)
+        return
+
+    ctx = _get_context(conn)
+
+    if ctx.backend == "duckdb":
+        records = [
+            (
+                r.concept.concept_id,
+                r.concept.concept_name,
+                r.concept.domain_id,
+                r.concept.vocabulary_id,
+                r.concept.concept_class_id,
+                r.concept.standard_concept,
+                r.concept.concept_code,
+                r.concept.invalid_reason,
+                r.embedding,
+                r.embed_text,
+                r.model_version,
+                r.embedded_at,
+            )
+            for r in rows
+        ]
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO concept_embeddings (
+                concept_id,
+                concept_name,
+                domain_id,
+                vocabulary_id,
+                concept_class_id,
+                standard_concept,
+                concept_code,
+                invalid_reason,
+                embedding,
+                embed_text,
+                model_version,
+                embedded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            records,
+        )
+        logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
+        return
+
     _append_rows_as_parquet_shards(conn, rows, refresh_view=refresh_view)
 
     logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
@@ -505,6 +612,8 @@ def upsert_model_registry(
     model_version: str,
     model_id: str,
     model_revision: str | None,
+    precision: str = "fp32",
+    quantization_scheme: str = "none",
 ) -> None:
     """Upsert model provenance metadata alongside parquet embeddings.
 
@@ -512,6 +621,31 @@ def upsert_model_registry(
     and deduplicated by ``model_version``.
     """
     ctx = _get_context(conn)
+
+    if ctx.backend == "duckdb":
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO model_registry (
+                model_version,
+                model_id,
+                model_revision,
+                precision,
+                quantization_scheme,
+                recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                model_version,
+                model_id,
+                model_revision,
+                precision,
+                quantization_scheme,
+                datetime.now(tz=UTC),
+            ],
+        )
+        return
+
+    assert ctx.parquet_root is not None
     registry_dir = _registry_dir(ctx.parquet_root)
     registry_dir.mkdir(parents=True, exist_ok=True)
 
@@ -523,6 +657,8 @@ def upsert_model_registry(
             model_version VARCHAR,
             model_id VARCHAR,
             model_revision VARCHAR,
+            precision VARCHAR,
+            quantization_scheme VARCHAR,
             recorded_at TIMESTAMP
         )
         """
@@ -533,10 +669,12 @@ def upsert_model_registry(
             model_version,
             model_id,
             model_revision,
+            precision,
+            quantization_scheme,
             recorded_at
-        ) VALUES (?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?)
         """,
-        [model_version, model_id, model_revision, now],
+        [model_version, model_id, model_revision, precision, quantization_scheme, now],
     )
 
     registry_files = _registry_files(ctx.parquet_root)
@@ -548,6 +686,8 @@ def upsert_model_registry(
                 model_version,
                 model_id,
                 model_revision,
+                COALESCE(precision, 'fp32') AS precision,
+                COALESCE(quantization_scheme, 'none') AS quantization_scheme,
                 CAST(recorded_at AS TIMESTAMP) AS recorded_at
             FROM read_parquet(
                 '__REGISTRY_PATTERN__',
@@ -566,6 +706,8 @@ def upsert_model_registry(
                 CAST(NULL AS VARCHAR) AS model_version,
                 CAST(NULL AS VARCHAR) AS model_id,
                 CAST(NULL AS VARCHAR) AS model_revision,
+                CAST(NULL AS VARCHAR) AS precision,
+                CAST(NULL AS VARCHAR) AS quantization_scheme,
                 CAST(NULL AS TIMESTAMP) AS recorded_at
             WHERE FALSE
             """
@@ -578,12 +720,16 @@ def upsert_model_registry(
             model_version,
             model_id,
             model_revision,
+            precision,
+            quantization_scheme,
             recorded_at
         FROM (
             SELECT
                 model_version,
                 model_id,
                 model_revision,
+                precision,
+                quantization_scheme,
                 recorded_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY model_version
@@ -610,6 +756,8 @@ def upsert_model_registry(
                 model_version,
                 model_id,
                 model_revision,
+                precision,
+                quantization_scheme,
                 recorded_at
             FROM temp_model_registry_merged
             ORDER BY model_version
@@ -626,6 +774,34 @@ def upsert_model_registry(
 def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEntry]:
     """Return model registry entries stored alongside parquet shards."""
     ctx = _get_context(conn)
+
+    if ctx.backend == "duckdb":
+        rows = conn.execute(
+            """
+            SELECT
+                model_version,
+                model_id,
+                model_revision,
+                COALESCE(precision, 'fp32') AS precision,
+                COALESCE(quantization_scheme, 'none') AS quantization_scheme,
+                CAST(recorded_at AS TIMESTAMP) AS recorded_at
+            FROM model_registry
+            ORDER BY CAST(recorded_at AS TIMESTAMP) DESC, model_version
+            """
+        ).fetchall()
+        return [
+            ModelRegistryEntry(
+                model_version=str(row[0]),
+                model_id=str(row[1]),
+                model_revision=str(row[2]) if row[2] is not None else None,
+                precision=str(row[3]),
+                quantization_scheme=str(row[4]),
+                recorded_at=row[5],
+            )
+            for row in rows
+        ]
+
+    assert ctx.parquet_root is not None
     if not _registry_files(ctx.parquet_root):
         return []
 
@@ -635,12 +811,16 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
             model_version,
             model_id,
             model_revision,
+            COALESCE(precision, 'fp32') AS precision,
+            COALESCE(quantization_scheme, 'none') AS quantization_scheme,
             CAST(recorded_at AS TIMESTAMP) AS recorded_at
         FROM (
             SELECT
                 model_version,
                 model_id,
                 model_revision,
+                precision,
+                quantization_scheme,
                 recorded_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY model_version
@@ -662,7 +842,9 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
             model_version=str(row[0]),
             model_id=str(row[1]),
             model_revision=str(row[2]) if row[2] is not None else None,
-            recorded_at=row[3],
+            precision=str(row[3]),
+            quantization_scheme=str(row[4]),
+            recorded_at=row[5],
         )
         for row in rows
     ]

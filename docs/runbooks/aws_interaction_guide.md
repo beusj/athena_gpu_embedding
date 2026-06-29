@@ -19,23 +19,24 @@ Data export and warehouse loading steps remain in:
 
 - `docs/runbooks/s3_to_snowflake_load.md`
 
-## Migration and store checklist (one-time)
+## Store and export checklist
 
-Before using downstream S3/Snowflake loading flows, ensure local storage is in
-parquet store format.
+For downstream S3/Snowflake loading flows, use `export` as the default handoff.
+Only use `migrate-store` when you explicitly need a full parquet mirror of the
+local `.duckdb` store.
 
 ```bash
-# Recommended default store path
-uv run gpu-embed migrate-store --db embeddings
+# Default local fast-write store
+uv run gpu-embed status --db embeddings.duckdb
 
-# If migrating from legacy DuckDB, trigger one-time auto-migration
+# Standard Snowflake handoff artifact
+uv run gpu-embed export exports/parquet --db embeddings.duckdb
+
+# Optional: full parquet mirror materialization from local DuckDB
 uv run gpu-embed migrate-store --db embeddings.duckdb
-
-# Verify parquet shards exist
-uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/vocabulary_id=*/*.parquet'))))"
 ```
 
-After migration, sync `embeddings/` directly to S3 as the default path.
+After export, sync `exports/parquet/` directly to S3 as the default path.
 
 Expected migration behavior:
 

@@ -398,6 +398,8 @@ def embed_cmd(
         model_version=model_version,
         model_id=cfg.model,
         model_revision=cfg.model_revision,
+        precision="fp32",
+        quantization_scheme="none",
     )
 
     skip_ids: set[int] = set()
@@ -589,7 +591,7 @@ def migrate_store_cmd(
         shutil.move(str(store_root), str(backup_dir))
         typer.echo(f"Moved existing store to backup: {backup_dir}")
 
-    conn = st.open_db(cfg.db)
+    conn = st.open_db(store_root)
     st.ensure_schema(conn)
 
     if cfg.db.suffix.lower() == ".duckdb":
@@ -963,6 +965,8 @@ def model_registry_cmd(
                     model_version=model_version,
                     model_id=model_id,
                     model_revision=revision,
+                    precision="fp32",
+                    quantization_scheme="none",
                 )
                 added += 1
 
@@ -978,14 +982,18 @@ def model_registry_cmd(
     typer.echo(f"\nStore: {cfg.db}")
     typer.echo(f"Registry source: {cfg.db}/_meta/model_registry")
     typer.echo()
-    typer.echo(f"{'MODEL VERSION':18}  {'RECORDED AT':20}  {'REVISION':12}  MODEL ID")
-    typer.echo("-" * 100)
+    typer.echo(
+        f"{'MODEL VERSION':18}  {'RECORDED AT':20}  {'REVISION':12}  {'PRECISION':9}  {'QUANT':9}  MODEL ID"
+    )
+    typer.echo("-" * 132)
     for row in rows:
         revision_label = row.model_revision or "default"
         typer.echo(
             f"{row.model_version[:16]}…  "
             f"{row.recorded_at.strftime('%Y-%m-%d %H:%M'):20}  "
             f"{revision_label[:12]:12}  "
+            f"{row.precision[:9]:9}  "
+            f"{row.quantization_scheme[:9]:9}  "
             f"{row.model_id}"
         )
     typer.echo()

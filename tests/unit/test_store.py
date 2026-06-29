@@ -51,12 +51,12 @@ class TestOpenDb:
         assert store_path.is_dir()
         conn.close()
 
-    def test_duckdb_suffix_maps_to_directory_root(self, tmp_path: Path) -> None:
-        legacy_style_path = tmp_path / "nested" / "store.duckdb"
-        conn = open_db(legacy_style_path)
+    def test_duckdb_suffix_uses_native_db_file(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "nested" / "store.duckdb"
+        conn = open_db(db_path)
         ensure_schema(conn)
-        assert legacy_style_path.with_suffix("").exists()
-        assert legacy_style_path.with_suffix("").is_dir()
+        assert db_path.exists()
+        assert db_path.is_file()
         conn.close()
 
 
@@ -75,7 +75,7 @@ class TestEnsureSchema:
         ensure_schema(conn)
         ensure_schema(conn)  # should not raise
 
-    def test_migrates_legacy_duckdb_table(self, tmp_path: Path) -> None:
+    def test_migrates_legacy_duckdb_table_when_opening_parquet_root(self, tmp_path: Path) -> None:
         legacy_path = tmp_path / "legacy.duckdb"
         legacy = duckdb.connect(str(legacy_path))
         legacy.execute(SCHEMA_DDL)
@@ -105,7 +105,7 @@ class TestEnsureSchema:
         )
         legacy.close()
 
-        conn = open_db(legacy_path)
+        conn = open_db(legacy_path.with_suffix(""))
         ensure_schema(conn)
         assert get_existing_ids(conn, "v1") == {101}
         migrated_files = list((legacy_path.with_suffix("")).glob("model_version=*/**/*.parquet"))
@@ -245,7 +245,7 @@ class TestModelRegistry:
 
         rows = conn.execute(
             """
-            SELECT model_version, model_id, model_revision
+            SELECT model_version, model_id, model_revision, precision, quantization_scheme
             FROM read_parquet(?, union_by_name=true)
             """,
             [str((store_root / "_meta" / "model_registry" / "*.parquet").as_posix())],
@@ -256,6 +256,8 @@ class TestModelRegistry:
                 "abc123",
                 "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
                 "090663c3",
+                "fp32",
+                "none",
             )
         ]
 
@@ -279,13 +281,13 @@ class TestModelRegistry:
 
         rows = conn.execute(
             """
-            SELECT model_version, model_id, model_revision
+            SELECT model_version, model_id, model_revision, precision, quantization_scheme
             FROM read_parquet(?, union_by_name=true)
             """,
             [str((store_root / "_meta" / "model_registry" / "*.parquet").as_posix())],
         ).fetchall()
 
-        assert rows == [("abc123", "model/two", "rev2")]
+        assert rows == [("abc123", "model/two", "rev2", "fp32", "none")]
 
     def test_list_model_registry_returns_latest_rows(self, tmp_path: Path) -> None:
         conn = open_db(tmp_path / "embeddings")
@@ -312,3 +314,5 @@ class TestModelRegistry:
         v2_row = next(r for r in rows if r.model_version == "v2")
         assert v2_row.model_id == "model/two"
         assert v2_row.model_revision is None
+        assert v2_row.precision == "fp32"
+        assert v2_row.quantization_scheme == "none"

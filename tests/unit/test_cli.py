@@ -254,6 +254,8 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
         model_version: str,
         model_id: str,
         model_revision: str | None,
+        precision: str = "fp32",
+        quantization_scheme: str = "none",
     ) -> None:
         return None
 
@@ -370,7 +372,7 @@ def test_migrate_store_invokes_store_initialization(monkeypatch, tmp_path: Path)
     result = runner.invoke(app, ["migrate-store", "--db", str(tmp_path / "legacy.duckdb")])
 
     assert result.exit_code == 0
-    assert calls[0].startswith("open:")
+    assert calls[0] == f"open:{tmp_path / 'legacy'}"
     assert "ensure" in calls
 
 
