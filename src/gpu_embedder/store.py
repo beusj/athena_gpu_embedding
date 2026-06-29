@@ -598,45 +598,47 @@ def classify_rows_requiring_embedding(
     if not rows:
         return ([], 0, 0, 0)
 
-    namespaces = [row.namespace for row in rows]
-    concept_ids = [row.concept_id for row in rows]
-    embed_texts = [candidate_texts[row.concept_id] for row in rows]
-    conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
-    conn.execute(
-        """
-        CREATE TEMP TABLE _candidate_embed_texts (
-            namespace VARCHAR,
-            concept_id BIGINT,
-            embed_text VARCHAR
-        )
-        """
+    # Register the candidate (namespace, concept_id, embed_text) columns as an
+    # Arrow table and join directly.  Passing the columns as `unnest(?::T[])`
+    # array params is ~quadratic in DuckDB (tens of seconds at a few hundred
+    # thousand rows); Arrow registration is columnar and near-instant.
+    logger.info("classify_rows_requiring_embedding: building candidate table (%d rows)", len(rows))
+    candidate_arrow = pa.table(
+        {
+            "namespace": pa.array([row.namespace for row in rows], type=pa.string()),
+            "concept_id": pa.array([row.concept_id for row in rows], type=pa.int64()),
+            "embed_text": pa.array(
+                [candidate_texts[row.concept_id] for row in rows], type=pa.string()
+            ),
+        }
     )
-    # Use array unnest instead of executemany to avoid per-row Python→DuckDB
-    # overhead, which is severe for millions of concepts.
-    conn.execute(
-        "INSERT INTO _candidate_embed_texts"
-        " SELECT unnest(?::VARCHAR[]), unnest(?::BIGINT[]), unnest(?::VARCHAR[])",
-        [namespaces, concept_ids, embed_texts],
+    conn.register("_candidate_embed_texts", candidate_arrow)
+    logger.info(
+        "classify_rows_requiring_embedding: joining candidates against stored "
+        "embeddings (model_version=%s)…",
+        model_version[:8],
     )
-    result = conn.execute(
-        """
-        SELECT
-            c.namespace,
-            c.concept_id,
-            CASE
-                WHEN e.concept_id IS NULL THEN 'new'
-                WHEN e.embed_text IS DISTINCT FROM c.embed_text THEN 'changed'
-                ELSE 'unchanged'
-            END AS status
-        FROM _candidate_embed_texts c
-        LEFT JOIN concept_embeddings e
-          ON e.namespace = c.namespace
-         AND e.concept_id = c.concept_id
-         AND e.model_version = ?
-        """,
-        [model_version],
-    ).fetchall()
-    conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
+    try:
+        result = conn.execute(
+            """
+            SELECT
+                c.namespace,
+                c.concept_id,
+                CASE
+                    WHEN e.concept_id IS NULL THEN 'new'
+                    WHEN e.embed_text IS DISTINCT FROM c.embed_text THEN 'changed'
+                    ELSE 'unchanged'
+                END AS status
+            FROM _candidate_embed_texts c
+            LEFT JOIN concept_embeddings e
+              ON e.namespace = c.namespace
+             AND e.concept_id = c.concept_id
+             AND e.model_version = ?
+            """,
+            [model_version],
+        ).fetchall()
+    finally:
+        conn.unregister("_candidate_embed_texts")
 
     status_by_key = {(str(row[0]), int(row[1])): str(row[2]) for row in result}
     need_embed = {

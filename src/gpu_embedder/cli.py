@@ -549,6 +549,10 @@ def embed_cmd(
     if cfg.force:
         to_embed = filtered
     else:
+        typer.echo(
+            f"Detecting which of {len(filtered)} concept(s) need embedding "
+            f"(namespace={cfg.namespace}) …"
+        )
         # Fast path for the common single-field default avoids the per-row
         # build_embed_text call overhead across millions of rows.
         if cfg.text_fields == ["concept_name"]:
