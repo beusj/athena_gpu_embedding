@@ -33,4 +33,5 @@ uv pip install "torch>=2.3"
 uv pip install --no-deps -e .
 uv pip install \
   duckdb typer pydantic pydantic-settings python-dotenv transformers tqdm numpy pyarrow \
+  pylance \
   pytest pytest-cov pytest-asyncio ruff mypy

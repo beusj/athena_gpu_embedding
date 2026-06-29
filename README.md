@@ -3,7 +3,8 @@
 Batch-embed OHDSI Athena concept CSVs with a biomedical embedding model
 (SapBERT by default; configurable — see
 [Choosing an embedding model](#choosing-an-embedding-model)) in FP32 on a GPU,
-persisting the vectors to a local DuckDB table (`embeddings.duckdb` by default).
+persisting the vectors to a local Lance store (`embeddings.lance` by default; a
+`.duckdb` path selects the native DuckDB table backend instead).
 Already-embedded concepts are skipped unless `--force` is passed, so runs are
 safe to restart or extend incrementally.
 
@@ -30,10 +31,11 @@ safe to restart or extend incrementally.
    by default, configurable via `--model` (see
    [Choosing an embedding model](#choosing-an-embedding-model)) — running in FP32
    on a CUDA GPU (falls back to CPU when no GPU is available, but will be slow).
-4. **Writes** each concept's vector plus its metadata into a local DuckDB table
-  (`embeddings.duckdb` by default). A directory path instead selects the opt-in
-  parquet-sharded store, a migration/export artifact rather than the recommended
-  live store (see [Storage model and migration](#storage-model-and-migration)).
+4. **Writes** each concept's vector plus its metadata into a local Lance store
+  (`embeddings.lance` by default). A `.duckdb` path instead selects the native
+  DuckDB table backend; a directory path selects the parquet-sharded store, a
+  migration/export artifact rather than a live store (see
+  [Storage model and migration](#storage-model-and-migration)).
 5. **Skips** rows whose `(namespace, concept_id, model_version)` key already
    exists in the store. Pass `--force` to re-embed unconditionally.
 
@@ -57,7 +59,7 @@ gpu_embedding/
 │       ├── models.py       # Pydantic row models + contracts
 │       ├── ingest.py       # DuckDB-backed CSV scan + filter → ConceptRow records
 │       ├── embed.py        # FP32 tokenize + forward pass (CLS-pooled, L2-normalized)
-│       └── store.py        # native DuckDB table store (+ optional parquet shards & query view)
+│       └── store.py        # Lance (default) / DuckDB / parquet store backends + query view
 └── tests/
     ├── unit/
     └── integration/
@@ -243,6 +245,8 @@ gpu-embed model-registry [OPTIONS]           — show hash -> model/revision map
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
 gpu-embed cleanup   [OPTIONS]                — delete embeddings for a model/vocabularies
 gpu-embed migrate-store [OPTIONS]            — materialize/initialize the parquet store
+gpu-embed migrate-lance [OPTIONS]            — migrate a legacy .duckdb store into a Lance store
+gpu-embed compact   [OPTIONS]                — compact a Lance store + prune old versions
 gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 ```
 
@@ -250,20 +254,81 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 
 ### Storage model and migration
 
-- Default store path is `embeddings.duckdb` (file) for fast local upserts.
-- Directory paths (for example `embeddings/`) use parquet-sharded storage under
-  `model_version=<digest>/vocabulary_id=<value>/part-*.parquet`.
-- Model provenance is stored alongside shards under
+The backend is chosen by the `--db` path suffix:
+
+- **`.lance` (default, `embeddings.lance`):** an embedded, ACID, versioned Lance
+  store — the recommended live store (details in the Lance section below).
+- **`.duckdb` (for example `embeddings.duckdb`):** the native DuckDB
+  single-writer table; fast local upserts but no cross-process concurrency. The
+  prior default, still fully supported — migrate one into Lance with
+  `gpu-embed migrate-lance` (see [Migrating an existing DuckDB store](#migrating-an-existing-duckdb-store-to-lance)).
+- **a directory (for example `embeddings/`):** parquet-sharded storage under
+  `model_version=<digest>/vocabulary_id=<value>/part-*.parquet` — a
+  migration/export artifact, not a live write store.
+
+- Model provenance is stored alongside the Lance/parquet data under
   `_meta/model_registry/part-*.parquet` with one deduplicated row per
   `model_version` (`model_id`, `model_revision`, `recorded_at`).
-- `concept_embeddings` is exposed as a DuckDB view for all reads and exports.
+- `concept_embeddings` is exposed as a DuckDB relation (a real table for
+  `.duckdb`; a view over the dataset for Lance/parquet) for all reads and exports.
 - New shard writes default to Snappy compression for faster write throughput;
   existing shards with other codecs (for example ZSTD) remain readable and do
   not require conversion.
 - Use `gpu-embed export ...` as the standard Snowflake handoff path.
 - Use `gpu-embed migrate-store --db embeddings.duckdb` only when you need a
-  full parquet mirror of the local store (`embeddings/`).
-- Local embedding runs can continue to use `embeddings.duckdb` directly.
+  full parquet mirror of a DuckDB store (`embeddings/`).
+
+#### Lance backend (default)
+
+Lance is the default store: an embedded, ACID, versioned store whose
+`merge_insert` upserts are **O(changes)** (deletion vectors), so a scattered
+re-embed rewrites only the changed rows, not the whole partition. It also lets
+`embed` (intermittent writes) and `export` / `status` run **concurrently across
+processes** — which a single `.duckdb` file cannot, since it holds an exclusive
+lock. This is the adopted live store for the ACID + concurrency requirement (see
+`docs/adr_lance_store_proposal.md`). `pylance` is a base dependency, so a normal
+install (`uv sync`) already has it.
+
+- **A `.lance` store is a container directory:**
+  - `<store>.lance/concept_embeddings.lance/` — the Lance dataset (the vectors).
+  - `<store>.lance/_meta/model_registry/` — model provenance (parquet, same
+    layout as the parquet store).
+  - `<store>.lance/_meta/meta.duckdb` — a small DuckDB **sidecar** holding the
+    CSV-fingerprint and weight-hash caches. They let `embed` skip unchanged CSVs
+    and avoid re-hashing the ~440 MB weights file each run; the Lance store's own
+    query connection is in-memory, so the sidecar is what persists them across
+    runs. Lance maintenance (compact/cleanup) never touches it.
+  - `concept_embeddings` is exposed as a DuckDB view for all reads/exports.
+- **Maintenance:** `gpu-embed compact --db embeddings.lance` bin-packs fragments
+  and prunes old versions. Reads are correct *without* compaction (deletion
+  vectors already dedupe), so it is optional — but Lance retains old versions
+  until pruned, so schedule it (or run it after an `embed`) to bound disk. It is
+  a writer: never run it concurrently with a live `embed`.
+- **Snowflake handoff unchanged:** `gpu-embed export` still emits plain sharded
+  parquet regardless of backend.
+
+##### Migrating an existing DuckDB store to Lance
+
+If you have an existing `embeddings.duckdb` from before Lance became the default,
+note that the default now points new runs at a fresh, empty `embeddings.lance`.
+Carry the data over once with a deliberate cutover:
+
+```bash
+# 1. Stream the legacy table into the new default store (re-runnable; --reset
+#    moves an existing .lance aside before re-migrating).
+gpu-embed migrate-lance --db embeddings.lance --from embeddings.duckdb
+
+# 2. From here on, embed/status/export default to embeddings.lance.
+gpu-embed status --db embeddings.lance
+```
+
+The migration copies the embeddings, not the fingerprint/weight-hash caches, so
+the **first** post-migration `embed` re-hashes the weights once and re-reads the
+source CSVs once — but it re-embeds nothing (the migrated rows already satisfy
+the change check) and it populates the sidecar, so subsequent runs skip again.
+To keep using DuckDB instead, set `GPU_EMBED_DB=embeddings.duckdb` (or pass
+`--db embeddings.duckdb`); the backend is fully supported, just no longer the
+default.
 
 #### Migration runtime notes
 
@@ -324,7 +389,7 @@ That path uses a source adapter rather than the Athena `CONCEPT.csv` ingest.
 |------|---------|-------------|
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` (used when no explicit path given) |
 | `--source-parquet` | _(none)_ | Source-concept parquet file or directory to embed instead of Athena CSV |
-| `--db` | `embeddings.duckdb` | Embedding store path (default fast local DuckDB file; directory enables parquet store mode) |
+| `--db` | `embeddings.lance` | Embedding store path. `.lance` = Lance store (ACID + cross-process readers, default); `.duckdb` = native DuckDB single-writer file; a directory = parquet store mode |
 | `--batch-size` | `256` | Rows per GPU forward pass |
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
@@ -427,7 +492,7 @@ breakdown of embedded concept counts. No source CSV is required.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings.duckdb` | Embedding store path to inspect |
+| `--db` | `embeddings.lance` | Embedding store path to inspect |
 | `--model-version` | _(most recent)_ | Show breakdown for the version starting with this prefix |
 
 ### `model-registry` — inspect model hash provenance
@@ -444,7 +509,7 @@ Shows mappings between `model_version` hashes and model metadata, including
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings.duckdb` | Embedding store path to inspect |
+| `--db` | `embeddings.lance` | Embedding store path to inspect |
 | `--backfill-from-logs` | false | Parse `GPU_EMBED_LOG_DIR` logs for model/revision lines and upsert derived hash mappings |
 | `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
 
@@ -476,7 +541,7 @@ Within each partition, sharding is controlled by `--shard-rows` (rows per file).
 | Flag | Default | Description |
 |------|---------|-------------|
 | `OUTPUT_DIR` | _(required)_ | Destination directory for parquet output |
-| `--db` | `embeddings.duckdb` | Embedding store path to export from |
+| `--db` | `embeddings.lance` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
 | `--pooling` | _(none)_ | Disambiguate by pooling (`cls` or `mean`); required when the selection matches both |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
@@ -505,7 +570,7 @@ When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings.duckdb` | Embedding store path to compare against |
+| `--db` | `embeddings.lance` | Embedding store path to compare against |
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` |
 | `--model-version` | _(most recent)_ | Limit comparison to the version starting with this prefix |
 | `--show-complete` / `--gaps-only` | `show-complete` | Include or hide fully-embedded groups |
@@ -539,7 +604,7 @@ was fully ingested). When a model version is left with zero embeddings, its
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings.duckdb` | Embedding store path to clean up |
+| `--db` | `embeddings.lance` | Embedding store path to clean up |
 | `--model-version` | _(interactive)_ | Model version hash prefix to delete (must match exactly one) |
 | `--vocabulary-id` | _(interactive)_ | Vocabulary IDs to delete (repeatable or comma-delimited) |
 | `--all-vocabularies` | `false` | Delete every vocabulary for the model version |
@@ -656,9 +721,9 @@ AWS_PAGER="" aws s3 sync exports/parquet s3://<your-bucket>/concept_embeddings/
 
 ## Logical schema
 
-The default store is a native DuckDB table named `concept_embeddings` (in the
-opt-in parquet store mode the same columns are exposed through a DuckDB view of
-that name). Logical columns:
+All backends expose the same `concept_embeddings` relation — a DuckDB view over
+the dataset for the default Lance store and the parquet store, and a real DuckDB
+table for the `.duckdb` backend. Logical columns:
 
 ```sql
 CREATE TABLE concept_embeddings (
@@ -703,7 +768,7 @@ so an empty `.env` is valid for local GPU runs against `athena_vocab/`.
 # Paths
 GPU_EMBED_VOCAB_DIR=athena_vocab
 GPU_EMBED_SOURCE_PARQUET=source_concepts/
-GPU_EMBED_DB=embeddings.duckdb   # native DuckDB table (default); a directory path selects the parquet store
+GPU_EMBED_DB=embeddings.lance    # Lance store (default); .duckdb = native DuckDB table; a directory = parquet store
 
 # Model (see "Choosing an embedding model"; e.g. FremyCompany/BioLORD-2023)
 GPU_EMBED_MODEL=cambridgeltl/SapBERT-from-PubMedBERT-fulltext
