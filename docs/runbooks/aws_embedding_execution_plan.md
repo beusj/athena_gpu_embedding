@@ -475,7 +475,8 @@ Current state:
 
 - `gpu_embedding` stores a raw SHA-256 digest of weight files as `model_version`.
 - `llm_concept_mapping` expects a namespaced version string format:
-  `sapbert-<backend>-<quantization>-<digest10>`.
+  `<model>-<backend>-<quantization>-<digest10>`, where `<model>` is a short
+  slug derived from the embedding model (e.g. `sapbert`, `biolord-2023`).
 
 Recommendation:
 
@@ -494,11 +495,13 @@ Canonical digest input (pinned attributes, sorted JSON):
 
 Canonical ID format:
 
-- `sapbert-<backend>-<quantization>-<sha256(pinned_attributes_json)[:10]>`
+- `<model>-<backend>-<quantization>-<sha256(pinned_attributes_json)[:10]>`,
+  where `<model>` is a slug derived from `model_name`.
 
-For current GPU embedder defaults, likely namespace example:
+Examples by model (with `torch` / `fp32` defaults):
 
-- `sapbert-torch-fp32-<digest10>`
+- SapBERT (default): `sapbert-torch-fp32-<digest10>`
+- BioLORD-2023: `biolord-2023-torch-fp32-<digest10>`
 
 Transition strategy:
 
