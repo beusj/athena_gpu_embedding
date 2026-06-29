@@ -627,8 +627,9 @@ def embed_cmd(
     typer.echo(f"Embedding phase: {total_embed_seconds:.2f}s for {total_embedded} rows.")
     typer.echo(f"Write phase: {total_write_seconds:.2f}s for {total_embedded} rows.")
 
-    # Refresh logical view once after all checkpoint shards are written.
-    st.ensure_schema(conn)
+    # Refresh logical view once after all checkpoint shards are written
+    # (no-op for the duckdb backend).
+    st.refresh_view(conn)
 
     total = st.count_rows(conn, model_version, namespace=cfg.namespace)
     typer.echo(

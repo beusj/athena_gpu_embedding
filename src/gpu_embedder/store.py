@@ -569,6 +569,20 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     logger.debug("Parquet-backed schema ensured")
 
 
+def refresh_view(conn: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild the logical concept_embeddings view over the parquet shards.
+
+    Call after writing shards with ``refresh_view=False`` so the view reflects
+    them. No-op for the duckdb backend, which writes a real table rather than a
+    view (so there is nothing to refresh).
+    """
+    ctx = _get_context(conn)
+    if ctx.backend != "parquet":
+        return
+    assert ctx.parquet_root is not None
+    _refresh_view(conn, ctx.parquet_root)
+
+
 def classify_rows_requiring_embedding(
     conn: duckdb.DuckDBPyConnection,
     rows: list[ConceptRow],
