@@ -220,29 +220,48 @@ def _copy_relation_to_partitioned_shards(
         )
         partition_dir.mkdir(parents=True, exist_ok=True)
         shard_count = ceil(partition_row_count / TARGET_ROWS_PER_SHARD)
+        conn.execute("DROP TABLE IF EXISTS temp_partition_ranked")
+        conn.execute(
+            f"""
+            CREATE TEMP TABLE temp_partition_ranked AS
+            SELECT
+                concept_id,
+                concept_name,
+                domain_id,
+                vocabulary_id,
+                concept_class_id,
+                standard_concept,
+                concept_code,
+                invalid_reason,
+                embedding,
+                embed_text,
+                model_version,
+                embedded_at,
+                ROW_NUMBER() OVER (ORDER BY concept_id) AS rn
+            FROM {source_relation}
+            WHERE model_version = ?
+              AND (
+                    (? = ? AND vocabulary_id IS NULL)
+                    OR vocabulary_id = ?
+                  )
+            """,
+            [
+                model_version,
+                vocabulary_partition,
+                NULL_VOCAB_PARTITION,
+                vocabulary_id,
+            ],
+        )
 
-        for shard_idx in range(shard_count):
-            start_rn = shard_idx * TARGET_ROWS_PER_SHARD + 1
-            end_rn = min((shard_idx + 1) * TARGET_ROWS_PER_SHARD, partition_row_count)
-            shard_path = partition_dir / f"part-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
-            escaped_shard = shard_path.as_posix().replace("'", "''")
-            conn.execute(
-                f"""
-                COPY (
-                    SELECT
-                        concept_id,
-                        concept_name,
-                        domain_id,
-                        vocabulary_id,
-                        concept_class_id,
-                        standard_concept,
-                        concept_code,
-                        invalid_reason,
-                        embedding,
-                        embed_text,
-                        model_version,
-                        embedded_at
-                    FROM (
+        try:
+            for shard_idx in range(shard_count):
+                start_rn = shard_idx * TARGET_ROWS_PER_SHARD + 1
+                end_rn = min((shard_idx + 1) * TARGET_ROWS_PER_SHARD, partition_row_count)
+                shard_path = partition_dir / f"part-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
+                escaped_shard = shard_path.as_posix().replace("'", "''")
+                conn.execute(
+                    f"""
+                    COPY (
                         SELECT
                             concept_id,
                             concept_name,
@@ -255,29 +274,17 @@ def _copy_relation_to_partitioned_shards(
                             embedding,
                             embed_text,
                             model_version,
-                            embedded_at,
-                            ROW_NUMBER() OVER (ORDER BY concept_id) AS rn
-                                                FROM {source_relation}
-                        WHERE model_version = ?
-                          AND (
-                                (? = ? AND vocabulary_id IS NULL)
-                                OR vocabulary_id = ?
-                              )
-                    ) ranked
-                    WHERE rn BETWEEN ? AND ?
-                ) TO '{escaped_shard}'
-                (FORMAT PARQUET, COMPRESSION ZSTD)
-                """,
-                [
-                    model_version,
-                    vocabulary_partition,
-                    NULL_VOCAB_PARTITION,
-                    vocabulary_id,
-                    start_rn,
-                    end_rn,
-                ],
-            )
-            total_files += 1
+                            embedded_at
+                        FROM temp_partition_ranked
+                        WHERE rn BETWEEN ? AND ?
+                    ) TO '{escaped_shard}'
+                    (FORMAT PARQUET, COMPRESSION ZSTD)
+                    """,
+                    [start_rn, end_rn],
+                )
+                total_files += 1
+        finally:
+            conn.execute("DROP TABLE IF EXISTS temp_partition_ranked")
 
         completed_rows += partition_row_count
         completed_partitions += 1
