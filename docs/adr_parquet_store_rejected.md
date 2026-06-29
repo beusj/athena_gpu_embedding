@@ -173,3 +173,26 @@ but the DuckDB-table re-embed cost is becoming one on its own. Recommended next
 step is a flag-gated `delta` backend behind the existing `store.open_db` path
 dispatch, validated against a realistic scattered re-embed at larger scale.
 Spark/Delta-on-Spark remains rejected.
+
+### Migration & Snowflake-handoff considerations (must address before any switch)
+
+Any backend change is a *migration*, not a greenfield choice — there is already
+a substantial production `.duckdb` store with many embeddings. Two requirements
+gate a switch:
+
+1. **Migrate the existing DuckDB-table data into the new backend.** Machinery
+   already exists and should be the template: `store._migrate_legacy_if_needed`
+   ATTACHes a legacy `.duckdb` read-only and streams it into partitioned shards
+   (`_copy_relation_to_partitioned_shards`). A `delta` backend would reuse the
+   same ATTACH-and-stream pattern, writing Arrow batches via `write_deltalake`
+   instead of `COPY ... TO parquet`. The migration must be re-runnable and not
+   require holding the whole table in memory.
+2. **Preserve the Snowflake handoff.** The `export` command
+   (`cli.export_cmd`) emits plain sharded Parquet that Snowflake reads via
+   `COPY INTO` / external stage; this is independent of the live store backend
+   and **must keep working** regardless of what backend embed writes to. Note a
+   Delta table *is* Parquet files plus a `_delta_log/`; Snowflake can consume
+   Delta directly (external table / Iceberg-style), but that is more setup than
+   the existing plain-Parquet export. Safest stance: keep `export` → plain
+   Parquet as the canonical Snowflake path even if the live store moves to
+   Delta, so the downstream contract does not change.
