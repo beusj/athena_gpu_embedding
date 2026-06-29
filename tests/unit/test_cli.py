@@ -1650,3 +1650,12 @@ def test_cleanup_no_embeddings(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "nothing to clean up" in result.output
+
+
+def test_retrieval_version_prints_shared_stamp() -> None:
+    """`gpu-embed retrieval-version` prints the cross-repo FP32+CLS stamp (ALIGNMENT.md §4.2)."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["retrieval-version"])
+    assert result.exit_code == 0, result.output
+    # Config-derived stamp, not the weights hash: FP32 + CLS by default.
+    assert result.output.strip().startswith("sapbert-cls-fp32-")

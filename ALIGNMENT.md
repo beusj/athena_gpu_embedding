@@ -190,12 +190,42 @@ PRIMARY KEY (mapping_wave, source_id)
 > `concept-mapper` Snowflake UDF, and `gpu-embedder` — must stamp the **same**
 > §4.2 string for the same pinned config, and must produce FP32 + CLS vectors.
 
+### 4.5 Embed-text contract (two populations, one space)
+
+There are **two embedding populations**. They embed **different text** but must
+live in the **same vector space** so cosine similarity is meaningful:
+
+| Population | Text embedded | Stored in | Produced by |
+|---|---|---|---|
+| **Target** concepts | bare `concept_name` | `concept_embeddings.embedding` | `gpu-embedder` (Athena CONCEPT.csv) / `concept-mapper` `build.py` |
+| **Source** concepts (queries) | bare `source_name` | `source_concepts.query_embedding` | `concept-mapper` Stage 3 / `gpu-embed --source-parquet` |
+
+SapBERT does **symmetric** biomedical name matching, so **both** sides embed the
+**bare name** — do *not* concatenate vocabulary/domain/units/codes into the text,
+or the vector shifts out of name space and stops matching the other population.
+Concretely: keep `gpu-embedder`'s `GPU_EMBED_SOURCE_TEXT_FIELDS=source_name` (its
+default) and `concept-mapper`'s `format_concept_text` / source `source_name` bare.
+
+`model_version` (§4.2) intentionally identifies the **artifact**, not the **text**,
+so it does *not* protect against an embed-text mismatch: two source runs with
+different `SOURCE_TEXT_FIELDS` get the same version but different vectors. The
+bare-name rule above is the guard; treat any deviation as a contract change.
+
 ---
 
 ## 5. Current gaps vs. §4 (inconsistency register)
 
-Ranked; each lists evidence and the convergence action. None are fixed by this
-doc — it records the target so the fixes are unambiguous.
+Ranked; each lists evidence and the convergence action.
+
+> **Implementation status** (branch `claude/align-embedding-mapping-dbt-9rkgnk`):
+> items **1–4 are now largely addressed in code** — `concept-mapper` computes the
+> §4.2 stamp, defaults to FP32, and forces CLS pooling; `gpu-embedder` exposes the
+> same stamp (`gpu-embed retrieval-version`) and the runbook lands vectors in the
+> contract tables with the VECTOR cast + `embed_model_version`. A shared golden
+> string (`sapbert-cls-fp32-…`) is asserted in **both** repos' unit tests. Items
+> **5–7 remain open** (target-ownership cutover, `source_vocabulary_id` casing,
+> de-duplicating the `768`/model-name constants). The descriptions below are the
+> design rationale and the remaining work.
 
 1. **🔴 `model_version` is three incompatible schemes.**
    - `gpu-embedder`: SHA-256 of the weights file (`models.py` `EmbeddedRow`;
@@ -247,22 +277,25 @@ doc — it records the target so the fixes are unambiguous.
 ## 6. Per-repo convergence checklists
 
 **`athena_gpu_embedding`**
-- [ ] Emit the §4.2 `model_version` as the retrieval-facing stamp (config-derived,
-      engine-excluded); keep weights-SHA in `model_registry` as provenance.
-- [ ] Keep FP32 + CLS defaults (already the rule); document them as the contract,
-      not just defaults.
-- [ ] Export/runbook: present the target version column as `embed_model_version`
-      and ensure the embedding loads as `VECTOR(FLOAT, 768)`.
-- [ ] Runbook: add the real `source_concepts` MERGE on `(mapping_wave, source_id)`.
+- [x] Emit the §4.2 stamp as the retrieval-facing version via
+      `embed.retrieval_model_version` / `gpu-embed retrieval-version`
+      (config-derived, engine-excluded); weights-SHA stays the store identity /
+      `model_registry` provenance.
+- [x] Keep FP32 + CLS defaults (already the rule); documented as the contract.
+- [x] Runbook: stage the parquet, then upsert into `concept_embeddings` with the
+      version column as `embed_model_version` and the embedding cast to
+      `VECTOR(FLOAT, 768)`.
+- [x] Runbook: real `source_concepts` MERGE on `(mapping_wave, source_id)`.
 
 **`llm_concept_mapping`**
-- [ ] `EMBEDDING_QUANTIZATION=fp32` as the contract default; update `.env.example`.
-- [ ] Force CLS pooling in the SapBERT loader (add a CLS pooling module) so it
-      stops defaulting to mean.
-- [ ] Replace `model_version_for` with the §4.2 formula (drop `backend` from the
-      identity; fix `precision="fp32"`; add `pooling`). One bump + re-embed.
-- [ ] Reconcile the GPU offload path (#4) to the §4.2 stamp; decide whether
-      `gpu_export.py` stays or defers to `gpu-embed`.
+- [x] `EMBEDDING_QUANTIZATION=fp32` as the contract default; `.env.example` updated.
+- [x] Force CLS pooling in the SapBERT loader (`_force_pooling`) so it stops
+      defaulting to mean.
+- [x] `model_version_for` uses the §4.2 formula (engine-excluded; `precision` from
+      quantization; `pooling` added). Bumps the version → re-embed required.
+- [~] GPU offload path reconciled to the §4.2 stamp in `gpu_export.py` (defers to
+      the dedicated repo; inline script uses the shared stamp + CLS). Deleting the
+      duplicate path entirely is still open (#4).
 - [ ] Normalize `source_vocabulary_id` casing (#6).
 
 **`dbt_omop_clean`**

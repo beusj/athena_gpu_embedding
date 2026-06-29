@@ -11,6 +11,7 @@ Key invariants (see AGENTS.md):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -176,6 +177,51 @@ def compute_model_version(
         weights_digest = hashlib.sha256(str(model_id_or_path).encode()).hexdigest()
 
     return _apply_run_variant(weights_digest, precision, quantization_scheme, pooling)
+
+
+# ---------------------------------------------------------------------------
+# Shared cross-repo retrieval stamp (ALIGNMENT.md §4.2)
+# ---------------------------------------------------------------------------
+
+_RETRIEVAL_DIMENSION = 768  # SapBERT (PubMedBERT backbone) output dim
+
+
+def retrieval_model_version(
+    model_name: str,
+    revision: str | None = None,
+    *,
+    pooling: str = "cls",
+    precision: str = "fp32",
+    normalize: bool = True,
+    dimension: int = _RETRIEVAL_DIMENSION,
+) -> str:
+    """Config-derived ``embed_model_version`` for the warehouse handoff (ALIGNMENT.md §4.2).
+
+    This is the *retrieval-facing* stamp concept-mapper's Stage 3 filters on
+    (``concept_embeddings.embed_model_version`` and
+    ``source_concepts.embed_model_version``). It is a pure function of the pinned
+    vector-space attributes and deliberately **excludes the runtime engine** (CUDA
+    here vs ONNX in concept-mapper) and throughput knobs, so one pinned artifact
+    yields one stamp on both sides. The identity dict below MUST stay byte-identical
+    to ``concept_mapper.embeddings.embedder.pinned_attributes`` or the two repos
+    will compute different versions and semantic retrieval will silently miss.
+
+    Distinct from :func:`compute_model_version`, which hashes the weights file and
+    remains the local Lance/DuckDB store identity (provenance in ``model_registry``).
+    Both target concepts (``concept_name``) and source concepts (``source_name``)
+    are stamped with this same value — they share one vector space; only the
+    embedded text differs.
+    """
+    identity = {
+        "model_name": model_name,
+        "revision": revision,
+        "pooling": pooling,
+        "precision": precision,
+        "normalize": normalize,
+        "dimension": dimension,
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
+    return f"sapbert-{pooling}-{precision}-{digest}"
 
 
 # ---------------------------------------------------------------------------
