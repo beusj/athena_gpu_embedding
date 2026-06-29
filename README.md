@@ -143,17 +143,18 @@ Two strong choices for OMOP/Athena concept text:
 | **BioLORD-2023** (`FremyCompany/BioLORD-2023`) | [model card](https://huggingface.co/FremyCompany/BioLORD-2023) | [BioLORD-2023: Semantic Textual Representations Fusing LLM and Clinical Knowledge Graph Insights — arXiv:2311.16075](https://arxiv.org/abs/2311.16075) |
 
 - **SapBERT** is tuned for biomedical *entity* representations (synonym/alias
-  matching) and is the default. It works directly with this tool's CLS-token
-  pooling.
+  matching) and is the default. It works directly with this tool's default
+  CLS-token pooling (`--pooling cls`).
 - **BioLORD-2023** targets clinical *sentence* similarity and often performs
   better on longer, descriptive concept names. It is a `sentence-transformers`
-  model trained with **mean** pooling, whereas this pipeline currently pools the
-  CLS token — so treat it as a candidate to evaluate (and adjust pooling to
-  reproduce its published behaviour) rather than a zero-change swap.
+  model trained with **mean** pooling, so run it with `--pooling mean` to
+  reproduce its published behaviour:
+  `gpu-embed embed --model FremyCompany/BioLORD-2023 --pooling mean`.
 
 Whichever model you choose, the `model_version` digest (a SHA-256 of the
-weights) keeps each model's embeddings from being silently mixed with another's
-in the same store. Pin `--model-revision` for reproducible downloads.
+weights, with non-default pooling folded in) keeps each model's embeddings from
+being silently mixed with another's — or with a different pooling of the same
+weights — in the same store. Pin `--model-revision` for reproducible downloads.
 
 ---
 
@@ -279,6 +280,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
 | `--max-length` | `128` | Tokenizer max sequence length |
+| `--pooling` | `cls` | Token pooling: `cls` (SapBERT default) or `mean` (e.g. BioLORD-2023). Non-default pooling is folded into `model_version` |
 | `--upsert-every-batches` | `250` | Checkpoint writes every N embedding batches |
 | `--ingest-engine` | `duckdb` | CSV ingest engine: `duckdb` (default) or `python` fallback |
 | `--device` | auto | `cuda`, `cpu`, or `mps` |

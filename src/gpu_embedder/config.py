@@ -45,6 +45,10 @@ class EmbedConfig(BaseSettings):
     device: str = "auto"
     batch_size: int = 256
     max_length: int = 128
+    # Token pooling strategy. ``cls`` (SapBERT default) takes the CLS token;
+    # ``mean`` is mask-aware mean pooling for sentence-transformers models such
+    # as BioLORD-2023. Non-default pooling is folded into model_version.
+    pooling: Literal["cls", "mean"] = "cls"
     ingest_engine: Literal["duckdb", "python"] = "duckdb"
     write_mode: Literal["ndjson", "direct"] = "ndjson"
     upsert_every_batches: int = 250

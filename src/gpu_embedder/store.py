@@ -118,6 +118,7 @@ class ModelRegistryEntry:
     model_revision: str | None
     precision: str
     quantization_scheme: str
+    pooling: str
     recorded_at: datetime
 
 
@@ -532,6 +533,7 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
                 model_revision VARCHAR,
                 precision VARCHAR NOT NULL,
                 quantization_scheme VARCHAR NOT NULL,
+                pooling VARCHAR NOT NULL,
                 recorded_at TIMESTAMP NOT NULL
             )
             """
@@ -550,15 +552,35 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         conn.execute(
             """
+            ALTER TABLE model_registry
+            ADD COLUMN IF NOT EXISTS pooling VARCHAR DEFAULT 'cls'
+            """
+        )
+        conn.execute(
+            """
             UPDATE model_registry
             SET
                 precision = COALESCE(precision, 'fp32'),
-                quantization_scheme = COALESCE(quantization_scheme, 'none')
-            WHERE precision IS NULL OR quantization_scheme IS NULL
+                quantization_scheme = COALESCE(quantization_scheme, 'none'),
+                pooling = COALESCE(pooling, 'cls')
+            WHERE precision IS NULL OR quantization_scheme IS NULL OR pooling IS NULL
             """
         )
         conn.execute(CSV_FINGERPRINTS_DDL)
         conn.execute(MODEL_VERSION_CACHE_DDL)
+        # Pre-pooling caches keyed by (model_id, revision) keep their rows; the
+        # added column defaults to 'cls' so existing cls entries stay valid. The
+        # PK cannot be widened in place, so on those DBs alternating pooling just
+        # re-hashes (never returns a wrong digest — see get_cached_model_version).
+        conn.execute(
+            """
+            ALTER TABLE model_version_cache
+            ADD COLUMN IF NOT EXISTS pooling TEXT DEFAULT 'cls'
+            """
+        )
+        conn.execute(
+            "UPDATE model_version_cache SET pooling = 'cls' WHERE pooling IS NULL"
+        )
         logger.debug("DuckDB-backed schema ensured")
         return
 
@@ -776,6 +798,7 @@ def upsert_model_registry(
     model_revision: str | None,
     precision: str = "fp32",
     quantization_scheme: str = "none",
+    pooling: str = "cls",
 ) -> None:
     """Upsert model provenance metadata alongside parquet embeddings.
 
@@ -793,8 +816,9 @@ def upsert_model_registry(
                 model_revision,
                 precision,
                 quantization_scheme,
+                pooling,
                 recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 model_version,
@@ -802,6 +826,7 @@ def upsert_model_registry(
                 model_revision,
                 precision,
                 quantization_scheme,
+                pooling,
                 datetime.now(tz=UTC),
             ],
         )
@@ -821,6 +846,7 @@ def upsert_model_registry(
             model_revision VARCHAR,
             precision VARCHAR,
             quantization_scheme VARCHAR,
+            pooling VARCHAR,
             recorded_at TIMESTAMP
         )
         """
@@ -833,10 +859,19 @@ def upsert_model_registry(
             model_revision,
             precision,
             quantization_scheme,
+            pooling,
             recorded_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        [model_version, model_id, model_revision, precision, quantization_scheme, now],
+        [
+            model_version,
+            model_id,
+            model_revision,
+            precision,
+            quantization_scheme,
+            pooling,
+            now,
+        ],
     )
 
     registry_files = _registry_files(ctx.parquet_root)
@@ -850,6 +885,7 @@ def upsert_model_registry(
                 model_revision,
                 COALESCE(precision, 'fp32') AS precision,
                 COALESCE(quantization_scheme, 'none') AS quantization_scheme,
+                COALESCE(pooling, 'cls') AS pooling,
                 CAST(recorded_at AS TIMESTAMP) AS recorded_at
             FROM read_parquet(
                 '__REGISTRY_PATTERN__',
@@ -870,6 +906,7 @@ def upsert_model_registry(
                 CAST(NULL AS VARCHAR) AS model_revision,
                 CAST(NULL AS VARCHAR) AS precision,
                 CAST(NULL AS VARCHAR) AS quantization_scheme,
+                CAST(NULL AS VARCHAR) AS pooling,
                 CAST(NULL AS TIMESTAMP) AS recorded_at
             WHERE FALSE
             """
@@ -884,6 +921,7 @@ def upsert_model_registry(
             model_revision,
             precision,
             quantization_scheme,
+            pooling,
             recorded_at
         FROM (
             SELECT
@@ -892,6 +930,7 @@ def upsert_model_registry(
                 model_revision,
                 precision,
                 quantization_scheme,
+                pooling,
                 recorded_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY model_version
@@ -920,6 +959,7 @@ def upsert_model_registry(
                 model_revision,
                 precision,
                 quantization_scheme,
+                pooling,
                 recorded_at
             FROM temp_model_registry_merged
             ORDER BY model_version
@@ -946,6 +986,7 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
                 model_revision,
                 COALESCE(precision, 'fp32') AS precision,
                 COALESCE(quantization_scheme, 'none') AS quantization_scheme,
+                COALESCE(pooling, 'cls') AS pooling,
                 CAST(recorded_at AS TIMESTAMP) AS recorded_at
             FROM model_registry
             ORDER BY CAST(recorded_at AS TIMESTAMP) DESC, model_version
@@ -958,7 +999,8 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
                 model_revision=str(row[2]) if row[2] is not None else None,
                 precision=str(row[3]),
                 quantization_scheme=str(row[4]),
-                recorded_at=row[5],
+                pooling=str(row[5]),
+                recorded_at=row[6],
             )
             for row in rows
         ]
@@ -975,6 +1017,7 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
             model_revision,
             COALESCE(precision, 'fp32') AS precision,
             COALESCE(quantization_scheme, 'none') AS quantization_scheme,
+            COALESCE(pooling, 'cls') AS pooling,
             CAST(recorded_at AS TIMESTAMP) AS recorded_at
         FROM (
             SELECT
@@ -983,6 +1026,7 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
                 model_revision,
                 precision,
                 quantization_scheme,
+                pooling,
                 recorded_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY model_version
@@ -1006,7 +1050,8 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
             model_revision=str(row[2]) if row[2] is not None else None,
             precision=str(row[3]),
             quantization_scheme=str(row[4]),
-            recorded_at=row[5],
+            pooling=str(row[5]),
+            recorded_at=row[6],
         )
         for row in rows
     ]
@@ -1094,18 +1139,22 @@ def get_cached_model_version(
     conn: duckdb.DuckDBPyConnection,
     model_id: str,
     revision: str | None,
+    pooling: str = "cls",
 ) -> str | None:
-    """Return a previously stored SHA-256 for *(model_id, revision)*, or None.
+    """Return a stored model_version for *(model_id, revision, pooling)*, or None.
 
-    Avoids re-hashing the ~440 MB weights file on every startup when the
-    model has not changed.
+    Avoids re-hashing the ~440 MB weights file on every startup when the model
+    has not changed. ``pooling`` is part of the key because it is folded into
+    the digest — a cls hit must never be reused for a mean run. A miss simply
+    triggers a re-hash, so this is always safe (never returns a wrong digest).
     """
     ctx = _get_context(conn)
     if ctx.backend != "duckdb":
         return None
     row = conn.execute(
-        "SELECT sha256 FROM model_version_cache WHERE model_id = ? AND revision = ?",
-        [model_id, revision or ""],
+        "SELECT sha256 FROM model_version_cache "
+        "WHERE model_id = ? AND revision = ? AND pooling = ?",
+        [model_id, revision or "", pooling],
     ).fetchone()
     return str(row[0]) if row is not None else None
 
@@ -1114,22 +1163,24 @@ def upsert_model_version_cache(
     conn: duckdb.DuckDBPyConnection,
     model_id: str,
     revision: str | None,
+    pooling: str,
     sha256: str,
 ) -> None:
-    """Persist the weights SHA-256 for *(model_id, revision)*."""
+    """Persist the model_version for *(model_id, revision, pooling)*."""
     ctx = _get_context(conn)
     if ctx.backend != "duckdb":
         return
     conn.execute(
         """
-        INSERT OR REPLACE INTO model_version_cache (model_id, revision, sha256)
-        VALUES (?, ?, ?)
+        INSERT OR REPLACE INTO model_version_cache (model_id, revision, pooling, sha256)
+        VALUES (?, ?, ?, ?)
         """,
-        [model_id, revision or "", sha256],
+        [model_id, revision or "", pooling, sha256],
     )
     logger.info(
-        "Upserted model_version_cache: model=%s revision=%s sha256=%s…",
+        "Upserted model_version_cache: model=%s revision=%s pooling=%s sha256=%s…",
         model_id,
         revision or "default",
+        pooling,
         sha256[:12],
     )

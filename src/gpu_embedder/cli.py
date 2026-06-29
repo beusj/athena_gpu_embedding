@@ -201,6 +201,14 @@ def embed_cmd(
         int | None,
         typer.Option(envvar="GPU_EMBED_MAX_LENGTH", help="Tokenizer max sequence length"),
     ] = None,
+    pooling: Annotated[
+        str | None,
+        typer.Option(
+            "--pooling",
+            envvar="GPU_EMBED_POOLING",
+            help="Token pooling: cls (SapBERT default) or mean (e.g. BioLORD-2023)",
+        ),
+    ] = None,
     upsert_every_batches: Annotated[
         int | None,
         typer.Option(
@@ -296,6 +304,8 @@ def embed_cmd(
         cfg_overrides["batch_size"] = batch_size
     if max_length is not None:
         cfg_overrides["max_length"] = max_length
+    if pooling is not None:
+        cfg_overrides["pooling"] = pooling
     if upsert_every_batches is not None:
         cfg_overrides["upsert_every_batches"] = upsert_every_batches
     if ingest_engine is not None:
@@ -366,7 +376,7 @@ def embed_cmd(
     from gpu_embedder.embed import build_embed_text, compute_model_version, embed_all, load_model
 
     _cached_mv = None if cfg.force else st.get_cached_model_version(
-        conn, cfg.model, cfg.model_revision
+        conn, cfg.model, cfg.model_revision, cfg.pooling
     )
     if _cached_mv is not None:
         model_version = _cached_mv
@@ -374,10 +384,14 @@ def embed_cmd(
     else:
         typer.echo(
             f"Hashing model weights for {cfg.model} "
-            f"(revision={cfg.model_revision or 'default'}) …"
+            f"(revision={cfg.model_revision or 'default'}, pooling={cfg.pooling}) …"
         )
-        model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
-        st.upsert_model_version_cache(conn, cfg.model, cfg.model_revision, model_version)
+        model_version = compute_model_version(
+            cfg.model, revision=cfg.model_revision, pooling=cfg.pooling
+        )
+        st.upsert_model_version_cache(
+            conn, cfg.model, cfg.model_revision, cfg.pooling, model_version
+        )
     filter_hash = filter_spec_hash(spec, cfg.namespace)
 
     # Load only CSVs that changed for this (model_version, filter_hash).
@@ -541,6 +555,7 @@ def embed_cmd(
         model_revision=cfg.model_revision,
         precision="fp32",
         quantization_scheme="none",
+        pooling=cfg.pooling,
     )
 
     # Texts to feed the tokenizer, keyed by concept_id; reused for change
@@ -612,6 +627,7 @@ def embed_cmd(
             cfg.text_fields,
             cfg.separator,
             model_version,
+            pooling=cfg.pooling,
             precomputed_texts=texts_for_embed,
         )
         total_embed_seconds += time.perf_counter() - embed_started

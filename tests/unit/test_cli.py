@@ -214,7 +214,9 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     def fake_load_model(model_id: str, device: str, revision: str | None = None):
         return object(), object()
 
-    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+    def fake_compute_model_version(
+        model_id: str, revision: str | None = None, *, pooling: str = "cls"
+    ) -> str:
         return "test-model-version"
 
     def fake_embed_all(
@@ -228,6 +230,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
         separator,
         model_version,
         *,
+        pooling: str = "cls",
         precomputed_texts=None,
     ):
         return [
@@ -263,6 +266,7 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
         model_revision: str | None,
         precision: str = "fp32",
         quantization_scheme: str = "none",
+        pooling: str = "cls",
     ) -> None:
         return None
 
@@ -297,10 +301,10 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     ) -> None:
         return None
 
-    def fake_get_cached_model_version(conn, model_id: str, revision) -> None:  # type: ignore[no-untyped-def]
+    def fake_get_cached_model_version(conn, model_id: str, revision, pooling: str = "cls") -> None:  # type: ignore[no-untyped-def]
         return None  # always miss — compute_model_version (also mocked) is called
 
-    def fake_upsert_model_version_cache(conn, model_id: str, revision, sha256: str) -> None:  # type: ignore[no-untyped-def]
+    def fake_upsert_model_version_cache(conn, model_id: str, revision, pooling: str, sha256: str) -> None:  # type: ignore[no-untyped-def]
         return None
 
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
@@ -370,7 +374,9 @@ def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> No
     def fake_load_model(model_id: str, device: str, revision: str | None = None):
         return object(), object()
 
-    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+    def fake_compute_model_version(
+        model_id: str, revision: str | None = None, *, pooling: str = "cls"
+    ) -> str:
         return "test-model-version"
 
     def fake_open_db(path: Path):

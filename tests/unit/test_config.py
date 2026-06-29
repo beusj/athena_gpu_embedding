@@ -22,6 +22,7 @@ class TestEmbedConfigDefaults:
         assert cfg.model_revision is None
         assert cfg.batch_size == 256
         assert cfg.max_length == 128
+        assert cfg.pooling == "cls"
         assert cfg.upsert_every_batches == 250
         assert cfg.ingest_engine == "duckdb"
         assert cfg.write_mode == "ndjson"
