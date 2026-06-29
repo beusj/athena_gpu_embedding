@@ -108,10 +108,15 @@ addendum); the concurrency-relevant takeaways:
   `adr_parquet_store_rejected.md` (4× amplification, rewrites the whole
   partition). So MERGE is the part of Delta this workload must avoid.
 
-So if cross-process embed-vs-export/status concurrency is a hard requirement,
-the proportionate answer is to **add periodic compaction to the existing
-append-only parquet backend** — that already gives lock-free multi-reader access
-and scatter-insensitive writes; compaction just bounds the read-side duplicate
-growth. A move to delta-rs in *append* mode (not MERGE) is a heavier alternative
-worth it only if the ACID log / Snowflake-via-Delta story is specifically
-wanted. Spark is **not** required for either and is rejected (data fits one node).
+Given pure DuckDB is the standing live backend, the proportionate concurrency
+answer is **in-process, cursor-per-thread** (Option 1): no backend change, and
+DuckDB's MVCC already supports one writer plus concurrent readers in a single
+process. Cross-process concurrency is impossible with one `.duckdb` file
+(exclusive lock), and the snapshot-copy workaround is unattractive at tens of GB.
+
+True cross-process multi-reader access requires a **file-based** backend — the
+demoted parquet path + compaction, Delta-rs in *append* mode (not MERGE), or
+Lance — but that reopens the storage-backend decision
+(`adr_parquet_store_rejected.md`) and is constrained to **embedded** stores (no
+separate client-server RDBMS, by requirement). Spark is not relevant under that
+constraint.

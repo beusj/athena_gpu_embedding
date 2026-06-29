@@ -111,6 +111,17 @@ Only consider it again if **all** of the following are true:
 
 ## Addendum (2026-06): benchmarks now contradict the central premise
 
+**Standing decision (unchanged by this addendum):** pure DuckDB
+(`embeddings.duckdb`) is the recommended live store; the parquet backend is a
+demoted opt-in migration/export artifact (README "Storage model"). The
+benchmarks below characterize the *costs* of that chosen backend and inform any
+future revisit — they do **not** by themselves reopen the decision. A hard
+architectural constraint also applies: **no separate client-server RDBMS**
+(Postgres/etc.). Concepts flow in and embeddings flow out continuously, so a
+server round-trip on every move is unacceptable; this keeps the field to
+*embedded, file-based* stores (DuckDB, parquet, Delta-rs, Lance, …), and makes
+Spark/Delta-on-Spark doubly irrelevant.
+
 After this ADR was written, two things changed: (a) the parquet write path was
 rewritten to be **append-only merge-on-read** (new shards per checkpoint +
 read-time dedup view; see `store._copy_relation_to_partitioned_shards` /
@@ -190,23 +201,32 @@ The real choice is a **write strategy**, not an engine:
   scatter-insensitive; read cost is bounded by compacting on a schedule, off
   the write critical path.
 
-Recommendations:
+Recommendations (all within the embedded / no-separate-RDBMS constraint):
 
 1. **Reject delta-rs MERGE for the re-embed path** — it is the ADR's
-   amplification with a nicer API.
-2. **Cheapest high-value fix: keep the append-only parquet backend and add a
-   periodic compaction step** (dedup + rewrite shards). Gives scatter-insensitive
-   writes, bounded reads, and lock-free multi-reader concurrency (the original
-   driver) with **no new dependency**.
-3. **Delta in *append* mode (not MERGE)** is a reasonable upgrade only if the
-   ACID log + managed OPTIMIZE + Snowflake-via-Delta story is specifically
-   wanted — it is the current parquet pattern plus a transaction log. The
-   amplifying part of Delta (MERGE) is the part this workload must avoid.
+   amplification with a nicer API (4× on a scattered re-embed).
+2. **Staying pure-DuckDB (the standing decision) is defensible.** Its costs are
+   the re-embed time (~50s/200k at 2M and growing), no cross-process concurrency
+   (exclusive file lock), and ~2× disk. If the *lock* is the only pain, solve it
+   *within* DuckDB via in-process cursor-per-thread concurrency
+   (`duckdb_concurrency.md`), not a backend change.
+3. **If the re-embed cost or concurrency limit becomes the real bottleneck**, the
+   correct write shape is **append + merge-on-read + periodic compaction** — which
+   the (demoted) parquet backend already implements bar compaction, and which
+   Delta in *append* mode (not MERGE) also provides with an ACID log. Either
+   reopens the parquet decision, so do it deliberately, not by drift.
+4. **Worth evaluating before any switch: Lance / LanceDB.** An embedded,
+   ML-native columnar format purpose-built for versioned vector+metadata stores.
+   Its update model (deletion vectors + new fragments, not whole-file rewrite)
+   *may* avoid both DuckDB's re-embed cost and Delta MERGE's scatter
+   amplification, stays embedded (no server), and exports to Parquet for
+   Snowflake. **Untested here — a hypothesis to benchmark with the same harness,
+   not a claim.**
 
-Criterion #4 from the original "when to revisit" list is met for *writes*, but
-the re-embed amplification means a wholesale parquet/Delta-MERGE switch is **not**
-warranted; adding compaction to the existing backend is the proportionate move.
-Spark/Delta-on-Spark remains rejected.
+Criterion #4 (write throughput ≥ DuckDB table) is met for *writes*, but the
+re-embed amplification means a wholesale parquet/Delta-MERGE switch is **not**
+warranted. Spark/Delta-on-Spark remains rejected (and is moot under the
+embedded-only, no-separate-RDBMS constraint).
 
 ### Caveats (do not over-read)
 
