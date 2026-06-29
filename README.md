@@ -243,6 +243,8 @@ gpu-embed model-registry [OPTIONS]           — show hash -> model/revision map
 gpu-embed coverage  [OPTIONS] [CSV_PATH...]   — identify unembedded concepts
 gpu-embed cleanup   [OPTIONS]                — delete embeddings for a model/vocabularies
 gpu-embed migrate-store [OPTIONS]            — materialize/initialize the parquet store
+gpu-embed migrate-lance [OPTIONS]            — migrate a legacy .duckdb store into a Lance store
+gpu-embed compact   [OPTIONS]                — compact a Lance store + prune old versions
 gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 ```
 
@@ -264,6 +266,33 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 - Use `gpu-embed migrate-store --db embeddings.duckdb` only when you need a
   full parquet mirror of the local store (`embeddings/`).
 - Local embedding runs can continue to use `embeddings.duckdb` directly.
+
+#### Lance backend (ACID + cross-process concurrency)
+
+When you need `embed` (intermittent writes) and `export` / `status` to run
+**concurrently across processes** — which a single `.duckdb` file cannot do (it
+holds an exclusive lock) — point `--db` at a `.lance` path. Lance is an
+embedded, ACID, versioned store whose `merge_insert` upserts are **O(changes)**
+(deletion vectors), so a scattered re-embed rewrites only the changed rows, not
+the whole partition. This is the adopted live store for the ACID + concurrency
+requirement (see `docs/adr_lance_store_proposal.md`); DuckDB remains the default.
+
+- **Opt-in install:** `uv sync --extra lance` (adds `pylance`). Nothing changes
+  for the default DuckDB backend unless you choose a `.lance` path.
+- **A `.lance` store is a container directory:** the Lance dataset lives in
+  `<store>.lance/concept_embeddings.lance/` and model-registry metadata in
+  `<store>.lance/_meta/model_registry/` (same parquet layout as the parquet
+  store). `concept_embeddings` is exposed as a DuckDB view for all reads/exports.
+- **Migrate from DuckDB:** `gpu-embed migrate-lance --db embeddings.lance --from
+  embeddings.duckdb` streams the legacy table into Lance (re-runnable; pass
+  `--reset` to redo from scratch).
+- **Maintenance:** `gpu-embed compact --db embeddings.lance` bin-packs fragments
+  and prunes old versions. Reads are correct *without* compaction (deletion
+  vectors already dedupe), so it is optional — but Lance retains old versions
+  until pruned, so schedule it (or run it after an `embed`) to bound disk. It is
+  a writer: never run it concurrently with a live `embed`.
+- **Snowflake handoff unchanged:** `gpu-embed export` still emits plain sharded
+  parquet regardless of backend.
 
 #### Migration runtime notes
 
@@ -324,7 +353,7 @@ That path uses a source adapter rather than the Athena `CONCEPT.csv` ingest.
 |------|---------|-------------|
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` (used when no explicit path given) |
 | `--source-parquet` | _(none)_ | Source-concept parquet file or directory to embed instead of Athena CSV |
-| `--db` | `embeddings.duckdb` | Embedding store path (default fast local DuckDB file; directory enables parquet store mode) |
+| `--db` | `embeddings.duckdb` | Embedding store path. `.duckdb` = fast local DuckDB file (default); `.lance` = Lance store (ACID + cross-process readers, opt-in `--extra lance`); a directory = parquet store mode |
 | `--batch-size` | `256` | Rows per GPU forward pass |
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |

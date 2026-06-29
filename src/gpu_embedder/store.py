@@ -1,8 +1,17 @@
-"""Storage layer for local DuckDB tables and parquet-sharded stores.
+"""Storage layer for local DuckDB tables, parquet-sharded stores, and Lance.
 
 The DuckDB connection is opened once per CLI invocation and passed down.
-`*.duckdb` paths use native DuckDB tables (fast local writes), while directory
-paths use parquet shards partitioned by model_version and vocabulary_id.
+Backend selection is by path suffix:
+
+- ``*.duckdb``  → native DuckDB table (the default live write store).
+- ``*.lance``   → a Lance dataset (ACID + cross-process readers, O(changes)
+  ``merge_insert`` upserts via deletion vectors). Opt-in: nothing uses it unless
+  ``--db`` points at a ``.lance`` path. Requires the optional ``pylance`` extra.
+- any other directory → parquet shards (a demoted migration/export artifact).
+
+For the parquet and lance backends DuckDB is an in-memory query layer: the
+``concept_embeddings`` relation every reader queries is a *view*, over the
+parquet shards or over the registered Lance dataset respectively.
 """
 
 from __future__ import annotations
@@ -13,11 +22,11 @@ import time
 import uuid
 import weakref
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from glob import glob
 from math import ceil
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import duckdb
 import numpy as np
@@ -36,6 +45,19 @@ TARGET_ROWS_PER_SHARD = 250_000
 NULL_VOCAB_PARTITION = "_null"
 MODEL_REGISTRY_SUBDIR = Path("_meta") / "model_registry"
 EMBEDDING_DIM = 768
+
+# A ``.lance`` store path is a *container directory*: the Lance dataset lives in
+# the subdirectory below it, and registry metadata reuses the parquet
+# ``_meta/model_registry`` layout alongside it. Keeping the dataset in its own
+# subdir means Lance maintenance (compaction, version cleanup) never sees the
+# metadata files, and vice versa.
+LANCE_DATASET_SUBDIR = "concept_embeddings.lance"
+# Name the registered Lance dataset is exposed under inside the in-memory DuckDB
+# connection; the ``concept_embeddings`` view selects from it.
+_LANCE_REGISTERED_NAME = "_lance_concept_embeddings"
+# Composite key matching the DuckDB table's PRIMARY KEY; what merge_insert
+# upserts on so a re-embed updates in place instead of duplicating.
+_LANCE_MERGE_KEYS = ("namespace", "concept_id", "model_version")
 
 # Column order shared by the concept_embeddings table, the parquet shards, and
 # the Arrow tables we build for bulk loading.  Keep these in lockstep.
@@ -111,9 +133,10 @@ def _embedded_rows_to_arrow(rows: list[EmbeddedRow]) -> pa.Table:
 
 @dataclass(frozen=True)
 class _StoreContext:
-    backend: Literal["duckdb", "parquet"]
+    backend: Literal["duckdb", "parquet", "lance"]
     db_path: Path | None = None
     parquet_root: Path | None = None
+    lance_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +162,11 @@ _CONTEXTS: "weakref.WeakKeyDictionary[duckdb.DuckDBPyConnection, _StoreContext]"
 def _resolve_paths(path: Path) -> _StoreContext:
     if path.suffix.lower() == ".duckdb":
         return _StoreContext(backend="duckdb", db_path=path)
+
+    if path.suffix.lower() == ".lance":
+        if path.exists() and path.is_file():
+            raise ValueError(f"Expected directory path for lance store, found file: {path}")
+        return _StoreContext(backend="lance", lance_root=path)
 
     if path.exists() and path.is_file():
         raise ValueError(f"Expected directory path for parquet store, found file: {path}")
@@ -170,6 +198,21 @@ def _registry_pattern(parquet_root: Path) -> str:
 
 def _registry_files(parquet_root: Path) -> list[Path]:
     return sorted(_registry_dir(parquet_root).glob("*.parquet"))
+
+
+def _registry_root(ctx: _StoreContext) -> Path:
+    """Root dir under which the parquet model-registry lives for file backends.
+
+    The lance backend reuses the parquet registry storage (a tiny parquet table
+    under ``_meta/model_registry``) rather than putting metadata inside the Lance
+    dataset, so this returns the lance container dir for lance and the parquet
+    root for parquet.
+    """
+    if ctx.backend == "lance":
+        assert ctx.lance_root is not None
+        return ctx.lance_root
+    assert ctx.parquet_root is not None
+    return ctx.parquet_root
 
 
 def _existing_parquet_patterns(parquet_root: Path) -> list[str]:
@@ -508,11 +551,157 @@ def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContex
         conn.execute("DETACH legacy")
 
 
+# ---------------------------------------------------------------------------
+# Lance backend
+# ---------------------------------------------------------------------------
+
+
+def _import_lance() -> Any:
+    """Import pylance lazily so the module loads without the optional extra.
+
+    The lance backend is opt-in (a ``.lance`` store path), so ``pylance`` is an
+    optional dependency. Importing it lazily keeps the duckdb/parquet backends
+    usable without it and turns a missing install into a clear, actionable error
+    only when a lance path is actually used.
+    """
+    try:
+        import lance
+    except ImportError as exc:  # pragma: no cover - exercised only without extra
+        raise RuntimeError(
+            "The lance store backend requires the optional 'pylance' dependency. "
+            "Install it with `uv sync --extra lance` (or `uv pip install pylance`)."
+        ) from exc
+    return lance
+
+
+def _lance_dataset_path(lance_root: Path) -> Path:
+    """Filesystem path of the Lance dataset inside the store container dir."""
+    return lance_root / LANCE_DATASET_SUBDIR
+
+
+def _lance_dataset_exists(lance_root: Path) -> bool:
+    return _lance_dataset_path(lance_root).exists()
+
+
+def _lance_arrow_schema() -> pa.Schema:
+    """Canonical Arrow schema for the Lance dataset.
+
+    Derived from the same builder ``merge_insert`` uses (``_embedded_rows_to_arrow``)
+    so a migrated dataset is byte-for-byte what later embeds write — same column
+    order, ``string`` vs ``large_string``, and embedding fixed-size-list item
+    field name. A mismatch on any of these would make the first post-migration
+    ``merge_insert`` fail with a schema error.
+    """
+    dummy = EmbeddedRow(
+        concept=ConceptRow(concept_id=0, concept_name=""),
+        embedding=[0.0] * EMBEDDING_DIM,
+        embed_text="",
+        model_version="",
+        embedded_at=datetime(1970, 1, 1, tzinfo=UTC),
+    )
+    return _embedded_rows_to_arrow([dummy]).schema
+
+
+def _lance_refresh_view(conn: duckdb.DuckDBPyConnection, lance_root: Path) -> None:
+    """(Re)register the Lance dataset and rebuild the concept_embeddings view.
+
+    A registered Lance dataset is a snapshot of one version, so after any write
+    (``merge_insert``/``delete``/migration) the registration is stale until
+    re-opened. Callers refresh once writes are committed (mirroring the parquet
+    backend's ``refresh_view``). Unlike parquet, no dedup window is needed:
+    ``merge_insert`` keeps exactly one row per key, so the view is a plain
+    ``SELECT *``.
+    """
+    ds_path = _lance_dataset_path(lance_root)
+    if not ds_path.exists():
+        _create_empty_view(conn)
+        return
+
+    lance = _import_lance()
+    dataset = lance.dataset(str(ds_path))
+    try:
+        conn.unregister(_LANCE_REGISTERED_NAME)
+    except (duckdb.Error, KeyError):
+        pass
+    conn.register(_LANCE_REGISTERED_NAME, dataset)
+    conn.execute(
+        f"CREATE OR REPLACE VIEW concept_embeddings AS "
+        f"SELECT * FROM {_LANCE_REGISTERED_NAME}"
+    )
+
+
+def _lance_merge_insert(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[EmbeddedRow],
+    *,
+    refresh_view: bool,
+) -> None:
+    """Upsert a batch into the Lance dataset via ``merge_insert`` (O(changes)).
+
+    Matched keys are updated in place (deletion vector + new fragment); unmatched
+    keys are inserted. A scattered re-embed therefore writes ~``len(rows)`` rows,
+    not the whole partition — the property that disqualified Delta MERGE here.
+    """
+    if not rows:
+        return
+
+    ctx = _get_context(conn)
+    assert ctx.lance_root is not None
+    lance = _import_lance()
+    arrow_batch = _embedded_rows_to_arrow(rows)
+    ds_path = _lance_dataset_path(ctx.lance_root)
+
+    if not ds_path.exists():
+        ds_path.parent.mkdir(parents=True, exist_ok=True)
+        lance.write_dataset(arrow_batch, str(ds_path), mode="create")
+    else:
+        dataset = lance.dataset(str(ds_path))
+        (
+            dataset.merge_insert(on=list(_LANCE_MERGE_KEYS))
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(arrow_batch)
+        )
+
+    if refresh_view:
+        _lance_refresh_view(conn, ctx.lance_root)
+
+
+def _lance_delete(
+    conn: duckdb.DuckDBPyConnection,
+    model_version: str,
+    vocabulary_ids: list[str] | None,
+) -> None:
+    """Delete rows for a model version (optionally limited to vocabularies).
+
+    Lance ``delete`` takes a SQL-like predicate string. ``model_version`` is a
+    hex SHA-256 digest and vocabulary IDs are controlled values, but quotes are
+    escaped defensively. The view is refreshed afterwards.
+    """
+    ctx = _get_context(conn)
+    assert ctx.lance_root is not None
+    ds_path = _lance_dataset_path(ctx.lance_root)
+    if not ds_path.exists():
+        return
+
+    lance = _import_lance()
+    dataset = lance.dataset(str(ds_path))
+    mv = model_version.replace("'", "''")
+    if vocabulary_ids is None:
+        dataset.delete(f"model_version = '{mv}'")
+    else:
+        quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in vocabulary_ids)
+        dataset.delete(f"model_version = '{mv}' AND vocabulary_id IN ({quoted})")
+
+    _lance_refresh_view(conn, ctx.lance_root)
+
+
 def open_db(path: Path) -> duckdb.DuckDBPyConnection:
     """Open storage backend for *path*.
 
     - ``*.duckdb`` paths use native DuckDB table-backed storage (fast local writes).
-    - Directory paths use parquet-sharded storage with DuckDB as query layer.
+    - ``*.lance`` paths use a Lance dataset with DuckDB as an in-memory query layer.
+    - Other directory paths use parquet-sharded storage with DuckDB as query layer.
     """
     ctx = _resolve_paths(path)
 
@@ -521,6 +710,11 @@ def open_db(path: Path) -> duckdb.DuckDBPyConnection:
         ctx.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = duckdb.connect(str(ctx.db_path))
         logger.info("Opened duckdb-backed store at %s", ctx.db_path)
+    elif ctx.backend == "lance":
+        assert ctx.lance_root is not None
+        ctx.lance_root.mkdir(parents=True, exist_ok=True)
+        conn = duckdb.connect(":memory:")
+        logger.info("Opened lance-backed store at %s", ctx.lance_root)
     else:
         assert ctx.parquet_root is not None
         ctx.parquet_root.mkdir(parents=True, exist_ok=True)
@@ -619,6 +813,17 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         logger.debug("DuckDB-backed schema ensured")
         return
 
+    if ctx.backend == "lance":
+        assert ctx.lance_root is not None
+        ctx.lance_root.mkdir(parents=True, exist_ok=True)
+        # The Lance dataset is created lazily on first write; here we only wire
+        # up the concept_embeddings view (empty until data exists). Legacy
+        # migration into Lance is an explicit command, not an open-time side
+        # effect (see migrate_duckdb_to_lance).
+        _lance_refresh_view(conn, ctx.lance_root)
+        logger.debug("Lance-backed schema ensured")
+        return
+
     assert ctx.parquet_root is not None
     ctx.parquet_root.mkdir(parents=True, exist_ok=True)
     _migrate_legacy_if_needed(conn, ctx)
@@ -627,17 +832,19 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def refresh_view(conn: duckdb.DuckDBPyConnection) -> None:
-    """Rebuild the logical concept_embeddings view over the parquet shards.
+    """Rebuild the logical concept_embeddings view over the file backend's data.
 
-    Call after writing shards with ``refresh_view=False`` so the view reflects
-    them. No-op for the duckdb backend, which writes a real table rather than a
+    Call after writing with ``refresh_view=False`` so the view reflects the new
+    data. No-op for the duckdb backend, which writes a real table rather than a
     view (so there is nothing to refresh).
     """
     ctx = _get_context(conn)
-    if ctx.backend != "parquet":
-        return
-    assert ctx.parquet_root is not None
-    _refresh_view(conn, ctx.parquet_root)
+    if ctx.backend == "parquet":
+        assert ctx.parquet_root is not None
+        _refresh_view(conn, ctx.parquet_root)
+    elif ctx.backend == "lance":
+        assert ctx.lance_root is not None
+        _lance_refresh_view(conn, ctx.lance_root)
 
 
 def classify_rows_requiring_embedding(
@@ -794,6 +1001,11 @@ def upsert_rows(
             )
         finally:
             conn.unregister("_upsert_batch")
+        logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
+        return
+
+    if ctx.backend == "lance":
+        _lance_merge_insert(conn, rows, refresh_view=refresh_view)
         logger.info("Upserted %d rows in total (mode=%s)", len(rows), mode)
         return
 
@@ -958,6 +1170,8 @@ def delete_embeddings(
                 """,
                 [model_version, list(vocabulary_ids)],
             )
+    elif ctx.backend == "lance":
+        _lance_delete(conn, model_version, vocabulary_ids)
     else:
         _delete_parquet_partitions(conn, model_version, vocabulary_ids)
 
@@ -997,10 +1211,14 @@ def _delete_parquet_registry_entry(
     conn: duckdb.DuckDBPyConnection,
     model_version: str,
 ) -> None:
-    """Rewrite the parquet model registry without *model_version*."""
+    """Rewrite the parquet model registry without *model_version*.
+
+    Shared by the parquet and lance backends (lance reuses the parquet registry
+    storage under its container dir; see ``_registry_root``).
+    """
     ctx = _get_context(conn)
-    assert ctx.parquet_root is not None
-    registry_files = _registry_files(ctx.parquet_root)
+    registry_root = _registry_root(ctx)
+    registry_files = _registry_files(registry_root)
     if not registry_files:
         return
 
@@ -1010,7 +1228,7 @@ def _delete_parquet_registry_entry(
     if not remaining:
         return
 
-    registry_dir = _registry_dir(ctx.parquet_root)
+    registry_dir = _registry_dir(registry_root)
     registry_dir.mkdir(parents=True, exist_ok=True)
     rewrite = pa.table(
         {
@@ -1023,6 +1241,10 @@ def _delete_parquet_registry_entry(
             "quantization_scheme": pa.array(
                 [e.quantization_scheme for e in remaining], type=pa.string()
             ),
+            # ``pooling`` was added to the registry after this rewrite path was
+            # first written; omitting it here drops the column on delete, so a
+            # later list_model_registry (which selects pooling) fails to bind.
+            "pooling": pa.array([e.pooling for e in remaining], type=pa.string()),
             "recorded_at": pa.array(
                 [
                     e.recorded_at.replace(tzinfo=None) if e.recorded_at.tzinfo else e.recorded_at
@@ -1076,10 +1298,11 @@ def upsert_model_registry(
     quantization_scheme: str = "none",
     pooling: str = "cls",
 ) -> None:
-    """Upsert model provenance metadata alongside parquet embeddings.
+    """Upsert model provenance metadata alongside file-backend embeddings.
 
-    Registry rows are stored in ``<parquet_root>/_meta/model_registry/*.parquet``
-    and deduplicated by ``model_version``.
+    For the parquet and lance backends, registry rows are stored in
+    ``<root>/_meta/model_registry/*.parquet`` and deduplicated by
+    ``model_version``.
     """
     ctx = _get_context(conn)
 
@@ -1108,8 +1331,8 @@ def upsert_model_registry(
         )
         return
 
-    assert ctx.parquet_root is not None
-    registry_dir = _registry_dir(ctx.parquet_root)
+    registry_root = _registry_root(ctx)
+    registry_dir = _registry_dir(registry_root)
     registry_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(tz=UTC)
@@ -1150,7 +1373,7 @@ def upsert_model_registry(
         ],
     )
 
-    registry_files = _registry_files(ctx.parquet_root)
+    registry_files = _registry_files(registry_root)
     if registry_files:
         conn.execute(
             """
@@ -1169,7 +1392,7 @@ def upsert_model_registry(
             )
             """.replace(
                 "__REGISTRY_PATTERN__",
-                _registry_pattern(ctx.parquet_root).replace("'", "''"),
+                _registry_pattern(registry_root).replace("'", "''"),
             )
         )
     else:
@@ -1250,7 +1473,7 @@ def upsert_model_registry(
 
 
 def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEntry]:
-    """Return model registry entries stored alongside parquet shards."""
+    """Return model registry entries (DuckDB table, or parquet metadata for file backends)."""
     ctx = _get_context(conn)
 
     if ctx.backend == "duckdb":
@@ -1281,8 +1504,8 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
             for row in rows
         ]
 
-    assert ctx.parquet_root is not None
-    if not _registry_files(ctx.parquet_root):
+    registry_root = _registry_root(ctx)
+    if not _registry_files(registry_root):
         return []
 
     rows = conn.execute(
@@ -1316,7 +1539,7 @@ def list_model_registry(conn: duckdb.DuckDBPyConnection) -> list[ModelRegistryEn
         WHERE _rownum = 1
         ORDER BY CAST(recorded_at AS TIMESTAMP) DESC, model_version
         """,
-        [_registry_pattern(ctx.parquet_root)],
+        [_registry_pattern(registry_root)],
     ).fetchall()
 
     return [
@@ -1460,3 +1683,150 @@ def upsert_model_version_cache(
         pooling,
         sha256[:12],
     )
+
+
+# ---------------------------------------------------------------------------
+# Lance maintenance / migration
+# ---------------------------------------------------------------------------
+
+
+def compact(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    cleanup_older_than_days: float | None = 7.0,
+) -> dict[str, int]:
+    """Compact the Lance dataset and prune old versions (lance backend only).
+
+    ``compact_files`` bin-packs small fragments and materializes deletion vectors
+    left by ``merge_insert``; ``cleanup_old_versions`` then reclaims superseded
+    versions (pass ``cleanup_older_than_days=None`` to skip, keeping time-travel
+    history). Reads are correct *without* compaction — deletion vectors already
+    dedupe — so this is optional maintenance. It is a writer: run it when
+    ``embed`` is idle, never concurrently with a live embed. Returns a metrics
+    dict for the caller to report.
+    """
+    ctx = _get_context(conn)
+    if ctx.backend != "lance":
+        raise ValueError("compact is only supported for the lance backend")
+    assert ctx.lance_root is not None
+
+    result = {
+        "fragments_removed": 0,
+        "fragments_added": 0,
+        "versions_removed": 0,
+        "bytes_removed": 0,
+    }
+    ds_path = _lance_dataset_path(ctx.lance_root)
+    if not ds_path.exists():
+        logger.info("compact: no lance dataset at %s; nothing to do", ds_path)
+        return result
+
+    lance = _import_lance()
+    dataset = lance.dataset(str(ds_path))
+    metrics = dataset.optimize.compact_files()
+    result["fragments_removed"] = int(metrics.fragments_removed)
+    result["fragments_added"] = int(metrics.fragments_added)
+
+    if cleanup_older_than_days is not None:
+        stats = dataset.cleanup_old_versions(
+            older_than=timedelta(days=cleanup_older_than_days)
+        )
+        result["versions_removed"] = int(getattr(stats, "old_versions", 0))
+        result["bytes_removed"] = int(getattr(stats, "bytes_removed", 0))
+
+    _lance_refresh_view(conn, ctx.lance_root)
+    logger.info(
+        "compact: fragments removed=%d added=%d; %d old version(s) removed (%d bytes)",
+        result["fragments_removed"],
+        result["fragments_added"],
+        result["versions_removed"],
+        result["bytes_removed"],
+    )
+    return result
+
+
+def migrate_duckdb_to_lance(
+    conn: duckdb.DuckDBPyConnection,
+    legacy_db_path: Path,
+    *,
+    batch_rows: int = 100_000,
+) -> int:
+    """Stream a legacy ``.duckdb`` concept_embeddings table into the Lance store.
+
+    Reuses the legacy-migration template: ATTACH the source read-only and stream
+    Arrow batches into ``lance.write_dataset`` (casting each to the canonical
+    schema), so the result is byte-for-byte what ``embed`` later writes. Columns
+    absent from an older legacy table (``namespace``, ``source_id``,
+    ``mapping_wave``) are synthesised. Streaming, so the whole table is never held
+    in memory. Re-runnable: if the Lance dataset already holds rows it is left
+    untouched (move it aside to re-migrate). ``conn`` must be a lance-backed
+    store connection. Returns rows migrated (0 when skipped).
+    """
+    ctx = _get_context(conn)
+    if ctx.backend != "lance":
+        raise ValueError("migrate_duckdb_to_lance requires a lance store path")
+    assert ctx.lance_root is not None
+
+    ds_path = _lance_dataset_path(ctx.lance_root)
+    lance = _import_lance()
+    if _lance_dataset_exists(ctx.lance_root):
+        existing = lance.dataset(str(ds_path)).count_rows()
+        if existing > 0:
+            logger.info(
+                "migrate_duckdb_to_lance: target already holds %d row(s); skipping. "
+                "Move it aside to re-migrate.",
+                existing,
+            )
+            return 0
+
+    if not legacy_db_path.exists() or not legacy_db_path.is_file():
+        raise FileNotFoundError(legacy_db_path)
+
+    escaped_legacy = str(legacy_db_path).replace("'", "''")
+    conn.execute(f"ATTACH '{escaped_legacy}' AS legacy (READ_ONLY)")
+    try:
+        has_table = conn.execute(
+            """
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_catalog = 'legacy' AND table_schema = 'main'
+              AND table_name = 'concept_embeddings'
+            """
+        ).fetchone()
+        if not has_table or int(has_table[0]) == 0:
+            logger.info("migrate_duckdb_to_lance: no legacy concept_embeddings table")
+            return 0
+        row_count = conn.execute("SELECT COUNT(*) FROM legacy.concept_embeddings").fetchone()
+        if not row_count or int(row_count[0]) == 0:
+            logger.info("migrate_duckdb_to_lance: legacy table is empty")
+            return 0
+
+        legacy_columns = {
+            str(r[0]) for r in conn.execute("DESCRIBE legacy.concept_embeddings").fetchall()
+        }
+
+        def _select_col(name: str) -> str:
+            if name == "namespace":
+                return "namespace" if "namespace" in legacy_columns else "'athena' AS namespace"
+            return name if name in legacy_columns else f"NULL AS {name}"
+
+        select_cols = ", ".join(_select_col(c) for c in _EMBEDDING_COLUMNS)
+        schema = _lance_arrow_schema()
+        reader = conn.execute(
+            f"SELECT {select_cols} FROM legacy.concept_embeddings"
+        ).to_arrow_reader(batch_rows)
+        ds_path.parent.mkdir(parents=True, exist_ok=True)
+        # mode="overwrite" handles both a fresh path and a leftover empty dataset
+        # dir from an interrupted run (the >0-row case was skipped above).
+        lance.write_dataset(
+            (batch.cast(schema) for batch in reader),
+            str(ds_path),
+            schema=schema,
+            mode="overwrite",
+        )
+    finally:
+        conn.execute("DETACH legacy")
+
+    migrated = int(lance.dataset(str(ds_path)).count_rows())
+    _lance_refresh_view(conn, ctx.lance_root)
+    logger.info("migrate_duckdb_to_lance: migrated %d row(s) into %s", migrated, ds_path)
+    return migrated

@@ -1,8 +1,42 @@
-# Proposal: Lance as the ACID + concurrent embedding store
+# ADR: Lance as the ACID + concurrent embedding store
 
 **Date:** 2026-06
-**Status:** Proposed — recommendation, pending team decision. Supersedes the
-delta-rs lean in `adr_parquet_store_rejected.md` (2026-06 addendum).
+**Status:** **Accepted** (2026-06-29) — Lance is adopted as the live store for
+the ACID + cross-process-concurrency requirement; **delta-rs is rejected** (its
+`MERGE` amplifies on scattered re-embeds, and its append mode offers no native
+upsert/dedup, only the parquet backend's discipline plus an ACID log). DuckDB
+remains the default backend; Lance is opt-in via a `.lance` store path.
+Supersedes the delta-rs lean in `adr_parquet_store_rejected.md` (2026-06
+addendum). A flag-gated prototype now exists (see "Implementation" below).
+
+---
+
+## Implementation (prototype, 2026-06-29)
+
+Behind the existing `store.open_db` path dispatch — a `.lance` store path selects
+the Lance backend, so nothing changes unless that path is chosen:
+
+- **Backend in `store.py`:** `merge_insert` upsert (O(changes)), DuckDB-as-query
+  layer (`concept_embeddings` is a view over the registered Lance dataset, so all
+  readers/`export` are unchanged), `delete` by predicate, and the model registry
+  reused from the parquet `_meta/model_registry` layout. csv-fingerprint and
+  model-version caches are no-ops (as for parquet — re-hash/re-read rather than
+  risk a stale hit).
+- **CLI:** `gpu-embed migrate-lance` (streaming, re-runnable `duckdb → lance`),
+  `gpu-embed compact` (`compact_files` + `cleanup_old_versions`), and `export`
+  works unchanged (`lance → parquet` via the view).
+- **Dependency:** optional `pylance` extra (`uv sync --extra lance`); imported
+  lazily so the default backends do not require it. Tests in
+  `tests/unit/test_store_lance.py` cover upsert/merge, classify, delete,
+  registry, compaction, migration, and `lance → parquet` export.
+- **Layout:** a `.lance` store is a container dir — dataset at
+  `<store>.lance/concept_embeddings.lance/`, registry at `<store>.lance/_meta/`
+  — so Lance maintenance never touches the metadata and vice versa. Migration
+  casts to the canonical Arrow schema so a post-migration `embed` merges without
+  a schema clash.
+
+Open validation items remain in "Caveats" (compaction memory at 12M; a concrete
+retention policy; export-to-parquet throughput at scale).
 
 ---
 

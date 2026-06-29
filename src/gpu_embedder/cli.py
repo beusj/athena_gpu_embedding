@@ -207,7 +207,7 @@ def embed_cmd(
         Path | None,
         typer.Option(
             envvar="GPU_EMBED_DB",
-            help="Embedding store path (parquet root or legacy .duckdb)",
+            help="Embedding store path: .duckdb (default), .lance, or a parquet directory",
         ),
     ] = None,
     model: Annotated[
@@ -957,6 +957,145 @@ def migrate_store_cmd(
         )
     else:
         typer.echo(f"Store initialization complete: {store_root}")
+
+
+# ---------------------------------------------------------------------------
+# migrate-lance subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("migrate-lance")
+def migrate_lance_cmd(
+    db: Annotated[
+        Path | None,
+        typer.Option(
+            envvar="GPU_EMBED_DB",
+            help="Destination Lance store path (must end in .lance)",
+        ),
+    ] = None,
+    source: Annotated[
+        Path | None,
+        typer.Option(
+            "--from",
+            help="Legacy .duckdb file to migrate from (default: <db>.duckdb sibling)",
+        ),
+    ] = None,
+    batch_rows: Annotated[
+        int,
+        typer.Option("--batch-rows", min=1, help="Rows per streamed Arrow batch"),
+    ] = 100_000,
+    reset: Annotated[
+        bool,
+        typer.Option("--reset", help="Move an existing Lance store aside before migrating"),
+    ] = False,
+) -> None:
+    """Migrate a legacy .duckdb embeddings table into a Lance store.
+
+    Streaming and re-runnable: ATTACHes the legacy DuckDB read-only and streams
+    Arrow batches into the Lance dataset. If the target already holds rows it is
+    left untouched (pass --reset to move it aside and re-migrate).
+    """
+    from gpu_embedder import store as st
+
+    cfg = EmbedConfig(**cast(dict[str, Any], {"db": db} if db is not None else {}))
+
+    if cfg.db.suffix.lower() != ".lance":
+        typer.echo(
+            f"ERROR: --db must be a Lance store path ending in .lance; got {cfg.db}.",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    legacy = source if source is not None else cfg.db.with_suffix(".duckdb")
+    if not legacy.exists() or not legacy.is_file():
+        typer.echo(
+            f"ERROR: legacy DuckDB store not found: {legacy}. Pass --from <path.duckdb>.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if reset and cfg.db.exists():
+        backup_dir = (
+            cfg.db.parent
+            / f"{cfg.db.name}_backup_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        shutil.move(str(cfg.db), str(backup_dir))
+        typer.echo(f"Moved existing Lance store to backup: {backup_dir}")
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    typer.echo(f"Migrating {legacy} -> {cfg.db} (streaming {batch_rows:,} rows/batch) …")
+    migrated = st.migrate_duckdb_to_lance(conn, legacy, batch_rows=batch_rows)
+    if migrated == 0:
+        typer.echo(
+            "Nothing migrated: the target already holds rows, or the legacy store "
+            "is empty. Use --reset to re-migrate from scratch."
+        )
+    else:
+        typer.echo(f"Migrated {migrated:,} embedding(s) into {cfg.db}.")
+
+
+# ---------------------------------------------------------------------------
+# compact subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("compact")
+def compact_cmd(
+    db: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_DB", help="Lance store path to compact (.lance)"),
+    ] = None,
+    cleanup_older_than_days: Annotated[
+        float,
+        typer.Option(
+            "--cleanup-older-than-days",
+            min=0.0,
+            help="Prune Lance versions older than this many days (retention window)",
+        ),
+    ] = 7.0,
+    no_cleanup: Annotated[
+        bool,
+        typer.Option("--no-cleanup", help="Compact only; keep all old versions for time-travel"),
+    ] = False,
+) -> None:
+    """Compact a Lance store: bin-pack fragments and prune old versions.
+
+    Reads stay correct without compaction (deletion vectors already dedupe), so
+    this is optional maintenance. It is a *writer* — run it only when `embed` is
+    idle, never concurrently with a live embed run.
+    """
+    from gpu_embedder import store as st
+
+    cfg = EmbedConfig(**cast(dict[str, Any], {"db": db} if db is not None else {}))
+
+    if cfg.db.suffix.lower() != ".lance":
+        typer.echo(
+            f"ERROR: compact applies only to a Lance store (a .lance path); got {cfg.db}.",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    typer.echo(f"Compacting Lance store: {cfg.db} …")
+    metrics = st.compact(
+        conn,
+        cleanup_older_than_days=None if no_cleanup else cleanup_older_than_days,
+    )
+    typer.echo("Compaction complete.")
+    typer.echo(
+        f"  Fragments removed/added: {metrics['fragments_removed']}/{metrics['fragments_added']}"
+    )
+    if no_cleanup:
+        typer.echo("  Old versions retained (--no-cleanup).")
+    else:
+        typer.echo(
+            f"  Old versions removed: {metrics['versions_removed']} "
+            f"({metrics['bytes_removed']:,} bytes reclaimed)"
+        )
 
 
 # ---------------------------------------------------------------------------

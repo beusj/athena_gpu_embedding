@@ -215,12 +215,15 @@ Recommendations (all within the embedded / no-separate-RDBMS constraint):
    the (demoted) parquet backend already implements bar compaction, and which
    Delta in *append* mode (not MERGE) also provides with an ACID log. Either
    reopens the parquet decision, so do it deliberately, not by drift.
-4. **Lance / LanceDB — now benchmarked and recommended; see
-   `adr_lance_store_proposal.md`.** Its deletion-vector update model made a
+4. **Lance / LanceDB — benchmarked, recommended, and now ADOPTED (2026-06-29);
+   see `adr_lance_store_proposal.md`.** Its deletion-vector update model made a
    scattered 200k re-embed **O(changes)** (~200k rows written, ~3s) instead of
    Delta MERGE's O(partition) (1M rows, 4×), with ACID snapshot isolation and
    multi-reader concurrency confirmed. Given the ACID + concurrency requirement,
-   Lance is the recommended live store; Delta-rs append mode is the fallback.
+   Lance is the adopted opt-in live store (a `.lance` path); Delta-rs is
+   rejected (MERGE amplifies; append mode adds no native upsert over the parquet
+   path). A flag-gated prototype now exists in `store.py` + the `migrate-lance` /
+   `compact` CLI commands.
 
 Criterion #4 (write throughput ≥ DuckDB table) is met for *writes*, but the
 re-embed amplification means a wholesale parquet/Delta-MERGE switch is **not**
