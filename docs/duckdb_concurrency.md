@@ -120,3 +120,8 @@ Lance — but that reopens the storage-backend decision
 (`adr_parquet_store_rejected.md`) and is constrained to **embedded** stores (no
 separate client-server RDBMS, by requirement). Spark is not relevant under that
 constraint.
+
+When the requirement is **ACID + cross-process concurrency** (not just
+concurrency), pure DuckDB cannot satisfy it and the recommended path is **Lance**
+as the live store — benchmarked O(changes) upserts with ACID snapshot isolation.
+See `adr_lance_store_proposal.md`.
