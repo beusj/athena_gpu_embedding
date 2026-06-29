@@ -116,12 +116,15 @@ class TestEnsureSchema:
 
 class TestUpsertAndExistence:
     def test_upsert_then_get_ids(self, tmp_path: Path) -> None:
-        conn = open_db(tmp_path / "embeddings")
+        store_root = tmp_path / "embeddings"
+        conn = open_db(store_root)
         ensure_schema(conn)
         rows = [_make_row(i) for i in range(1, 4)]
         upsert_rows(conn, rows)
         ids = get_existing_ids(conn, "v1")
         assert ids == {1, 2, 3}
+        shards = list(store_root.glob("model_version=*/vocabulary_id=*/*.parquet"))
+        assert shards
 
     def test_get_ids_scoped_to_model_version(self, tmp_path: Path) -> None:
         conn = open_db(tmp_path / "embeddings")

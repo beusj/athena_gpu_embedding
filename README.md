@@ -176,7 +176,8 @@ Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 ### Storage model and migration
 
 - Default store path is `embeddings/` (directory).
-- Data is stored as parquet files under `model_version=<digest>/part-*.parquet`.
+- Data is stored as parquet files under
+  `model_version=<digest>/vocabulary_id=<value>/part-*.parquet`.
 - `concept_embeddings` is exposed as a DuckDB view for all reads and exports.
 - If `--db` / `GPU_EMBED_DB` points to an existing legacy `.duckdb` file,
   rows are auto-migrated one time into a sibling parquet directory with the

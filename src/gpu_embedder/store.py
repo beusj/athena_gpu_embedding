@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from glob import glob
 from pathlib import Path
+from math import ceil
 from typing import Literal
 
 import duckdb
@@ -19,6 +20,8 @@ import duckdb
 from gpu_embedder.models import EmbeddedRow
 
 logger = logging.getLogger(__name__)
+TARGET_ROWS_PER_SHARD = 250_000
+NULL_VOCAB_PARTITION = "_null"
 
 
 @dataclass(frozen=True)
@@ -49,12 +52,23 @@ def _get_context(conn: duckdb.DuckDBPyConnection) -> _StoreContext:
     return ctx
 
 
-def _parquet_glob(parquet_root: Path) -> str:
-    return str((parquet_root / "model_version=*" / "*.parquet").as_posix())
+def _parquet_patterns(parquet_root: Path) -> list[str]:
+    return [
+        str((parquet_root / "model_version=*" / "*.parquet").as_posix()),
+        str((parquet_root / "model_version=*" / "vocabulary_id=*" / "*.parquet").as_posix()),
+    ]
+
+
+def _existing_parquet_patterns(parquet_root: Path) -> list[str]:
+    existing: list[str] = []
+    for pattern in _parquet_patterns(parquet_root):
+        if glob(pattern):
+            existing.append(pattern)
+    return existing
 
 
 def _has_parquet_data(parquet_root: Path) -> bool:
-    return bool(glob(_parquet_glob(parquet_root)))
+    return bool(_existing_parquet_patterns(parquet_root))
 
 
 def _create_empty_view(conn: duckdb.DuckDBPyConnection) -> None:
@@ -80,11 +94,23 @@ def _create_empty_view(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _refresh_view(conn: duckdb.DuckDBPyConnection, parquet_root: Path) -> None:
-    if not _has_parquet_data(parquet_root):
+    patterns = _existing_parquet_patterns(parquet_root)
+    if not patterns:
         _create_empty_view(conn)
         return
 
-    parquet_pattern = _parquet_glob(parquet_root).replace("'", "''")
+    parquet_sources = "\nUNION ALL\n".join(
+        """
+            SELECT *
+            FROM read_parquet(
+                '__PARQUET_GLOB__',
+                hive_partitioning=true,
+                union_by_name=true,
+                filename=true
+            )
+        """.replace("__PARQUET_GLOB__", pattern.replace("'", "''"))
+        for pattern in patterns
+    )
     conn.execute(
         """
         CREATE OR REPLACE VIEW concept_embeddings AS
@@ -108,16 +134,97 @@ def _refresh_view(conn: duckdb.DuckDBPyConnection, parquet_root: Path) -> None:
                     PARTITION BY concept_id, model_version
                     ORDER BY CAST(embedded_at AS TIMESTAMP) DESC, filename DESC
                 ) AS _rownum
-            FROM read_parquet(
-                '__PARQUET_GLOB__',
-                hive_partitioning=true,
-                union_by_name=true,
-                filename=true
-            )
+            FROM (
+__PARQUET_SOURCES__
+            ) AS all_parquet
         ) dedup
         WHERE _rownum = 1
-        """.replace("__PARQUET_GLOB__", parquet_pattern),
+        """.replace("__PARQUET_SOURCES__", parquet_sources),
     )
+
+
+def _copy_relation_to_partitioned_shards(
+    conn: duckdb.DuckDBPyConnection,
+    source_relation: str,
+    parquet_root: Path,
+) -> int:
+    partitions = conn.execute(
+        f"""
+        SELECT
+            model_version,
+            COALESCE(vocabulary_id, ?) AS vocabulary_partition,
+            vocabulary_id,
+            COUNT(*) AS row_count
+        FROM {source_relation}
+        GROUP BY model_version, COALESCE(vocabulary_id, ?), vocabulary_id
+        """,
+        [NULL_VOCAB_PARTITION, NULL_VOCAB_PARTITION],
+    ).fetchall()
+
+    total_files = 0
+    for model_version, vocabulary_partition, vocabulary_id, row_count in partitions:
+        partition_dir = parquet_root / f"model_version={model_version}" / f"vocabulary_id={vocabulary_partition}"
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        shard_count = ceil(int(row_count) / TARGET_ROWS_PER_SHARD)
+
+        for shard_idx in range(shard_count):
+            start_rn = shard_idx * TARGET_ROWS_PER_SHARD + 1
+            end_rn = min((shard_idx + 1) * TARGET_ROWS_PER_SHARD, int(row_count))
+            shard_path = partition_dir / f"part-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
+            escaped_shard = shard_path.as_posix().replace("'", "''")
+            conn.execute(
+                f"""
+                COPY (
+                    SELECT
+                        concept_id,
+                        concept_name,
+                        domain_id,
+                        vocabulary_id,
+                        concept_class_id,
+                        standard_concept,
+                        concept_code,
+                        invalid_reason,
+                        embedding,
+                        embed_text,
+                        model_version,
+                        embedded_at
+                    FROM (
+                        SELECT
+                            concept_id,
+                            concept_name,
+                            domain_id,
+                            vocabulary_id,
+                            concept_class_id,
+                            standard_concept,
+                            concept_code,
+                            invalid_reason,
+                            embedding,
+                            embed_text,
+                            model_version,
+                            embedded_at,
+                            ROW_NUMBER() OVER (ORDER BY concept_id) AS rn
+                                                FROM {source_relation}
+                        WHERE model_version = ?
+                          AND (
+                                (? = ? AND vocabulary_id IS NULL)
+                                OR vocabulary_id = ?
+                              )
+                    ) ranked
+                    WHERE rn BETWEEN ? AND ?
+                ) TO '{escaped_shard}'
+                (FORMAT PARQUET, COMPRESSION ZSTD)
+                """,
+                [
+                    model_version,
+                    vocabulary_partition,
+                    NULL_VOCAB_PARTITION,
+                    vocabulary_id,
+                    start_rn,
+                    end_rn,
+                ],
+            )
+            total_files += 1
+    return total_files
 
 
 def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContext) -> None:
@@ -141,48 +248,18 @@ def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContex
             logger.info("No legacy concept_embeddings table found; skipping migration")
             return
 
-        model_versions = conn.execute(
-            "SELECT DISTINCT model_version FROM legacy.concept_embeddings"
-        ).fetchall()
-        if not model_versions:
+        row_count = conn.execute("SELECT COUNT(*) FROM legacy.concept_embeddings").fetchone()
+        if not row_count or int(row_count[0]) == 0:
             logger.info("Legacy concept_embeddings is empty; skipping migration")
             return
 
-        migrated_files = 0
-        for row in model_versions:
-            model_version = row[0]
-            partition_dir = ctx.parquet_root / f"model_version={model_version}"
-            partition_dir.mkdir(parents=True, exist_ok=True)
-            shard_path = partition_dir / (
-                f"migrated-{datetime.now(tz=UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex}.parquet"
-            )
-            escaped_shard = shard_path.as_posix().replace("'", "''")
-            conn.execute(
-                f"""
-                COPY (
-                    SELECT
-                        concept_id,
-                        concept_name,
-                        domain_id,
-                        vocabulary_id,
-                        concept_class_id,
-                        standard_concept,
-                        concept_code,
-                        invalid_reason,
-                        embedding,
-                        embed_text,
-                        model_version,
-                        embedded_at
-                    FROM legacy.concept_embeddings
-                    WHERE model_version = ?
-                ) TO '{escaped_shard}'
-                (FORMAT PARQUET, COMPRESSION ZSTD)
-                """,
-                [model_version],
-            )
-            migrated_files += 1
+        migrated_files = _copy_relation_to_partitioned_shards(
+            conn,
+            "legacy.concept_embeddings",
+            ctx.parquet_root,
+        )
 
-        logger.info("Migrated %d model_version shard(s) from legacy DuckDB", migrated_files)
+        logger.info("Migrated legacy DuckDB into %d parquet shard(s)", migrated_files)
     finally:
         conn.execute("DETACH legacy")
 
@@ -280,39 +357,11 @@ def _append_rows_as_parquet_shards(conn: duckdb.DuckDBPyConnection, rows: list[E
         records,
     )
 
-    model_versions = conn.execute(
-        "SELECT DISTINCT model_version FROM temp_embeddings"
-    ).fetchall()
-    for row in model_versions:
-        model_version = row[0]
-        partition_dir = ctx.parquet_root / f"model_version={model_version}"
-        partition_dir.mkdir(parents=True, exist_ok=True)
-        shard_path = partition_dir / f"part-{uuid.uuid4().hex}.parquet"
-        escaped_shard = shard_path.as_posix().replace("'", "''")
-
-        conn.execute(
-            f"""
-            COPY (
-                SELECT
-                    concept_id,
-                    concept_name,
-                    domain_id,
-                    vocabulary_id,
-                    concept_class_id,
-                    standard_concept,
-                    concept_code,
-                    invalid_reason,
-                    embedding,
-                    embed_text,
-                    model_version,
-                    embedded_at
-                FROM temp_embeddings
-                WHERE model_version = ?
-            ) TO '{escaped_shard}'
-            (FORMAT PARQUET, COMPRESSION ZSTD)
-            """,
-            [model_version],
-        )
+    _copy_relation_to_partitioned_shards(
+        conn,
+        "temp_embeddings",
+        ctx.parquet_root,
+    )
 
     conn.execute("DROP TABLE IF EXISTS temp_embeddings")
     _refresh_view(conn, ctx.parquet_root)

@@ -1,11 +1,11 @@
 # S3 to Snowflake Load Runbook
 
-This runbook covers the operational flow for moving exported embeddings from
-local DuckDB to S3 and loading them into Snowflake.
+This runbook covers the operational flow for moving parquet-backed embeddings
+from the local store to S3 and loading them into Snowflake.
 
 ## Scope
 
-- Export sharded parquet files from DuckDB
+- Sync parquet shards from the local embeddings store
 - Authenticate to AWS CLI
 - Copy or sync parquet shards to S3
 - Load from S3 into Snowflake with `COPY INTO`
@@ -13,32 +13,30 @@ local DuckDB to S3 and loading them into Snowflake.
 
 ## Prerequisites
 
-- DuckDB embeddings DB available (default: `embeddings.duckdb`)
+- Embeddings store available (default: `embeddings/`)
 - AWS CLI installed and configured (default profile or named profile)
 - S3 bucket + path chosen for parquet dataset
 - Snowflake `STORAGE INTEGRATION` with read access to the bucket path
 
-## 1) Export sharded parquet from DuckDB
+## 1) Validate local embeddings parquet store
 
-Vocabulary is the directory key and shard files are written as:
+By default, embeddings are stored as:
 
-`<output_root>/<vocabulary_id>/part-00000.parquet`
-
-```bash
-uv run gpu-embed export exports/parquet \
-  --db embeddings.duckdb \
-  --shard-rows 50000
-```
-
-Optional filtered export:
+`embeddings/model_version=<sha256>/vocabulary_id=<value>/part-*.parquet`
 
 ```bash
-uv run gpu-embed export exports/parquet \
-  --db embeddings.duckdb \
-  --model-version <model_version_prefix> \
-  --vocabulary-id SNOMED,LOINC \
-  --shard-rows 50000
+uv run gpu-embed status --db embeddings
+uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/*.parquet'))))"
 ```
+
+If you are migrating from a legacy `.duckdb` file and have not migrated yet,
+run once to trigger automatic migration:
+
+```bash
+uv run gpu-embed status --db embeddings.duckdb
+```
+
+This creates `embeddings/model_version=.../*.parquet` and no manual pre-export is required.
 
 ## 2) Authenticate to AWS CLI
 
@@ -79,7 +77,7 @@ Use `cp --recursive` for a full push:
 
 ```bash
 AWS_PAGER="" aws s3 cp \
-  --recursive exports/parquet \
+  --recursive embeddings \
   s3://<your-bucket>/concept_embeddings/
 ```
 
@@ -87,7 +85,7 @@ Use `sync` for repeat runs:
 
 ```bash
 AWS_PAGER="" aws s3 sync \
-  exports/parquet \
+  embeddings \
   s3://<your-bucket>/concept_embeddings/
 ```
 
@@ -95,9 +93,26 @@ Expected layout:
 
 ```text
 s3://<your-bucket>/concept_embeddings/
-  SNOMED/part-00000.parquet
-  SNOMED/part-00001.parquet
-  LOINC/part-00000.parquet
+  model_version=<sha256>/vocabulary_id=SNOMED/part-00000.parquet
+  model_version=<sha256>/vocabulary_id=LOINC/part-00000.parquet
+  model_version=<sha256>/vocabulary_id=_null/part-00000.parquet
+```
+
+### Optional: curated export flow
+
+Keep `gpu-embed export` for curated extracts (e.g., specific model version,
+vocabulary subsets, or custom shard sizing):
+
+```bash
+uv run gpu-embed export exports/parquet \
+  --db embeddings \
+  --model-version <model_version_prefix> \
+  --vocabulary-id SNOMED,LOINC \
+  --shard-rows 50000
+
+AWS_PAGER="" aws s3 sync \
+  exports/parquet \
+  s3://<your-bucket>/concept_embeddings/
 ```
 
 ## 4) Load from S3 into Snowflake (`COPY INTO`)
@@ -136,11 +151,11 @@ MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
 ON_ERROR = ABORT_STATEMENT;
 ```
 
-Load a single vocabulary directory only:
+Load a single model-version + vocabulary partition only:
 
 ```sql
 COPY INTO concept_embeddings
-FROM @omop_embed_stage/SNOMED/
+FROM @omop_embed_stage/model_version=<sha256>/vocabulary_id=SNOMED/
 MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
 ON_ERROR = ABORT_STATEMENT;
 ```

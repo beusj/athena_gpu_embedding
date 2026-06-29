@@ -19,6 +19,24 @@ Data export and warehouse loading steps remain in:
 
 - `docs/runbooks/s3_to_snowflake_load.md`
 
+## Migration and store checklist (one-time)
+
+Before using downstream S3/Snowflake loading flows, ensure local storage is in
+parquet store format.
+
+```bash
+# Recommended default store path
+uv run gpu-embed status --db embeddings
+
+# If migrating from legacy DuckDB, trigger one-time auto-migration
+uv run gpu-embed status --db embeddings.duckdb
+
+# Verify parquet shards exist
+uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/*.parquet'))))"
+```
+
+After migration, sync `embeddings/` directly to S3 as the default path.
+
 ## Prerequisites
 
 - Environment configured for workload-only mode:
