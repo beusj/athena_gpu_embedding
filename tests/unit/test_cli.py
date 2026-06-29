@@ -344,6 +344,30 @@ def test_embed_accepts_mixed_repeat_and_comma_vocabulary_id(monkeypatch) -> None
     assert captured["vocabulary_ids"] == ["LOINC", "SNOMED", "RxNorm"]
 
 
+def test_migrate_store_invokes_store_initialization(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+
+    class _FakeConn:
+        pass
+
+    def fake_open_db(path: Path):
+        calls.append(f"open:{path}")
+        return _FakeConn()
+
+    def fake_ensure_schema(conn) -> None:  # type: ignore[no-untyped-def]
+        calls.append("ensure")
+
+    monkeypatch.setattr("gpu_embedder.store.open_db", fake_open_db)
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", fake_ensure_schema)
+
+    result = runner.invoke(app, ["migrate-store", "--db", str(tmp_path / "legacy.duckdb")])
+
+    assert result.exit_code == 0
+    assert calls[0].startswith("open:")
+    assert "ensure" in calls
+
+
 def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
     runner = CliRunner()
     db_path = tmp_path / "embeddings.duckdb"

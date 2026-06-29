@@ -26,10 +26,10 @@ parquet store format.
 
 ```bash
 # Recommended default store path
-uv run gpu-embed status --db embeddings
+uv run gpu-embed migrate-store --db embeddings
 
 # If migrating from legacy DuckDB, trigger one-time auto-migration
-uv run gpu-embed status --db embeddings.duckdb
+uv run gpu-embed migrate-store --db embeddings.duckdb
 
 # Verify parquet shards exist
 uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/*.parquet'))))"

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime
 from glob import glob
 from pathlib import Path
 from typing import Annotated
@@ -545,6 +546,51 @@ def cpt4_cmd(
         sys.exit(exc.returncode)
 
     typer.echo("CPT-4 population complete.")
+
+
+# ---------------------------------------------------------------------------
+# migrate-store subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("migrate-store")
+def migrate_store_cmd(
+    db: Annotated[
+        Path | None,
+        typer.Option(
+            envvar="GPU_EMBED_DB",
+            help="Legacy .duckdb path (or store path) to migrate/initialize",
+        ),
+    ] = None,
+    reset: Annotated[
+        bool,
+        typer.Option(
+            "--reset",
+            help="Move existing parquet store directory aside before migration",
+        ),
+    ] = False,
+) -> None:
+    """Migrate or initialize the parquet embeddings store without heavy summaries."""
+    from gpu_embedder import store as st
+
+    cfg = EmbedConfig(**({"db": db} if db is not None else {}))
+
+    store_root = cfg.db.with_suffix("") if cfg.db.suffix.lower() == ".duckdb" else cfg.db
+    if reset and store_root.exists():
+        backup_dir = store_root.parent / f"{store_root.name}_backup_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        shutil.move(str(store_root), str(backup_dir))
+        typer.echo(f"Moved existing store to backup: {backup_dir}")
+
+    conn = st.open_db(cfg.db)
+    st.ensure_schema(conn)
+
+    if cfg.db.suffix.lower() == ".duckdb":
+        typer.echo(
+            "Migration/initialization complete for legacy source: "
+            f"{cfg.db} -> {store_root}"
+        )
+    else:
+        typer.echo(f"Store initialization complete: {store_root}")
 
 
 # ---------------------------------------------------------------------------

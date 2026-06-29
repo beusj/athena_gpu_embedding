@@ -29,7 +29,7 @@ Model hash provenance is stored alongside the dataset at:
 `embeddings/_meta/model_registry/part-*.parquet`
 
 ```bash
-uv run gpu-embed status --db embeddings
+uv run gpu-embed migrate-store --db embeddings
 uv run python -c "from pathlib import Path; print(len(list(Path('embeddings').glob('model_version=*/*.parquet'))))"
 ```
 
@@ -37,7 +37,7 @@ If you are migrating from a legacy `.duckdb` file and have not migrated yet,
 run once to trigger automatic migration:
 
 ```bash
-uv run gpu-embed status --db embeddings.duckdb
+uv run gpu-embed migrate-store --db embeddings.duckdb
 ```
 
 This creates `embeddings/model_version=.../*.parquet` and no manual pre-export is required.
