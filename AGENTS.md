@@ -2,6 +2,10 @@
 
 Guidance for AI coding agents (and humans) working in this repository.
 
+> **Cross-repo contract:** how this repo's embeddings feed `concept-mapper` and
+> dbt — and the shared SapBERT vector-space / `model_version` contract — lives in
+> [`ALIGNMENT.md`](ALIGNMENT.md), committed identically to all three repos.
+
 ---
 
 ## What this project is
