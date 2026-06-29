@@ -7,6 +7,7 @@ Data is persisted in parquet shards partitioned by model_version.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -168,6 +169,8 @@ def _copy_relation_to_partitioned_shards(
     conn: duckdb.DuckDBPyConnection,
     source_relation: str,
     parquet_root: Path,
+    *,
+    log_progress: bool = False,
 ) -> int:
     partitions = conn.execute(
         f"""
@@ -182,19 +185,45 @@ def _copy_relation_to_partitioned_shards(
         [NULL_VOCAB_PARTITION, NULL_VOCAB_PARTITION],
     ).fetchall()
 
+    if not partitions:
+        return 0
+
+    total_rows = sum(int(row_count) for _, _, _, row_count in partitions)
+    total_partitions = len(partitions)
+    estimated_total_files = sum(ceil(int(row_count) / TARGET_ROWS_PER_SHARD) for *_, row_count in partitions)
+
     total_files = 0
+    completed_rows = 0
+    completed_partitions = 0
+    started_at = time.perf_counter()
+    next_log_at = started_at + 30.0
+
+    if log_progress:
+        logger.info(
+            (
+                "Migration planning: source=%s, partitions=%d, rows=%d, "
+                "target_rows_per_shard=%d, estimated_files=%d"
+            ),
+            source_relation,
+            total_partitions,
+            total_rows,
+            TARGET_ROWS_PER_SHARD,
+            estimated_total_files,
+        )
+
     for model_version, vocabulary_partition, vocabulary_id, row_count in partitions:
+        partition_row_count = int(row_count)
         partition_dir = (
             parquet_root
             / f"model_version={model_version}"
             / f"vocabulary_id={vocabulary_partition}"
         )
         partition_dir.mkdir(parents=True, exist_ok=True)
-        shard_count = ceil(int(row_count) / TARGET_ROWS_PER_SHARD)
+        shard_count = ceil(partition_row_count / TARGET_ROWS_PER_SHARD)
 
         for shard_idx in range(shard_count):
             start_rn = shard_idx * TARGET_ROWS_PER_SHARD + 1
-            end_rn = min((shard_idx + 1) * TARGET_ROWS_PER_SHARD, int(row_count))
+            end_rn = min((shard_idx + 1) * TARGET_ROWS_PER_SHARD, partition_row_count)
             shard_path = partition_dir / f"part-{shard_idx:05d}-{uuid.uuid4().hex}.parquet"
             escaped_shard = shard_path.as_posix().replace("'", "''")
             conn.execute(
@@ -249,6 +278,38 @@ def _copy_relation_to_partitioned_shards(
                 ],
             )
             total_files += 1
+
+        completed_rows += partition_row_count
+        completed_partitions += 1
+
+        if log_progress:
+            now = time.perf_counter()
+            if (
+                completed_partitions == 1
+                or completed_partitions == total_partitions
+                or now >= next_log_at
+            ):
+                elapsed = max(now - started_at, 1e-9)
+                rows_per_sec = completed_rows / elapsed
+                remaining_rows = max(total_rows - completed_rows, 0)
+                eta_minutes = (remaining_rows / rows_per_sec / 60.0) if rows_per_sec > 0 else 0.0
+                pct = (completed_rows / total_rows * 100.0) if total_rows else 100.0
+                logger.info(
+                    (
+                        "Migration progress: %d/%d partitions (%.1f%%), "
+                        "%d/%d rows, files=%d, rows_per_sec=%.0f, eta_minutes=%.1f"
+                    ),
+                    completed_partitions,
+                    total_partitions,
+                    pct,
+                    completed_rows,
+                    total_rows,
+                    total_files,
+                    rows_per_sec,
+                    eta_minutes,
+                )
+                next_log_at = now + 30.0
+
     return total_files
 
 
@@ -282,6 +343,7 @@ def _migrate_legacy_if_needed(conn: duckdb.DuckDBPyConnection, ctx: _StoreContex
             conn,
             "legacy.concept_embeddings",
             ctx.parquet_root,
+            log_progress=True,
         )
 
         logger.info("Migrated legacy DuckDB into %d parquet shard(s)", migrated_files)
@@ -389,6 +451,7 @@ def _append_rows_as_parquet_shards(
         conn,
         "temp_embeddings",
         ctx.parquet_root,
+        log_progress=False,
     )
 
     conn.execute("DROP TABLE IF EXISTS temp_embeddings")
