@@ -29,6 +29,9 @@ athena_vocab/
 *.json
 *.xlsx
 
+# lance data store
+*.lance
+
 # Claude Code shared config (override the broad *.json data ignore above so the
 # session-start hook is registered for everyone). Local overrides stay ignored.
 !.claude/settings.json

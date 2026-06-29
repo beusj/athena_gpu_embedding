@@ -336,6 +336,10 @@ default.
   vocabulary/model partitions are processed.
 - This is expected as long as progress logs continue to advance
   (`partitions`, `rows`, `files`, `eta_minutes`).
+- `migrate-lance` uses a conservative default batch size (`--batch-rows 25000`)
+  to reduce peak RAM/SSD pressure on local machines. If you have headroom and
+  want higher throughput, raise it (for example `--batch-rows 50000` or
+  `--batch-rows 100000`).
 - If progress appears stalled, prefer `gpu-embed migrate-store --db ...`
   over `status` for migration-only workflows to avoid extra summary queries.
 
@@ -490,10 +494,15 @@ gpu-embed status [OPTIONS]
 Prints the model versions stored in the embeddings store and a per-(vocabulary, domain)
 breakdown of embedded concept counts. No source CSV is required.
 
+Use `--backfill-from-logs` to infer missing model metadata from prior embed logs
+before rendering status (helpful after legacy store migrations).
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--db` | `embeddings.lance` | Embedding store path to inspect |
 | `--model-version` | _(most recent)_ | Show breakdown for the version starting with this prefix |
+| `--backfill-from-logs` | false | Parse `GPU_EMBED_LOG_DIR` logs for model/revision lines and upsert derived hash mappings before status output |
+| `--log-dir` | `logs` | Directory containing `gpu-embed` log files |
 
 ### `model-registry` — inspect model hash provenance
 

@@ -1844,7 +1844,7 @@ def migrate_duckdb_to_lance(
     conn: duckdb.DuckDBPyConnection,
     legacy_db_path: Path,
     *,
-    batch_rows: int = 100_000,
+    batch_rows: int = 25_000,
 ) -> int:
     """Stream a legacy ``.duckdb`` concept_embeddings table into the Lance store.
 

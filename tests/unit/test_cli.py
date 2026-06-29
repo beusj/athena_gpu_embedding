@@ -937,6 +937,67 @@ def test_model_registry_backfills_from_logs(tmp_path: Path, monkeypatch) -> None
     assert "f8c969586cc6b0fd" in result.output
 
 
+def test_status_backfills_from_logs(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_path = tmp_path / "embeddings"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "gpu-embed-2026-06-28.log").write_text(
+        "2026-06-28 09:00:00 INFO gpu_embedder.embed: "
+        "Loading model from FremyCompany/BioLORD-2023 → device=cuda "
+        "(FP32, revision=167aab527b238a50ca65224e6319215d2ff4fc9f, source=cached)\n",
+        encoding="utf-8",
+    )
+
+    model_hash = "f8c969586cc6b0fd393faa7d879de93d6cc532123956041fefd3474194322050"
+
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    upsert_rows(
+        conn,
+        [
+            EmbeddedRow(
+                concept=ConceptRow(
+                    concept_id=1,
+                    concept_name="Test concept",
+                    domain_id="Condition",
+                    vocabulary_id="SNOMED",
+                ),
+                embedding=[0.0] * 768,
+                embed_text="Test concept",
+                model_version=model_hash,
+                embedded_at=datetime.now(tz=UTC),
+            )
+        ],
+    )
+    conn.close()
+
+    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+        assert model_id == "FremyCompany/BioLORD-2023"
+        assert revision == "167aab527b238a50ca65224e6319215d2ff4fc9f"
+        return model_hash
+
+    monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
+
+    result = runner.invoke(
+        app,
+        [
+            "status",
+            "--db",
+            str(db_path),
+            "--backfill-from-logs",
+            "--log-dir",
+            str(log_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Backfill complete from logs" in result.output
+    assert "model=FremyCompany/BioLORD-2023" in result.output
+    assert "quant=none" in result.output
+    assert f"full_hash={model_hash}" in result.output
+
+
 # ---------------------------------------------------------------------------
 # cleanup subcommand
 # ---------------------------------------------------------------------------

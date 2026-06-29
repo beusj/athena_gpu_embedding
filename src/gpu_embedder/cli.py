@@ -119,6 +119,54 @@ def _extract_model_pairs_from_logs(log_dir: Path) -> list[tuple[str, str | None]
     return ordered
 
 
+def _backfill_model_registry_from_logs(
+    conn: Any,
+    *,
+    log_dir: Path,
+) -> tuple[int, int] | None:
+    """Backfill model-registry entries from embed logs.
+
+    Returns ``(added, failed)`` when log candidates are found, otherwise
+    ``None`` (and emits a "no candidates" message).
+    """
+    from gpu_embedder import store as st
+    from gpu_embedder.embed import compute_model_version
+
+    candidates = _extract_model_pairs_from_logs(log_dir)
+    if not candidates:
+        typer.echo(f"No log-derived model pairs found in {log_dir}.")
+        return None
+
+    added = 0
+    failed = 0
+    for model_id, revision in candidates:
+        try:
+            model_version = compute_model_version(model_id, revision=revision)
+        except Exception as exc:  # pragma: no cover - defensive CLI handling
+            failed += 1
+            revision_label = revision or "default"
+            typer.echo(
+                (
+                    f"Warning: could not hash model '{model_id}' "
+                    f"(revision={revision_label}): {exc}"
+                ),
+                err=True,
+            )
+            continue
+
+        st.upsert_model_registry(
+            conn,
+            model_version=model_version,
+            model_id=model_id,
+            model_revision=revision,
+            precision="fp32",
+            quantization_scheme="none",
+        )
+        added += 1
+
+    return added, failed
+
+
 def _resolve_java_executable() -> Path | None:
     """Return a usable Java executable from PATH, JAVA_HOME, or common installs."""
     on_path = shutil.which("java")
@@ -983,10 +1031,13 @@ def migrate_lance_cmd(
     batch_rows: Annotated[
         int,
         typer.Option("--batch-rows", min=1, help="Rows per streamed Arrow batch"),
-    ] = 100_000,
+    ] = 25_000,
     reset: Annotated[
         bool,
-        typer.Option("--reset", help="Move an existing Lance store aside before migrating"),
+        typer.Option(
+            "--reset",
+            help="Move an existing Lance store aside before migrating",
+        ),
     ] = False,
 ) -> None:
     """Migrate a legacy .duckdb embeddings table into a Lance store.
@@ -1426,31 +1477,65 @@ def status_cmd(
             help="Limit breakdown to the model version starting with this prefix",
         ),
     ] = None,
+    backfill_from_logs: Annotated[
+        bool,
+        typer.Option(
+            "--backfill-from-logs",
+            help="Parse logs and upsert missing model hash mappings before listing",
+        ),
+    ] = False,
+    log_dir: Annotated[
+        Path | None,
+        typer.Option(envvar="GPU_EMBED_LOG_DIR", help="Directory containing gpu-embed logs"),
+    ] = None,
 ) -> None:
     """Show a summary of what is currently stored in the embeddings store."""
     from gpu_embedder import store as st
     from gpu_embedder.report import embedded_summary, list_model_versions
 
-    cfg = EmbedConfig(**cast(dict[str, Any], {"db": db} if db is not None else {}))
+    cfg_overrides: dict[str, Any] = {}
+    if db is not None:
+        cfg_overrides["db"] = db
+    if log_dir is not None:
+        cfg_overrides["log_dir"] = log_dir
+    cfg = EmbedConfig(**cfg_overrides)
 
     conn = st.open_db(cfg.db)
     st.ensure_schema(conn)
+
+    if backfill_from_logs:
+        result = _backfill_model_registry_from_logs(conn, log_dir=cfg.log_dir)
+        if result is not None:
+            added, failed = result
+            typer.echo(f"Backfill complete from logs: {added} mapping(s) upserted, {failed} failed.")
 
     versions = list_model_versions(conn)
     if not versions:
         typer.echo("No embeddings found in the database.")
         raise typer.Exit(0)
 
+    registry_by_version = {row.model_version: row for row in st.list_model_registry(conn)}
+
     typer.echo(f"\nStore: {cfg.db}\n")
     typer.echo(f"{'MODEL VERSION':18}  {'CONCEPTS':>9}  {'FIRST EMBEDDED':20}  LAST EMBEDDED")
     typer.echo("-" * 75)
     for v in versions:
+        registry_entry = registry_by_version.get(v.model_version)
+        model_name = registry_entry.model_id if registry_entry is not None else "(unknown)"
+        quant_scheme = (
+            registry_entry.quantization_scheme
+            if registry_entry is not None
+            else "unknown"
+        )
         typer.echo(
             f"{v.short_hash}…  {v.count:>9,}  "
             f"{v.first_embedded_at.strftime('%Y-%m-%d %H:%M'):20}  "
             f"{v.last_embedded_at.strftime('%Y-%m-%d %H:%M')}"
         )
-    typer.echo()
+        typer.echo(f"model={model_name}")
+        typer.echo(f"quant={quant_scheme}")
+        typer.echo(f"full_hash={v.model_version}")
+        typer.echo()
 
     # Resolve which model version to break down
     mv_filter: str | None = None
@@ -1506,7 +1591,6 @@ def model_registry_cmd(
 ) -> None:
     """Show model hash to model-id/revision mappings from parquet metadata."""
     from gpu_embedder import store as st
-    from gpu_embedder.embed import compute_model_version
 
     cfg_overrides: dict[str, Any] = {}
     if db is not None:
@@ -1519,40 +1603,10 @@ def model_registry_cmd(
     st.ensure_schema(conn)
 
     if backfill_from_logs:
-        candidates = _extract_model_pairs_from_logs(cfg.log_dir)
-        if not candidates:
-            typer.echo(f"No log-derived model pairs found in {cfg.log_dir}.")
-        else:
-            added = 0
-            failed = 0
-            for model_id, revision in candidates:
-                try:
-                    model_version = compute_model_version(model_id, revision=revision)
-                except Exception as exc:  # pragma: no cover - defensive CLI handling
-                    failed += 1
-                    revision_label = revision or "default"
-                    typer.echo(
-                        (
-                            f"Warning: could not hash model '{model_id}' "
-                            f"(revision={revision_label}): {exc}"
-                        ),
-                        err=True,
-                    )
-                    continue
-
-                st.upsert_model_registry(
-                    conn,
-                    model_version=model_version,
-                    model_id=model_id,
-                    model_revision=revision,
-                    precision="fp32",
-                    quantization_scheme="none",
-                )
-                added += 1
-
-            typer.echo(
-                f"Backfill complete from logs: {added} mapping(s) upserted, {failed} failed."
-            )
+        result = _backfill_model_registry_from_logs(conn, log_dir=cfg.log_dir)
+        if result is not None:
+            added, failed = result
+            typer.echo(f"Backfill complete from logs: {added} mapping(s) upserted, {failed} failed.")
 
     rows = st.list_model_registry(conn)
     if not rows:
