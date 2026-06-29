@@ -52,7 +52,7 @@ src/gpu_embedder/
 ├── models.py     # ConceptRow (Pydantic), DuckDB DDL constant, FilterSpec
 ├── ingest.py     # read_csv() → filter_rows(); pure, no I/O side effects
 ├── embed.py      # load_model(), compute_model_version(), embed_batch()
-└── store.py      # open_db(), ensure_schema(), get_existing_ids(), upsert_rows()
+└── store.py      # open_db(), ensure_schema(), classify_rows_requiring_embedding(), upsert_rows()
 ```
 
 `cli.py` is the only module allowed to call all others. No other module imports
@@ -149,10 +149,12 @@ from `cli.py`.
   `FLOAT[768]` column (~100×+ slower); do not reintroduce it for embedding writes.
   Likewise, pass scalar columns to `classify_rows_requiring_embedding()` as a
   single `unnest(?::T[])` array, not via per-row `executemany`.
-- `get_existing_ids(conn, model_version)` returns a `set[int]` of `concept_id`s
-  already embedded for a model version. The live ingest path instead uses
-  `classify_rows_requiring_embedding()`, which also re-embeds rows whose
-  `embed_text` changed; prefer it for new code.
+- `classify_rows_requiring_embedding()` is the single entry point for deciding
+  what to embed: it returns the rows needing work plus `(new, changed, unchanged)`
+  counts, skipping rows already embedded for the model version *and* re-embedding
+  rows whose `embed_text` changed. (The older `get_existing_ids` /
+  `filter_unembedded_rows` helpers were removed — do not reintroduce parallel
+  variants.)
 - The store context is tracked in a `weakref.WeakKeyDictionary` keyed by the
   connection object — not `id(conn)` (which leaks and can alias a closed
   connection after the id is recycled).
@@ -216,7 +218,7 @@ from `cli.py`.
 
 The only write abstraction is `store.py`. To add PostgreSQL or another backend:
 1. Create `store_pg.py` implementing the same interface:
-   `open_db`, `ensure_schema`, `get_existing_ids`, `upsert_rows`.
+   `open_db`, `ensure_schema`, `classify_rows_requiring_embedding`, `upsert_rows`.
 2. Select via a `--backend` CLI flag (default `duckdb`).
 3. Do not modify `embed.py` or `ingest.py`.
 

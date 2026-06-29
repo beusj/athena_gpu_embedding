@@ -529,60 +529,6 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     logger.debug("Parquet-backed schema ensured")
 
 
-def get_existing_ids(conn: duckdb.DuckDBPyConnection, model_version: str) -> set[int]:
-    """Return concept_ids that already have an embedding for *model_version*."""
-    rows = conn.execute(
-        "SELECT concept_id FROM concept_embeddings WHERE model_version = ?",
-        [model_version],
-    ).fetchall()
-    ids = {r[0] for r in rows}
-    logger.info("Found %d existing concept_ids for model_version=%s", len(ids), model_version[:8])
-    return ids
-
-
-def filter_unembedded_rows(
-    conn: duckdb.DuckDBPyConnection,
-    rows: list[ConceptRow],
-    model_version: str,
-) -> list[ConceptRow]:
-    """Return only the rows whose concept_id has no embedding for *model_version*.
-
-    Performs the anti-join inside DuckDB rather than materialising all existing
-    IDs into a Python set.  This is significantly faster when the store already
-    contains millions of rows and only a small fraction remain to embed.
-    """
-    if not rows:
-        return []
-
-    candidate_ids = [r.concept_id for r in rows]
-    conn.execute("DROP TABLE IF EXISTS _candidate_ids")
-    conn.execute("CREATE TEMP TABLE _candidate_ids (concept_id BIGINT)")
-    conn.executemany("INSERT INTO _candidate_ids VALUES (?)", [(i,) for i in candidate_ids])
-    result = conn.execute(
-        """
-        SELECT concept_id
-        FROM _candidate_ids
-        WHERE concept_id NOT IN (
-            SELECT concept_id
-            FROM concept_embeddings
-            WHERE model_version = ?
-        )
-        """,
-        [model_version],
-    ).fetchall()
-    conn.execute("DROP TABLE IF EXISTS _candidate_ids")
-    unembedded = {r[0] for r in result}
-    logger.info(
-        "filter_unembedded_rows: %d candidates, %d already embedded, %d to embed "
-        "(model_version=%s)",
-        len(candidate_ids),
-        len(candidate_ids) - len(unembedded),
-        len(unembedded),
-        model_version[:8],
-    )
-    return [r for r in rows if r.concept_id in unembedded]
-
-
 def classify_rows_requiring_embedding(
     conn: duckdb.DuckDBPyConnection,
     rows: list[ConceptRow],
@@ -653,22 +599,6 @@ def classify_rows_requiring_embedding(
         model_version[:8],
     )
     return ([row for row in rows if row.concept_id in need_embed], new_count, changed_count, unchanged_count)
-
-
-def filter_rows_requiring_embedding(
-    conn: duckdb.DuckDBPyConnection,
-    rows: list[ConceptRow],
-    model_version: str,
-    candidate_texts: dict[int, str],
-) -> list[ConceptRow]:
-    """Backward-compatible wrapper returning only rows requiring embedding."""
-    to_embed, _, _, _ = classify_rows_requiring_embedding(
-        conn,
-        rows,
-        model_version,
-        candidate_texts,
-    )
-    return to_embed
 
 
 def _append_rows_as_parquet_shards(
