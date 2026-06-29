@@ -295,6 +295,12 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     ) -> None:
         return None
 
+    def fake_get_cached_model_version(conn, model_id: str, revision) -> None:  # type: ignore[no-untyped-def]
+        return None  # always miss — compute_model_version (also mocked) is called
+
+    def fake_upsert_model_version_cache(conn, model_id: str, revision, sha256: str) -> None:  # type: ignore[no-untyped-def]
+        return None
+
     monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
     monkeypatch.setattr("gpu_embedder.embed.load_model", fake_load_model)
     monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
@@ -311,6 +317,8 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     monkeypatch.setattr("gpu_embedder.store.list_model_registry", fake_list_model_registry)
     monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
     monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
+    monkeypatch.setattr("gpu_embedder.store.get_cached_model_version", fake_get_cached_model_version)
+    monkeypatch.setattr("gpu_embedder.store.upsert_model_version_cache", fake_upsert_model_version_cache)
 
     result = runner.invoke(
         app,

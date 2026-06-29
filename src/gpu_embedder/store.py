@@ -19,7 +19,7 @@ from typing import Literal
 
 import duckdb
 
-from gpu_embedder.models import ConceptRow, EmbeddedRow, SCHEMA_DDL, CSV_FINGERPRINTS_DDL
+from gpu_embedder.models import ConceptRow, EmbeddedRow, SCHEMA_DDL, CSV_FINGERPRINTS_DDL, MODEL_VERSION_CACHE_DDL
 
 logger = logging.getLogger(__name__)
 TARGET_ROWS_PER_SHARD = 250_000
@@ -427,6 +427,7 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             """
         )
         conn.execute(CSV_FINGERPRINTS_DDL)
+        conn.execute(MODEL_VERSION_CACHE_DDL)
         logger.debug("DuckDB-backed schema ensured")
         return
 
@@ -506,7 +507,8 @@ def classify_rows_requiring_embedding(
     if not rows:
         return ([], 0, 0, 0)
 
-    payload = [(row.concept_id, candidate_texts[row.concept_id]) for row in rows]
+    concept_ids = [row.concept_id for row in rows]
+    embed_texts = [candidate_texts[row.concept_id] for row in rows]
     conn.execute("DROP TABLE IF EXISTS _candidate_embed_texts")
     conn.execute(
         """
@@ -516,9 +518,12 @@ def classify_rows_requiring_embedding(
         )
         """
     )
-    conn.executemany(
-        "INSERT INTO _candidate_embed_texts VALUES (?, ?)",
-        payload,
+    # Use array unnest instead of executemany to avoid per-row Python→DuckDB
+    # overhead, which is severe for millions of concepts.
+    conn.execute(
+        "INSERT INTO _candidate_embed_texts"
+        " SELECT unnest(?::BIGINT[]), unnest(?::VARCHAR[])",
+        [concept_ids, embed_texts],
     )
     result = conn.execute(
         """
@@ -1065,4 +1070,53 @@ def upsert_csv_fingerprint(
         model_version[:12],
         filter_hash[:12],
         row_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model version cache
+# ---------------------------------------------------------------------------
+
+def get_cached_model_version(
+    conn: duckdb.DuckDBPyConnection,
+    model_id: str,
+    revision: str | None,
+) -> str | None:
+    """Return a previously stored SHA-256 for *(model_id, revision)*, or None.
+
+    Avoids re-hashing the ~440 MB weights file on every startup when the
+    model has not changed.
+    """
+    ctx = _get_context(conn)
+    if ctx.backend != "duckdb":
+        return None
+    row = conn.execute(
+        "SELECT sha256 FROM model_version_cache WHERE model_id = ? AND revision = ?",
+        [model_id, revision or ""],
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def upsert_model_version_cache(
+    conn: duckdb.DuckDBPyConnection,
+    model_id: str,
+    revision: str | None,
+    sha256: str,
+) -> None:
+    """Persist the weights SHA-256 for *(model_id, revision)*."""
+    ctx = _get_context(conn)
+    if ctx.backend != "duckdb":
+        return
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO model_version_cache (model_id, revision, sha256)
+        VALUES (?, ?, ?)
+        """,
+        [model_id, revision or "", sha256],
+    )
+    logger.info(
+        "Upserted model_version_cache: model=%s revision=%s sha256=%s…",
+        model_id,
+        revision or "default",
+        sha256[:12],
     )

@@ -351,7 +351,19 @@ def embed_cmd(
     # Resolve model version before CSV load so we can short-circuit unchanged inputs.
     from gpu_embedder.embed import build_embed_text, compute_model_version, embed_all, load_model
 
-    model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
+    _cached_mv = None if cfg.force else st.get_cached_model_version(
+        conn, cfg.model, cfg.model_revision
+    )
+    if _cached_mv is not None:
+        model_version = _cached_mv
+        logger.info("model_version from cache: %s…", model_version[:16])
+    else:
+        typer.echo(
+            f"Hashing model weights for {cfg.model} "
+            f"(revision={cfg.model_revision or 'default'}) …"
+        )
+        model_version = compute_model_version(cfg.model, revision=cfg.model_revision)
+        st.upsert_model_version_cache(conn, cfg.model, cfg.model_revision, model_version)
     filter_hash = filter_spec_hash(spec)
 
     # Load only CSVs that changed for this (model_version, filter_hash)
@@ -398,8 +410,11 @@ def embed_cmd(
             ingested_fingerprints.append((p, current_fp, len(loaded)))
             continue
 
-        current_fp = compute_csv_fingerprint(p)
+        # Read CSV first so the file is warm in the OS page cache, then hash
+        # it.  Computing the SHA-256 on a cold file before read_csv caused two
+        # sequential full scans of CONCEPT.csv (~500 MB) on every first run.
         loaded = read_csv(p, spec=spec, engine=cfg.ingest_engine)
+        current_fp = compute_csv_fingerprint(p)
         filtered.extend(loaded)
         ingested_fingerprints.append((p, current_fp, len(loaded)))
 
