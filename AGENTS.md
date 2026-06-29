@@ -128,7 +128,11 @@ from `cli.py`.
 
 ### Embedding
 
-- Model: `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` (768-dim).
+- Model: `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` (768-dim) is the
+  configurable default (`--model` / `GPU_EMBED_MODEL`); any 768-dim biomedical
+  encoder is accepted. See the README's "Choosing an embedding model" for
+  alternatives such as BioLORD-2023. The invariants below (FP32, CLS pooling,
+  768-dim store column) hold regardless of which model is selected.
 - Pin the revision via `GPU_EMBED_MODEL_REVISION` (commit hash, branch, or tag)
   so downloads are reproducible. Pass as `revision=` to both
   `AutoModel.from_pretrained` and `AutoTokenizer.from_pretrained`. `None` uses
