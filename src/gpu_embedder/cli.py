@@ -410,6 +410,34 @@ def embed_cmd(
             f"({skipped_unchanged_rows} filtered rows)."
         )
 
+    fingerprints_persisted = False
+
+    def persist_ingested_fingerprints() -> None:
+        """Record fingerprints for every CSV read this run (idempotent).
+
+        Safe to call at any point where the concepts contributed by these CSVs
+        are already fully represented in the store — i.e. the normal completion
+        path *and* the early-exit paths where nothing remains to embed.  This
+        ensures a CSV whose bytes changed but yields no new/changed embeddings
+        (or zero rows after filtering) still gets its fingerprint updated, so we
+        do not re-read and re-hash the same large file on every subsequent run.
+        """
+        nonlocal fingerprints_persisted
+        if fingerprints_persisted:
+            return
+        for path_obj, fingerprint, row_count in ingested_fingerprints:
+            st.upsert_csv_fingerprint(
+                conn,
+                csv_path=str(path_obj.resolve()),
+                model_version=model_version,
+                filter_hash=filter_hash,
+                size_bytes=int(fingerprint["size_bytes"]),
+                mtime_ns=int(fingerprint["mtime_ns"]),
+                sha256=str(fingerprint["sha256"]),
+                row_count=row_count,
+            )
+        fingerprints_persisted = True
+
     # Deduplicate by concept_id before model loading/embedding. Keep first-seen row.
     seen_concept_ids: set[int] = set()
     deduped: list = []
@@ -429,6 +457,9 @@ def embed_cmd(
     filtered = deduped
 
     if not filtered:
+        # CSVs read this run produced no rows to embed; persist their
+        # fingerprints so they are not re-read and re-hashed next time.
+        persist_ingested_fingerprints()
         typer.echo("Nothing to embed.")
         raise typer.Exit(0)
 
@@ -474,6 +505,10 @@ def embed_cmd(
     typer.echo(f"Skipping {skipped} already-embedded, embedding {len(to_embed)} …")
 
     if not to_embed:
+        # Every concept from these CSVs is already embedded with current text,
+        # so the store is complete for them; record the (possibly updated)
+        # fingerprints to avoid re-reading unchanged-result files each run.
+        persist_ingested_fingerprints()
         typer.echo("Nothing new to embed. Use --force to re-embed.")
         raise typer.Exit(0)
 
@@ -535,17 +570,7 @@ def embed_cmd(
         f"Total stored for this model version: {total}."
     )
 
-    for path_obj, fingerprint, row_count in ingested_fingerprints:
-        st.upsert_csv_fingerprint(
-            conn,
-            csv_path=str(path_obj.resolve()),
-            model_version=model_version,
-            filter_hash=filter_hash,
-            size_bytes=int(fingerprint["size_bytes"]),
-            mtime_ns=int(fingerprint["mtime_ns"]),
-            sha256=str(fingerprint["sha256"]),
-            row_count=row_count,
-        )
+    persist_ingested_fingerprints()
 
 
 # ---------------------------------------------------------------------------

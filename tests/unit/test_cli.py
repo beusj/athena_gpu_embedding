@@ -326,6 +326,83 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
     assert upsert_sizes == [4, 1]
 
 
+def test_embed_persists_fingerprint_when_nothing_new_to_embed(monkeypatch) -> None:
+    """Regression: a CSV that was read but yields no rows to embed must still
+
+    have its fingerprint recorded, otherwise the file is re-read and re-hashed
+    on every subsequent run (the diff-detection optimization never converges).
+    """
+    runner = CliRunner()
+    fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
+
+    rows = [
+        ConceptRow(
+            concept_id=i,
+            concept_name=f"Concept {i}",
+            domain_id="Drug",
+            vocabulary_id="NDC",
+        )
+        for i in range(1, 4)
+    ]
+
+    recorded_fingerprints: list[str] = []
+
+    class _FakeConn:
+        pass
+
+    def fake_read_csv(path: Path, spec, engine: str):  # type: ignore[no-untyped-def]
+        return rows
+
+    def fake_load_model(model_id: str, device: str, revision: str | None = None):
+        return object(), object()
+
+    def fake_compute_model_version(model_id: str, revision: str | None = None) -> str:
+        return "test-model-version"
+
+    def fake_open_db(path: Path):
+        return _FakeConn()
+
+    def fake_ensure_schema(conn) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_classify_rows_requiring_embedding(  # type: ignore[no-untyped-def]
+        conn,
+        rows,
+        model_version: str,
+        candidate_texts,
+    ):
+        # Everything is already embedded with the current text -> nothing to do.
+        return [], 0, 0, len(rows)
+
+    def fake_upsert_model_registry(conn, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    def fake_get_csv_fingerprint(conn, csv_path: str, model_version: str, filter_hash: str):  # type: ignore[no-untyped-def]
+        return None  # no stored fingerprint -> file is (re-)read this run
+
+    def fake_upsert_csv_fingerprint(conn, *, csv_path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        recorded_fingerprints.append(csv_path)
+
+    monkeypatch.setattr("gpu_embedder.cli.read_csv", fake_read_csv)
+    monkeypatch.setattr("gpu_embedder.embed.load_model", fake_load_model)
+    monkeypatch.setattr("gpu_embedder.embed.compute_model_version", fake_compute_model_version)
+    monkeypatch.setattr("gpu_embedder.store.open_db", fake_open_db)
+    monkeypatch.setattr("gpu_embedder.store.ensure_schema", fake_ensure_schema)
+    monkeypatch.setattr(
+        "gpu_embedder.store.classify_rows_requiring_embedding",
+        fake_classify_rows_requiring_embedding,
+    )
+    monkeypatch.setattr("gpu_embedder.store.upsert_model_registry", fake_upsert_model_registry)
+    monkeypatch.setattr("gpu_embedder.store.get_csv_fingerprint", fake_get_csv_fingerprint)
+    monkeypatch.setattr("gpu_embedder.store.upsert_csv_fingerprint", fake_upsert_csv_fingerprint)
+
+    result = runner.invoke(app, ["embed", str(fixture), "--device", "cpu"])
+
+    assert result.exit_code == 0
+    assert "Nothing new to embed" in result.output
+    assert recorded_fingerprints == [str(fixture.resolve())]
+
+
 def test_embed_accepts_comma_delimited_vocabulary_id(monkeypatch) -> None:
     runner = CliRunner()
     fixture = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"

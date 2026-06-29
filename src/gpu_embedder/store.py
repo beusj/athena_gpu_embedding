@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from glob import glob
@@ -44,7 +45,13 @@ class ModelRegistryEntry:
     recorded_at: datetime
 
 
-_CONTEXTS: dict[int, _StoreContext] = {}
+# Keyed by the connection object itself (not id(conn)) via weak references so
+# entries are reclaimed automatically when a connection is garbage collected.
+# A plain dict keyed by id(conn) leaks entries and can alias a stale, closed
+# connection because CPython recycles id() values after collection.
+_CONTEXTS: "weakref.WeakKeyDictionary[duckdb.DuckDBPyConnection, _StoreContext]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _resolve_paths(path: Path) -> _StoreContext:
@@ -58,7 +65,7 @@ def _resolve_paths(path: Path) -> _StoreContext:
 
 
 def _get_context(conn: duckdb.DuckDBPyConnection) -> _StoreContext:
-    ctx = _CONTEXTS.get(id(conn))
+    ctx = _CONTEXTS.get(conn)
     if ctx is None:
         raise RuntimeError("Store connection context not found")
     return ctx
@@ -383,7 +390,7 @@ def open_db(path: Path) -> duckdb.DuckDBPyConnection:
         conn = duckdb.connect(":memory:")
         logger.info("Opened parquet-backed store at %s", ctx.parquet_root)
 
-    _CONTEXTS[id(conn)] = ctx
+    _CONTEXTS[conn] = ctx
     return conn
 
 
