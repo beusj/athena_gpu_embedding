@@ -161,14 +161,22 @@ from `cli.py`.
 - The embedding column is `FLOAT[768]` (DuckDB array type). `EmbeddedRow.embedding`
   stays a Python `list[float]` across module boundaries — do not serialize to
   JSON or bytes.
-- **Bulk writes go through Arrow, never `executemany`.** `store.py` builds a
-  columnar `pyarrow.Table` (embedding as a `FixedSizeList` of float32) via
-  `_embedded_rows_to_arrow()`, registers it with `conn.register(...)`, and runs a
-  single `INSERT OR REPLACE ... SELECT`. `executemany` binds row-by-row across
-  the Python→DuckDB boundary and is catastrophically slow for the wide
-  `FLOAT[768]` column (~100×+ slower); do not reintroduce it for embedding writes.
-  Likewise, pass scalar columns to `classify_rows_requiring_embedding()` as a
-  single `unnest(?::T[])` array, not via per-row `executemany`.
+- **Moving bulk Python data into DuckDB always goes through Arrow.** Build a
+  columnar `pyarrow.Table` and `conn.register(...)` it, then `INSERT ... SELECT`
+  or JOIN against the registered relation. This is the *only* approved path for
+  anything that scales with row count — embedding writes
+  (`_embedded_rows_to_arrow()` → `INSERT OR REPLACE ... SELECT`, ~100× faster
+  than the old `executemany` on the wide `FLOAT[768]` column) **and** the
+  change-detection candidate set in `classify_rows_requiring_embedding()`
+  (register `(namespace, concept_id, embed_text)`, then LEFT JOIN). Two
+  anti-patterns are **banned for large inputs** — both have bitten this project:
+  - `conn.executemany("INSERT ... VALUES (?)", rows)` — per-row Python→DuckDB
+    binding; pathological for the embedding column.
+  - `... unnest(?::T[])` with a big Python list bound as the array param —
+    DuckDB materialises the whole list as one value ~quadratically (tens of
+    seconds at a few hundred thousand rows; effectively hangs at millions).
+    `unnest(?::T[])` is fine only for *small, bounded* lists (e.g. a handful of
+    filter values); never for a per-concept column.
 - `classify_rows_requiring_embedding()` is the single entry point for deciding
   what to embed: it returns the rows needing work plus `(new, changed, unchanged)`
   counts, skipping rows already embedded for the model version *and* re-embedding
@@ -210,8 +218,10 @@ from `cli.py`.
 - **Do not embed SQL in Python f-strings.** Any non-trivial SQL goes in a
   `.sql` file under `src/gpu_embedder/sql/` and is loaded via a helper.
 - **Do not pass lists directly as bind parameters to DuckDB `IN` clauses.**
-  Use `IN (SELECT unnest(?::BIGINT[]))` or build the filter in Python before
-  the query.
+  For a *small, bounded* list, `IN (SELECT unnest(?::BIGINT[]))` is fine. For
+  anything that scales with row count, register an Arrow table and JOIN/semi-join
+  against it — never bind a large list as an `unnest(?::T[])` param (quadratic;
+  see the bulk-data rule under "DuckDB").
 - **Do not silently swallow embedding errors.** Log and re-raise; a partial
   batch should not produce a partial write.
 - **Do not use Parquet as the primary write store.** A Parquet-backed backend

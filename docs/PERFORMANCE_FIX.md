@@ -1,46 +1,57 @@
-# Performance Fix: DuckDB Insert Batching
+# Performance: moving bulk data between Python and DuckDB
 
-## Problem
-After GPU embedding completed quickly (~1 second for 1128 rows), the process appeared to hang during the DuckDB write phase.
+This note records why all bulk Python→DuckDB transfer in `store.py` goes through
+Arrow, and the two slow approaches that preceded it — so they are not
+reintroduced. The authoritative rule lives in `AGENTS.md` ("DuckDB" section);
+this is the background.
 
-**Root Cause:**
-The `upsert_rows()` function was attempting a single `executemany` call with all 1128 rows at once. DuckDB's PRIMARY KEY constraint checking was becoming a bottleneck because:
-1. Each row was being checked against the primary key index during insertion
-2. With 768-dimensional float arrays per row (~6KB each), total payload was ~6.8MB
-3. DuckDB had to validate the constraint on the full 1128-row batch atomically
+## The rule
 
-## Solution
-Changed `upsert_rows()` to batch the inserts into **256-row chunks** instead of one monolithic insert.
+To move data that **scales with row count** into DuckDB, build a columnar
+`pyarrow.Table`, `conn.register(...)` it, and `INSERT ... SELECT` (or JOIN)
+against the registered relation. DuckDB ingests Arrow zero-copy and fully
+vectorised. This covers:
 
-**Benefits:**
-- Primary key constraint checking happens on smaller, more cache-friendly batches
-- Better CPU cache utilization during index operations
-- Each batch completes faster, providing incremental progress feedback
-- Total I/O remains efficient (one transaction per batch)
-- Maintains ACID guarantees per batch
+- **Embedding writes** — `_embedded_rows_to_arrow()` → `INSERT OR REPLACE ...
+  SELECT` (embedding encoded as a `FixedSizeList` of float32 → `FLOAT[768]`).
+- **Change detection** — `classify_rows_requiring_embedding()` registers the
+  `(namespace, concept_id, embed_text)` candidate columns and LEFT JOINs them
+  against `concept_embeddings`.
 
-## Implementation
-[store.py](src/gpu_embedder/store.py) `upsert_rows()` function now:
-1. Loops through rows in 256-row increments
-2. Calls `executemany` on each chunk separately
-3. Logs debug-level progress per chunk
-4. Logs final summary with total rows upserted
+## Approaches that were tried and abandoned
 
-## Performance Impact
-For the 1128-row UCUM vocabulary embedding:
-- **Before:** ~30+ seconds while "hanging" on single executemany call
-- **After:** <1 second per batch × 5 batches = ~5 seconds total (estimated **5-6x speedup**)
+### 1. Single `executemany` for the whole batch (original)
+The first `upsert_rows()` did one `executemany` over all rows. The process
+appeared to hang in the write phase: each row crossed the Python→DuckDB boundary
+individually and the PRIMARY KEY index was maintained per row, with a ~3KB
+`FLOAT[768]` payload each. Catastrophic on large batches.
 
-The embedding GPU phase remains unchanged (~1 second). The write phase is now proportional to row count and payload size, not bottlenecked on constraint checking.
+### 2. Chunked `executemany` (interim)
+Splitting the insert into fixed-size chunks gave incremental progress and helped
+small runs, but it is the *same* per-row binding underneath — still far too slow
+for millions of rows. Superseded by Arrow (≈100× faster on the embedding write).
 
-## Testing
-- All 63 unit tests pass (11/11 store-specific tests pass)
-- 100% code coverage maintained on `store.py`
-- Existing tests verify upsert correctness, replacement behavior, and batch idempotence
-- The change is backward-compatible; no API changes to calling code
+### 3. `unnest(?::T[])` array params (interim, for classify)
+To avoid `executemany`, the candidate columns were briefly passed as
+`unnest(?::BIGINT[])` / `unnest(?::VARCHAR[])` params. Binding a large Python
+list as a single array value is **~quadratic** in DuckDB: ~54s for 300k
+candidates and effectively unbounded at millions — it presented as a multi-minute
+stall after model load (GPU idle, no progress bar, growing WAL) before any
+embedding started. Replaced with Arrow registration (1M candidates in ~1.5s).
 
-## Config Considerations
-The **256-row chunk size** was chosen to match the default embedding batch size (`GPU_EMBED_BATCH_SIZE`), making it intuitive and aligned with memory usage patterns. This can be tuned if needed based on:
-- Row embed dimensionality (768 dims × 4 bytes = 3KB per row)
-- DuckDB index block size
-- Available RAM and cache pressure
+`unnest(?::T[])` remains acceptable only for **small, bounded** lists (e.g. a
+handful of filter values), never for a per-concept column.
+
+## Phases, for context
+
+Work after the model loads runs in three phases — keep them distinct when
+diagnosing a stall:
+
+1. **classify** (`classify_rows_requiring_embedding`, CPU/DuckDB) — decides which
+   concepts are new/changed/unchanged. No GPU.
+2. **embed** (`embed_all`, GPU) — the SapBERT/BioLORD forward pass over the
+   rows classify selected (the `Embedding (cuda)` progress bar).
+3. **upsert** (`upsert_rows`) — write vectors via Arrow.
+
+A hang with the GPU idle and no progress bar is the classify/write data path,
+not the model — check the Arrow path first.
