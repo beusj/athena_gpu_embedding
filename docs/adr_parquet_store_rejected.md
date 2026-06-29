@@ -144,35 +144,80 @@ pipeline moved to Arrow-native batch I/O. A storage-only benchmark (synthetic
 - **The current parquet weakness is the read side, not writes:** unbounded
   duplicate accumulation (200k stale rows after one re-embed) with **no
   compaction**, and a full-table dedup COUNT of ~710ms at 2M.
-- **delta-rs (no Spark/JVM) addresses both** and the key scaling risk holds up:
-  partitioned by `model_version`, the re-embed MERGE pruned to that partition's
-  30 files, ran in ~10s with **zero duplicates**, kept reads clean (140ms), and
-  OPTIMIZE compaction was cheap. It addresses original issues #1, #2, #7, #8.
+- **delta-rs (no Spark/JVM) addresses the read side** (ACID log, OPTIMIZE
+  compaction, lock-free multi-reader concurrency) — *but its MERGE upsert does
+  not survive a realistic re-embed; see the scattered-re-embed result below,
+  which reverses the initial lean toward delta-rs MERGE.*
 - **Spark is still not justified** — all of the above ran single-node in 59s.
+
+### Scattered re-embed result (2026-06): delta-rs MERGE reintroduces the amplification
+
+The favorable "10s / 0-duplicate" MERGE above used 200k **contiguous** ids,
+which cluster into whole files. Real re-embeds (an Athena refresh changing a
+subset of concept names) scatter across the row-space, and delta-rs MERGE
+rewrites whole *files* containing any matched row. Measured on a 1M-row
+`model_version`, re-embedding the same 200k rows:
+
+| Re-embed 200k of 1M | files rewritten | updated | rows copied (amplification) | output rows |
+|---|---|---|---|---|
+| Delta MERGE, contiguous ids | 6 of 30 | 200k | **0** (0.0×) | 200k |
+| Delta MERGE, scattered ids | **30 of 30** | 200k | **800k (4.0×)** | **1,000,000** |
+| Delta MERGE, scattered, `[mv, vocabulary_id]` | 40 of 40 | 200k | **800k (4.0×)** | 1,000,000 |
+| Parquet append (current), contiguous | n/a | — | — | 200k (+200k stale) |
+| Parquet append (current), scattered | n/a | — | — | 200k (+200k stale) |
+
+- **Scattered MERGE rewrote the entire partition** (all files, 1M rows) to
+  change 200k — 4× amplification that scales with *partition size, not change
+  size*. At 12M this rewrites the whole model_version partition per re-embed.
+  This is precisely original issues #1/#2, reborn inside Delta.
+- **Finer partitioning does not help** (identical 4.0×): an Athena refresh
+  scatters changes uniformly, so every partition's files get a mix and all are
+  rewritten. Partitioning only helps when changes concentrate.
+- **The current append-only parquet path is scatter-insensitive** — identical
+  cost contiguous vs scattered (append writes only the 200k changed rows as new
+  shards, O(changes)). Its only cost is read-side duplicate growth, which is
+  bounded and fixable by periodic compaction.
+
+### Revised stance (supersedes the lean above)
+
+The real choice is a **write strategy**, not an engine:
+
+- *Upsert-on-write* — DuckDB `INSERT OR REPLACE` (~50s/200k at 2M and growing)
+  or Delta `MERGE` (rewrites whole partition on scatter). Both scale re-embed
+  cost with table/partition size; both lose at scale on the re-embed path.
+- *Append + merge-on-read + periodic compaction* — what the current parquet
+  backend already does, minus compaction. Writes are always O(changes) and
+  scatter-insensitive; read cost is bounded by compacting on a schedule, off
+  the write critical path.
+
+Recommendations:
+
+1. **Reject delta-rs MERGE for the re-embed path** — it is the ADR's
+   amplification with a nicer API.
+2. **Cheapest high-value fix: keep the append-only parquet backend and add a
+   periodic compaction step** (dedup + rewrite shards). Gives scatter-insensitive
+   writes, bounded reads, and lock-free multi-reader concurrency (the original
+   driver) with **no new dependency**.
+3. **Delta in *append* mode (not MERGE)** is a reasonable upgrade only if the
+   ACID log + managed OPTIMIZE + Snowflake-via-Delta story is specifically
+   wanted — it is the current parquet pattern plus a transaction log. The
+   amplifying part of Delta (MERGE) is the part this workload must avoid.
+
+Criterion #4 from the original "when to revisit" list is met for *writes*, but
+the re-embed amplification means a wholesale parquet/Delta-MERGE switch is **not**
+warranted; adding compaction to the existing backend is the proportionate move.
+Spark/Delta-on-Spark remains rejected.
 
 ### Caveats (do not over-read)
 
 - Synthetic random vectors, single process, local SSD; 2M ≈ ⅙ of production
   (12M). Trends are consistent across 200k→2M but absolute ms scale up.
-- delta-rs MERGE rewrites whole *files* containing any matched row, so the
-  favorable ~10s/0-dup result depends on the re-embed being **model_version-
-  scoped** (partition-prunable). A re-embed scattered across many
-  vocabularies/model_versions would amplify and must be measured separately
-  before committing.
-- OPTIMIZE looked near-free only because the preceding MERGE had already
-  consolidated the touched partition.
-
-### Revised stance
-
-The "do not revisit" disposition above is **superseded for the Delta-rs case**:
-revisit criterion #4 (write throughput ≥ DuckDB table) is met by a wide margin,
-and criteria #2 (a merge-on-read write path) and #3 (direct downstream
-consumption without an export step) are satisfied by Delta's transaction log.
-Criterion #1 (>100M rows) is *not* met, so this is not yet a forcing function —
-but the DuckDB-table re-embed cost is becoming one on its own. Recommended next
-step is a flag-gated `delta` backend behind the existing `store.open_db` path
-dispatch, validated against a realistic scattered re-embed at larger scale.
-Spark/Delta-on-Spark remains rejected.
+- The favorable ~10s/0-dup MERGE result depended on the re-embed being
+  contiguous (file-clustered). The scattered case — the realistic one — was
+  measured above and shows 4× amplification; that is the result to trust for
+  this workload, not the contiguous figure.
+- OPTIMIZE looked near-free only because the preceding (contiguous) MERGE had
+  already consolidated the touched partition.
 
 ### Migration & Snowflake-handoff considerations (must address before any switch)
 

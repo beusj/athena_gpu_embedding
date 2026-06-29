@@ -102,12 +102,16 @@ addendum); the concurrency-relevant takeaways:
   compaction**.
 - **delta-rs** (Delta Lake without Spark/JVM) gives the same lock-free
   multi-reader concurrency *plus* an ACID transaction log (readers see only
-  committed snapshots), true MERGE upserts with zero duplicates, partition-
-  pruned reads, and cheap OPTIMIZE compaction — at the fastest writes measured
-  (~1.2s/100k). It is the one option that resolves both the concurrency goal of
-  this doc and the read-side weakness of the current parquet path.
+  committed snapshots) and managed OPTIMIZE compaction — but **only in append
+  mode**. Its MERGE upsert reintroduces write amplification on realistic
+  (scattered) re-embeds — see the scattered-re-embed result in
+  `adr_parquet_store_rejected.md` (4× amplification, rewrites the whole
+  partition). So MERGE is the part of Delta this workload must avoid.
 
 So if cross-process embed-vs-export/status concurrency is a hard requirement,
-moving to a file/lakehouse backend (delta-rs preferred) is a cleaner answer than
-the in-process or snapshot workarounds above — at the cost of a backend change.
-Spark is **not** required for this and is rejected (the data fits one node).
+the proportionate answer is to **add periodic compaction to the existing
+append-only parquet backend** — that already gives lock-free multi-reader access
+and scatter-insensitive writes; compaction just bounds the read-side duplicate
+growth. A move to delta-rs in *append* mode (not MERGE) is a heavier alternative
+worth it only if the ACID log / Snowflake-via-Delta story is specifically
+wanted. Spark is **not** required for either and is rejected (data fits one node).
