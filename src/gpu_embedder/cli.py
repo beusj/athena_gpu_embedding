@@ -380,7 +380,12 @@ def embed_cmd(
         st.upsert_model_version_cache(conn, cfg.model, cfg.model_revision, model_version)
     filter_hash = filter_spec_hash(spec, cfg.namespace)
 
-    # Load only CSVs that changed for this (model_version, filter_hash)
+    # Load only CSVs that changed for this (model_version, filter_hash).
+    # Each ingested_fingerprints entry is (path, fingerprint, row_count) where
+    # row_count is this file's *post-filter, pre-dedup* row count. Cross-file
+    # concept_id de-duplication happens later, so the summed skipped/loaded row
+    # counts below are reporting figures only — they can exceed the number of
+    # distinct concepts actually stored and must not be treated as authoritative.
     filtered = []
     ingested_fingerprints: list[tuple[Path, dict[str, object], int]] = []
     skipped_unchanged = 0
