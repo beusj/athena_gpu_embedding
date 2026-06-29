@@ -244,11 +244,17 @@ def embed_all(
     text_fields: list[str],
     separator: str,
     model_version: str,
+    *,
+    precomputed_texts: dict[int, str] | None = None,
 ) -> list[EmbeddedRow]:
     """Embed all rows in batches, returning EmbeddedRow objects.
 
     Progress is shown via tqdm.  On any exception within a batch the error is
     logged and re-raised — no partial writes.
+
+    *precomputed_texts* maps ``concept_id`` → embed text; when supplied the
+    caller has already built the text (e.g. for change detection) and we reuse
+    it instead of recomputing ``build_embed_text`` per row.
     """
     total_batches = max((len(rows) + batch_size - 1) // batch_size, 1)
     logger.info(
@@ -271,7 +277,10 @@ def embed_all(
     )
     for batch_index, start in enumerate(progress, start=1):
         batch = rows[start : start + batch_size]
-        texts = [build_embed_text(r, text_fields, separator) for r in batch]
+        if precomputed_texts is not None:
+            texts = [precomputed_texts[r.concept_id] for r in batch]
+        else:
+            texts = [build_embed_text(r, text_fields, separator) for r in batch]
         try:
             logger.info(
                 "Embedding batch %d/%d (%d rows)",

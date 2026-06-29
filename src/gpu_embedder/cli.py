@@ -538,13 +538,21 @@ def embed_cmd(
         quantization_scheme="none",
     )
 
+    # Texts to feed the tokenizer, keyed by concept_id; reused for change
+    # detection and embedding so build_embed_text runs at most once per row.
+    texts_for_embed: dict[int, str] | None = None
     if cfg.force:
         to_embed = filtered
     else:
-        candidate_texts = {
-            row.concept_id: build_embed_text(row, cfg.text_fields, cfg.separator)
-            for row in filtered
-        }
+        # Fast path for the common single-field default avoids the per-row
+        # build_embed_text call overhead across millions of rows.
+        if cfg.text_fields == ["concept_name"]:
+            candidate_texts = {row.concept_id: row.concept_name for row in filtered}
+        else:
+            candidate_texts = {
+                row.concept_id: build_embed_text(row, cfg.text_fields, cfg.separator)
+                for row in filtered
+            }
         to_embed, new_count, changed_count, unchanged_count = st.classify_rows_requiring_embedding(
             conn,
             filtered,
@@ -555,6 +563,9 @@ def embed_cmd(
             "Embedding delta: "
             f"{new_count} new, {changed_count} changed-text, {unchanged_count} unchanged."
         )
+        # Keep only the texts we will actually embed, then release the rest.
+        texts_for_embed = {row.concept_id: candidate_texts[row.concept_id] for row in to_embed}
+        del candidate_texts
     skipped = len(filtered) - len(to_embed)
     typer.echo(f"Skipping {skipped} already-embedded, embedding {len(to_embed)} …")
 
@@ -592,6 +603,7 @@ def embed_cmd(
             cfg.text_fields,
             cfg.separator,
             model_version,
+            precomputed_texts=texts_for_embed,
         )
         total_embed_seconds += time.perf_counter() - embed_started
 

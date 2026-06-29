@@ -227,6 +227,8 @@ def test_embed_upserts_every_n_batches(monkeypatch) -> None:
         text_fields,
         separator,
         model_version,
+        *,
+        precomputed_texts=None,
     ):
         return [
             EmbeddedRow(
