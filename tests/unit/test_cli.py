@@ -6,25 +6,32 @@ import csv
 from datetime import UTC, datetime
 from pathlib import Path
 
-import duckdb
 from typer.testing import CliRunner
 
 from gpu_embedder.cli import app
-from gpu_embedder.models import SCHEMA_DDL, ConceptRow, EmbeddedRow
+from gpu_embedder.models import ConceptRow, EmbeddedRow
+from gpu_embedder.store import ensure_schema, open_db, upsert_rows
 
 
 def _seed_embeddings_db(db_path: Path) -> None:
-    conn = duckdb.connect(str(db_path))
-    conn.execute(SCHEMA_DDL)
-    conn.execute(
-        """
-        INSERT INTO concept_embeddings (
-            concept_id, concept_name, domain_id, vocabulary_id,
-            concept_class_id, standard_concept, concept_code,
-            invalid_reason, embedding, embed_text, model_version, embedded_at
-        ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, NOW())
-        """,
-        [999002, "CPT4 test concept", "Procedure", "CPT4", [0.0] * 768, "CPT4 test concept", "v1"],
+    conn = open_db(db_path)
+    ensure_schema(conn)
+    upsert_rows(
+        conn,
+        [
+            EmbeddedRow(
+                concept=ConceptRow(
+                    concept_id=999002,
+                    concept_name="CPT4 test concept",
+                    domain_id="Procedure",
+                    vocabulary_id="CPT4",
+                ),
+                embedding=[0.0] * 768,
+                embed_text="CPT4 test concept",
+                model_version="v1",
+                embedded_at=datetime.now(tz=UTC),
+            )
+        ],
     )
     conn.close()
 
@@ -332,8 +339,8 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
     db_path = tmp_path / "embeddings.duckdb"
     out_dir = tmp_path / "parquet"
 
-    conn = duckdb.connect(str(db_path))
-    conn.execute(SCHEMA_DDL)
+    conn = open_db(db_path)
+    ensure_schema(conn)
 
     now = datetime(2026, 1, 1, tzinfo=UTC)
     rows = [
@@ -387,32 +394,7 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
         ),
     ]
 
-    conn.executemany(
-        """
-        INSERT INTO concept_embeddings (
-            concept_id, concept_name, domain_id, vocabulary_id,
-            concept_class_id, standard_concept, concept_code,
-            invalid_reason, embedding, embed_text, model_version, embedded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                row.concept.concept_id,
-                row.concept.concept_name,
-                row.concept.domain_id,
-                row.concept.vocabulary_id,
-                row.concept.concept_class_id,
-                row.concept.standard_concept,
-                row.concept.concept_code,
-                row.concept.invalid_reason,
-                row.embedding,
-                row.embed_text,
-                row.model_version,
-                row.embedded_at,
-            )
-            for row in rows
-        ],
-    )
+    upsert_rows(conn, rows)
     conn.close()
 
     result = runner.invoke(
@@ -437,7 +419,9 @@ def test_export_writes_sharded_parquet_by_vocabulary(tmp_path: Path) -> None:
     assert len(snomed_files) == 2
     assert len(loinc_files) == 1
 
-    verify_conn = duckdb.connect()
+    from duckdb import connect
+
+    verify_conn = connect()
     snomed_count = verify_conn.execute(
         "SELECT COUNT(*) FROM read_parquet(?)",
         [str(out_dir / "SNOMED" / "*.parquet")],

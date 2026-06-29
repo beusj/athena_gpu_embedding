@@ -8,7 +8,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from gpu_embedder.models import SCHEMA_DDL
+from gpu_embedder.models import ConceptRow, EmbeddedRow
 from gpu_embedder.report import (
     ModelVersionInfo,
     VocabCoverage,
@@ -16,6 +16,7 @@ from gpu_embedder.report import (
     embedded_summary,
     list_model_versions,
 )
+from gpu_embedder.store import ensure_schema, open_db, upsert_rows
 
 FIXTURE_TSV = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
 
@@ -25,8 +26,12 @@ FIXTURE_TSV = Path(__file__).parent.parent / "fixtures" / "CONCEPT_mini.tsv"
 
 
 def _mem_conn() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
-    conn.execute(SCHEMA_DDL)
+    raise RuntimeError("Deprecated helper not supported for parquet-backed store")
+
+
+def _store_conn(tmp_path: Path) -> duckdb.DuckDBPyConnection:
+    conn = open_db(tmp_path / "embeddings")
+    ensure_schema(conn)
     return conn
 
 
@@ -38,23 +43,21 @@ def _insert_embedded(
     model_version: str = "abc123",
     embedded_at: datetime | None = None,
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO concept_embeddings (
-            concept_id, concept_name, domain_id, vocabulary_id,
-            concept_class_id, standard_concept, concept_code,
-            invalid_reason, embedding, embed_text, model_version, embedded_at
-        ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
-        """,
+    upsert_rows(
+        conn,
         [
-            concept_id,
-            f"Concept {concept_id}",
-            domain_id,
-            vocabulary_id,
-            [0.0] * 768,
-            f"Concept {concept_id}",
-            model_version,
-            embedded_at or datetime(2026, 1, 1, tzinfo=UTC),
+            EmbeddedRow(
+                concept=ConceptRow(
+                    concept_id=concept_id,
+                    concept_name=f"Concept {concept_id}",
+                    domain_id=domain_id,
+                    vocabulary_id=vocabulary_id,
+                ),
+                embedding=[0.0] * 768,
+                embed_text=f"Concept {concept_id}",
+                model_version=model_version,
+                embedded_at=embedded_at or datetime(2026, 1, 1, tzinfo=UTC),
+            )
         ],
     )
 
@@ -93,13 +96,13 @@ class TestListModelVersions:
         result = list_model_versions(conn)
         assert result == []
 
-    def test_empty_when_table_exists_but_empty(self) -> None:
-        conn = _mem_conn()
+    def test_empty_when_table_exists_but_empty(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         result = list_model_versions(conn)
         assert result == []
 
-    def test_single_version(self) -> None:
-        conn = _mem_conn()
+    def test_single_version(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(conn, 1, "LOINC", "Measurement", model_version="aaa")
         _insert_embedded(conn, 2, "SNOMED", "Condition", model_version="aaa")
         result = list_model_versions(conn)
@@ -107,8 +110,8 @@ class TestListModelVersions:
         assert result[0].model_version == "aaa"
         assert result[0].count == 2
 
-    def test_multiple_versions_sorted_most_recent_first(self) -> None:
-        conn = _mem_conn()
+    def test_multiple_versions_sorted_most_recent_first(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(
             conn, 1, "LOINC", "Measurement",
             model_version="old", embedded_at=datetime(2026, 1, 1, tzinfo=UTC)
@@ -120,8 +123,8 @@ class TestListModelVersions:
         result = list_model_versions(conn)
         assert [r.model_version for r in result] == ["new", "old"]
 
-    def test_short_hash_is_first_16_chars(self) -> None:
-        conn = _mem_conn()
+    def test_short_hash_is_first_16_chars(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(conn, 1, "LOINC", "Measurement", model_version="abcdef1234567890xyz")
         result = list_model_versions(conn)
         assert result[0].short_hash == "abcdef1234567890"
@@ -137,12 +140,12 @@ class TestEmbeddedSummary:
         conn = duckdb.connect(":memory:")
         assert embedded_summary(conn) == []
 
-    def test_empty_when_no_rows(self) -> None:
-        conn = _mem_conn()
+    def test_empty_when_no_rows(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         assert embedded_summary(conn) == []
 
-    def test_groups_by_vocabulary_and_domain(self) -> None:
-        conn = _mem_conn()
+    def test_groups_by_vocabulary_and_domain(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(conn, 1, "LOINC", "Measurement")
         _insert_embedded(conn, 2, "LOINC", "Measurement")
         _insert_embedded(conn, 3, "SNOMED", "Condition")
@@ -152,16 +155,16 @@ class TestEmbeddedSummary:
         assert loinc.embedded == 2
         assert loinc.total == 2  # total == embedded in DB-only mode
 
-    def test_filters_by_model_version(self) -> None:
-        conn = _mem_conn()
+    def test_filters_by_model_version(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(conn, 1, "LOINC", "Measurement", model_version="v1")
         _insert_embedded(conn, 2, "SNOMED", "Condition", model_version="v2")
         rows_v1 = embedded_summary(conn, model_version="v1")
         assert len(rows_v1) == 1
         assert rows_v1[0].vocabulary_id == "LOINC"
 
-    def test_all_versions_when_no_filter(self) -> None:
-        conn = _mem_conn()
+    def test_all_versions_when_no_filter(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(conn, 1, "LOINC", "Measurement", model_version="v1")
         _insert_embedded(conn, 2, "LOINC", "Measurement", model_version="v2")
         rows = embedded_summary(conn)
@@ -169,8 +172,8 @@ class TestEmbeddedSummary:
         assert len(rows) == 1
         assert rows[0].embedded == 2
 
-    def test_sorted_alphabetically(self) -> None:
-        conn = _mem_conn()
+    def test_sorted_alphabetically(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(conn, 1, "SNOMED", "Condition")
         _insert_embedded(conn, 2, "LOINC", "Measurement")
         rows = embedded_summary(conn)
@@ -190,13 +193,13 @@ class TestCoverageReport:
         assert all(r.embedded == 0 for r in rows)
         assert sum(r.total for r in rows) > 0
 
-    def test_all_gaps_when_table_empty(self) -> None:
-        conn = _mem_conn()
+    def test_all_gaps_when_table_empty(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         rows = coverage_report(conn, FIXTURE_TSV)
         assert all(r.embedded == 0 for r in rows)
 
-    def test_partial_coverage(self) -> None:
-        conn = _mem_conn()
+    def test_partial_coverage(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         # Embed only the two LOINC concepts from the fixture
         # concept_ids: 40481088, 3004249 (both LOINC / Measurement)
         _insert_embedded(conn, 40481088, "LOINC", "Measurement")
@@ -210,8 +213,8 @@ class TestCoverageReport:
         assert loinc.total == 3
         assert loinc.gap == 1
 
-    def test_full_coverage_group(self) -> None:
-        conn = _mem_conn()
+    def test_full_coverage_group(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         # Embed all UCUM-style: fixture only has 1 CPT4 row
         _insert_embedded(conn, 999002, "CPT4", "Procedure")
         rows = coverage_report(conn, FIXTURE_TSV)
@@ -220,8 +223,8 @@ class TestCoverageReport:
         assert cpt4.gap == 0
         assert cpt4.pct == pytest.approx(100.0)
 
-    def test_model_version_filter(self) -> None:
-        conn = _mem_conn()
+    def test_model_version_filter(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         _insert_embedded(conn, 40481088, "LOINC", "Measurement", model_version="v1")
         _insert_embedded(conn, 3004249, "LOINC", "Measurement", model_version="v2")
 
@@ -230,14 +233,14 @@ class TestCoverageReport:
         assert loinc is not None
         assert loinc.embedded == 1  # only v1 concept counted
 
-    def test_groups_sorted_alphabetically(self) -> None:
-        conn = _mem_conn()
+    def test_groups_sorted_alphabetically(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         rows = coverage_report(conn, FIXTURE_TSV)
         vocab_ids = [r.vocabulary_id for r in rows]
         assert vocab_ids == sorted(vocab_ids)
 
-    def test_total_count_matches_csv(self) -> None:
-        conn = _mem_conn()
+    def test_total_count_matches_csv(self, tmp_path: Path) -> None:
+        conn = _store_conn(tmp_path)
         rows = coverage_report(conn, FIXTURE_TSV)
         # Fixture has 10 data rows
         assert sum(r.total for r in rows) == 10

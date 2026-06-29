@@ -136,7 +136,7 @@ def embed_cmd(
     ] = None,
     db: Annotated[
         Path | None,
-        typer.Option(envvar="GPU_EMBED_DB", help="DuckDB output file"),
+        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path (parquet root or legacy .duckdb)"),
     ] = None,
     model: Annotated[
         str | None,
@@ -228,7 +228,7 @@ def embed_cmd(
         ),
     ] = None,
 ) -> None:
-    """Batch-embed Athena CONCEPT.csv rows with SapBERT and store in DuckDB."""
+    """Batch-embed Athena CONCEPT.csv rows with SapBERT and store in parquet shards."""
     # Build config, allowing CLI overrides
     cfg_overrides: dict[str, object] = {}
     if vocab_dir is not None:
@@ -516,7 +516,7 @@ def export_cmd(
     ],
     db: Annotated[
         Path | None,
-        typer.Option(envvar="GPU_EMBED_DB", help="DuckDB file to export from"),
+        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path to export from"),
     ] = None,
     model_version_prefix: Annotated[
         str | None,
@@ -558,15 +558,11 @@ def export_cmd(
         ),
     ] = "zstd",
 ) -> None:
-    """Export embeddings from DuckDB to sharded parquet files by vocabulary directory."""
+    """Export embeddings from the store to sharded parquet files by vocabulary directory."""
     from gpu_embedder import store as st
     from gpu_embedder.report import list_model_versions
 
     cfg = EmbedConfig(**({"db": db} if db is not None else {}))
-    if not cfg.db.exists():
-        typer.echo(f"ERROR: database not found: {cfg.db}", err=True)
-        raise typer.Exit(1)
-
     allowed_compressions = {"zstd", "snappy", "gzip", "brotli", "lz4", "uncompressed"}
     normalized_compression = compression.lower()
     if normalized_compression not in allowed_compressions:
@@ -741,7 +737,7 @@ def export_cmd(
 def status_cmd(
     db: Annotated[
         Path | None,
-        typer.Option(envvar="GPU_EMBED_DB", help="DuckDB file to inspect"),
+        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path to inspect"),
     ] = None,
     model_version_prefix: Annotated[
         str | None,
@@ -751,15 +747,11 @@ def status_cmd(
         ),
     ] = None,
 ) -> None:
-    """Show a summary of what is currently stored in the embeddings database."""
+    """Show a summary of what is currently stored in the embeddings store."""
     from gpu_embedder import store as st
     from gpu_embedder.report import embedded_summary, list_model_versions
 
     cfg = EmbedConfig(**({"db": db} if db is not None else {}))
-
-    if not cfg.db.exists():
-        typer.echo(f"Database not found: {cfg.db}")
-        raise typer.Exit(0)
 
     conn = st.open_db(cfg.db)
     st.ensure_schema(conn)
@@ -769,7 +761,7 @@ def status_cmd(
         typer.echo("No embeddings found in the database.")
         raise typer.Exit(0)
 
-    typer.echo(f"\nDatabase: {cfg.db}\n")
+    typer.echo(f"\nStore: {cfg.db}\n")
     typer.echo(f"{'MODEL VERSION':18}  {'CONCEPTS':>9}  {'FIRST EMBEDDED':20}  LAST EMBEDDED")
     typer.echo("-" * 75)
     for v in versions:
@@ -831,7 +823,7 @@ def coverage_cmd(
     ] = None,
     db: Annotated[
         Path | None,
-        typer.Option(envvar="GPU_EMBED_DB", help="DuckDB file to compare against"),
+        typer.Option(envvar="GPU_EMBED_DB", help="Embedding store path to compare against"),
     ] = None,
     model_version_prefix: Annotated[
         str | None,
@@ -859,7 +851,7 @@ def coverage_cmd(
         ),
     ] = None,
 ) -> None:
-    """Compare a CONCEPT.csv against the embeddings database to identify gaps."""
+    """Compare a CONCEPT.csv against the embeddings store to identify gaps."""
     from gpu_embedder import store as st
     from gpu_embedder.report import VocabCoverage, coverage_report, list_model_versions
 
@@ -906,7 +898,7 @@ def coverage_cmd(
             mv_filter = versions[0].model_version  # most recent
             typer.echo(f"Using most recent model version: {mv_filter[:16]}…\n")
         else:
-            typer.echo("No embeddings found in database — all concepts will show as gaps.\n")
+            typer.echo("No embeddings found in store — all concepts will show as gaps.\n")
 
     # Accumulate coverage across all provided CSVs
     agg: dict[tuple[str, str], VocabCoverage] = defaultdict(

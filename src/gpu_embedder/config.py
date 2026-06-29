@@ -32,7 +32,7 @@ class EmbedConfig(BaseSettings):
 
     # Paths
     vocab_dir: Path = Path("athena_vocab")
-    db: Path = Path("embeddings.duckdb")
+    db: Path = Path("embeddings")
     log_dir: Path = Path("logs")
     log_max_bytes: int = 2 * 1024 * 1024
     log_max_files: int = 5

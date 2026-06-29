@@ -1,8 +1,9 @@
 # gpu-embedder
 
 Batch-embed OHDSI Athena concept CSVs with SapBERT (FP32, GPU) and persist the
-vectors to DuckDB. Already-embedded concepts are skipped unless `--force` is
-passed, so runs are safe to restart or extend incrementally.
+vectors to parquet shards, with DuckDB as the query interface layer.
+Already-embedded concepts are skipped unless `--force` is passed, so runs are
+safe to restart or extend incrementally.
 
 ---
 
@@ -26,9 +27,9 @@ passed, so runs are safe to restart or extend incrementally.
    [SapBERT](https://huggingface.co/cambridgeltl/SapBERT-from-PubMedBERT-fulltext)
    running in FP32 on a CUDA GPU (falls back to CPU when no GPU is available,
    but will be slow).
-4. **Writes** each concept's vector plus its metadata into a local DuckDB
-   database (`embeddings.duckdb` by default). Embedding runs are stamped with a
-   `model_version` digest so mixed-version stores are detected.
+4. **Writes** each concept's vector plus its metadata into a local parquet
+  store (`embeddings/` by default), partitioned by `model_version`.
+  DuckDB remains the query engine over that store.
 5. **Skips** rows whose `(concept_id, model_version)` pair already exists in
    the store. Pass `--force` to re-embed unconditionally.
 
@@ -49,10 +50,10 @@ gpu_embedding/
 │   └── gpu_embedder/
 │       ├── cli.py          # Typer app: `embed`, `export`, `status`, `coverage`, `cpt4`
 │       ├── config.py       # Settings (Pydantic BaseSettings + env)
-│       ├── models.py       # Pydantic row models + DuckDB schema DDL
+│       ├── models.py       # Pydantic row models + contracts
 │       ├── ingest.py       # DuckDB-backed CSV scan + filter → ConceptRow records
 │       ├── embed.py        # SapBERT FP32 tokenize + forward pass
-│       └── store.py        # DuckDB upsert / existence checks
+│       └── store.py        # DuckDB query layer over parquet shards
 └── tests/
     ├── unit/
     └── integration/
@@ -172,6 +173,16 @@ gpu-embed cpt4      [OPTIONS]                — populate CPT-4 names via Java
 
 Running `gpu-embed` without a subcommand is equivalent to `gpu-embed embed`.
 
+### Storage model and migration
+
+- Default store path is `embeddings/` (directory).
+- Data is stored as parquet files under `model_version=<digest>/part-*.parquet`.
+- `concept_embeddings` is exposed as a DuckDB view for all reads and exports.
+- If `--db` / `GPU_EMBED_DB` points to an existing legacy `.duckdb` file,
+  rows are auto-migrated one time into a sibling parquet directory with the
+  same basename (for example `embeddings.duckdb` → `embeddings/`).
+- No manual pre-export is required for migration.
+
 ### `embed` — batch embed concepts
 
 ```
@@ -192,7 +203,7 @@ When no `CSV_PATH` arguments are given, reads `CONCEPT.csv` from
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` (used when no explicit path given) |
-| `--db` | `embeddings.duckdb` | DuckDB file path |
+| `--db` | `embeddings` | Embedding store path (directory recommended; legacy `.duckdb` auto-migrates) |
 | `--batch-size` | `256` | Rows per GPU forward pass |
 | `--model` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | HF model ID or local path |
 | `--model-revision` | _(default branch)_ | HuggingFace commit hash, branch, or tag to pin the exact model revision |
@@ -222,18 +233,18 @@ gpu-embed cpt4 [OPTIONS]
 | `--jar` | `CPT4_JAR` / `athena_vocab/cpt4.jar` | Explicit path to `cpt4.jar` |
 | `--api-key` | `UMLS_API_KEY` | UMLS API key (prefer setting in `.env`) |
 
-### `status` — show what is stored in the database
+### `status` — show what is stored in the embeddings store
 
 ```
 gpu-embed status [OPTIONS]
 ```
 
-Prints the model versions stored in the database and a per-(vocabulary, domain)
+Prints the model versions stored in the embeddings store and a per-(vocabulary, domain)
 breakdown of embedded concept counts. No source CSV is required.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings.duckdb` | DuckDB file to inspect |
+| `--db` | `embeddings` | Embedding store path to inspect |
 | `--model-version` | _(most recent)_ | Show breakdown for the version starting with this prefix |
 
 ### `export` — write sharded parquet by vocabulary directory
@@ -251,7 +262,7 @@ Sharding is controlled by `--shard-rows` (rows per file).
 | Flag | Default | Description |
 |------|---------|-------------|
 | `OUTPUT_DIR` | _(required)_ | Destination directory for parquet output |
-| `--db` | `embeddings.duckdb` | DuckDB file to export from |
+| `--db` | `embeddings` | Embedding store path to export from |
 | `--model-version` | _(most recent)_ | Export only the model version starting with this prefix |
 | `--vocabulary-id` | _(all)_ | Export only these vocabulary IDs (repeatable or comma-delimited) |
 | `--shard-rows` | `50000` | Max rows per parquet shard |
@@ -265,7 +276,7 @@ gpu-embed coverage [OPTIONS] [CSV_PATH...]
 ```
 
 Scans a `CONCEPT.csv` and compares every (vocabulary, domain) group against the
-embeddings database, reporting how many concepts have been embedded and how many
+embeddings store, reporting how many concepts have been embedded and how many
 remain.
 
 By default the output is split into two sections:
@@ -278,7 +289,7 @@ When no `CSV_PATH` arguments are given, reads from `GPU_EMBED_VOCAB_DIR`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `embeddings.duckdb` | DuckDB file to compare against |
+| `--db` | `embeddings` | Embedding store path to compare against |
 | `--vocab-dir` | `athena_vocab` | Directory containing `CONCEPT.csv` |
 | `--model-version` | _(most recent)_ | Limit comparison to the version starting with this prefix |
 | `--show-complete` / `--gaps-only` | `show-complete` | Include or hide fully-embedded groups |
@@ -323,9 +334,9 @@ gpu-embed embed \
   --text-field concept_name \
   --separator ": "
 
-# Point at a specific DuckDB file and use CPU
+# Point at a specific store path and use CPU
 gpu-embed embed /data/vocab/CONCEPT.csv \
-  --db /data/embeddings/omop.duckdb \
+  --db /data/embeddings \
   --device cpu \
   --batch-size 64
 
@@ -350,8 +361,8 @@ gpu-embed coverage
 # Hide fully-embedded groups and show only gaps
 gpu-embed coverage --gaps-only
 
-# Coverage against an explicit CSV and specific DB
-gpu-embed coverage /data/vocab/CONCEPT.csv --db /data/embeddings/omop.duckdb
+# Coverage against an explicit CSV and specific store path
+gpu-embed coverage /data/vocab/CONCEPT.csv --db /data/embeddings
 
 # Write coverage results to CSV for follow-up workflows
 gpu-embed coverage --csv coverage_report.csv
@@ -369,17 +380,20 @@ and idempotent `MERGE` are documented in:
 Quick start:
 
 ```bash
-uv run gpu-embed export exports/parquet --db embeddings.duckdb --shard-rows 50000
+uv run gpu-embed export exports/parquet --db embeddings --shard-rows 50000
 AWS_PAGER="" aws s3 sync exports/parquet s3://<your-bucket>/concept_embeddings/
 # Optional named profile: add --profile <aws-profile> or set AWS_PROFILE
 ```
 
 ---
 
-## DuckDB schema
+## Logical schema
+
+The store is physically parquet but exposed through a DuckDB view named
+`concept_embeddings` with the following logical columns:
 
 ```sql
-CREATE TABLE concept_embeddings (
+CREATE VIEW concept_embeddings AS SELECT
     concept_id          BIGINT    NOT NULL,
     concept_name        TEXT      NOT NULL,
     domain_id           TEXT,
@@ -391,9 +405,7 @@ CREATE TABLE concept_embeddings (
     embedding           FLOAT[768] NOT NULL,   -- SapBERT CLS vector
     embed_text          TEXT      NOT NULL,    -- exact string that was embedded
     model_version       TEXT      NOT NULL,    -- SHA-256 digest of model weights
-    embedded_at         TIMESTAMP NOT NULL,
-    PRIMARY KEY (concept_id, model_version)
-);
+    embedded_at         TIMESTAMP NOT NULL;
 ```
 
 The `model_version` digest ensures that embeddings from different model
@@ -409,7 +421,7 @@ so an empty `.env` is valid for local GPU runs against `athena_vocab/`.
 ```dotenv
 # Paths
 GPU_EMBED_VOCAB_DIR=athena_vocab
-GPU_EMBED_DB=embeddings.duckdb
+GPU_EMBED_DB=embeddings
 
 # Model
 GPU_EMBED_MODEL=cambridgeltl/SapBERT-from-PubMedBERT-fulltext
