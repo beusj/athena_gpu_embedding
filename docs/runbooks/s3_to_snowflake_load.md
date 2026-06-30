@@ -134,135 +134,122 @@ AWS_PAGER="" aws s3 sync \
   s3://<your-bucket>/concept_embeddings/
 ```
 
-## 4) Load from S3 into Snowflake (`COPY INTO`)
+## 4) Load from S3 into a staging table (`COPY INTO`)
 
-> Exported parquet includes a `namespace` column (default `athena`). It is part
-> of the embedding identity, so the target table carries it and the idempotent
-> load keys on `(namespace, concept_id, model_version)`. Source-concept datasets
-> exported under a distinct namespace load into the same table without colliding
-> with Athena standard concepts. `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` picks
-> the column up automatically.
+> The export parquet mirrors the GPU store, not concept-mapper's contract tables:
+> `embedding` is a fixed-size float list, the version column is `model_version`
+> (the **weights-file SHA-256** — the store's provenance identity), and there are
+> extra columns (`namespace`, `concept_class_id`, `concept_code`, `invalid_reason`,
+> `embed_text`, `source_id`, `mapping_wave`). Concept-mapper's contract tables use
+> a **different** shape — `embedding VECTOR(FLOAT, 768)` and the version column
+> `embed_model_version` — so we land the parquet in a staging table first (§4),
+> then upsert into the contract tables with the right types and the shared
+> retrieval version (§5). See ALIGNMENT.md §4.
 >
-> Exported parquet also includes nullable `source_id` and `mapping_wave` columns.
-> These are NULL for Athena concepts and populated for source-concept datasets so
-> embedded source rows can be rejoined to the concept-mapper `source_concepts`
-> table on `(mapping_wave, source_id)`. The hashed `concept_id` is only a dedupe
-> surrogate for source rows and cannot reconstruct `source_id`, so both columns
-> must survive the handoff.
+> `source_id` / `mapping_wave` are NULL for Athena **target** concepts and
+> populated for **source** concepts, so one staging load fans out to both contract
+> tables: targets → `concept_embeddings`, sources → `source_concepts`.
 
 ```sql
--- One-time file format
-CREATE OR REPLACE FILE FORMAT omop_parquet_ff
-  TYPE = PARQUET;
-
--- One-time external stage
+-- One-time file format + external stage
+CREATE OR REPLACE FILE FORMAT omop_parquet_ff TYPE = PARQUET;
 CREATE OR REPLACE STAGE omop_embed_stage
   URL = 's3://<your-bucket>/concept_embeddings/'
   STORAGE_INTEGRATION = <your_storage_integration>
   FILE_FORMAT = omop_parquet_ff;
 
--- Target table (example)
-CREATE TABLE IF NOT EXISTS concept_embeddings (
-  namespace STRING,
-  concept_id BIGINT,
-  concept_name STRING,
-  domain_id STRING,
-  vocabulary_id STRING,
-  concept_class_id STRING,
-  standard_concept STRING,
-  concept_code STRING,
-  invalid_reason STRING,
-  embedding ARRAY,
-  embed_text STRING,
-  model_version STRING,
-  embedded_at TIMESTAMP_NTZ,
-  source_id STRING,
-  mapping_wave STRING
+-- Staging table mirrors the parquet exactly (embedding as ARRAY, weights-hash
+-- model_version). This is NOT a contract table — it is the load buffer for §5.
+CREATE TABLE IF NOT EXISTS omop_mapping.concept_embeddings_stage (
+  namespace STRING, concept_id BIGINT, concept_name STRING, domain_id STRING,
+  vocabulary_id STRING, concept_class_id STRING, standard_concept STRING,
+  concept_code STRING, invalid_reason STRING, embedding ARRAY, embed_text STRING,
+  model_version STRING, embedded_at TIMESTAMP_NTZ, source_id STRING, mapping_wave STRING
 );
 
--- Bulk load all vocabulary directories
-COPY INTO concept_embeddings
+TRUNCATE TABLE omop_mapping.concept_embeddings_stage;
+COPY INTO omop_mapping.concept_embeddings_stage
 FROM @omop_embed_stage
 MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
 ON_ERROR = ABORT_STATEMENT;
 ```
 
-Load a single model-version + vocabulary partition only:
+Load a single model-version + vocabulary partition only by pointing `COPY` at a
+sub-path, e.g. `@omop_embed_stage/model_version=<sha256>/vocabulary_id=SNOMED/`.
 
-```sql
-COPY INTO concept_embeddings
-FROM @omop_embed_stage/model_version=<sha256>/vocabulary_id=SNOMED/
-MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-ON_ERROR = ABORT_STATEMENT;
+## 5) Upsert into concept-mapper's contract tables (`MERGE`)
+
+The contract tables store `embedding` as `VECTOR(FLOAT, 768)` and key retrieval on
+**`embed_model_version`** — the config-derived, engine-independent stamp that
+concept-mapper's Stage 3 filters on (ALIGNMENT.md §4.2). It is **not** the
+weights-hash `model_version` in the staging table. Get the exact value from the
+GPU repo (it equals concept-mapper's `embed_model_version_from_settings()` for the
+same pinned model):
+
+```bash
+uv run gpu-embed retrieval-version      # e.g. sapbert-cls-fp32-1a2b3c4d5e
 ```
 
-## 5) Idempotent load with staging + `MERGE` (recommended)
-
-If you rerun loads often, use a staging table and upsert on
-`(namespace, concept_id, model_version)`.
-
 ```sql
-CREATE TABLE IF NOT EXISTS concept_embeddings_stage LIKE concept_embeddings;
+-- Paste the value printed by `gpu-embed retrieval-version`:
+SET embed_model_version = 'sapbert-cls-fp32-1a2b3c4d5e';
 
-COPY INTO concept_embeddings_stage
-FROM @omop_embed_stage
-MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-ON_ERROR = ABORT_STATEMENT;
-
-MERGE INTO concept_embeddings t
-USING concept_embeddings_stage s
-  ON t.namespace = s.namespace
- AND t.concept_id = s.concept_id
- AND t.model_version = s.model_version
+-- 5a) Athena TARGET concepts -> concept_embeddings (source_id IS NULL).
+--     ARRAY -> VECTOR cast; idempotent on (concept_id, embed_model_version).
+MERGE INTO omop_mapping.concept_embeddings t
+USING (
+  SELECT concept_id, vocabulary_id, domain_id, concept_name, standard_concept,
+         embedding::VECTOR(FLOAT, 768) AS embedding, embedded_at
+  FROM omop_mapping.concept_embeddings_stage
+  WHERE source_id IS NULL
+) s
+  ON  t.concept_id = s.concept_id
+  AND t.embed_model_version = $embed_model_version
 WHEN MATCHED THEN UPDATE SET
-  concept_name = s.concept_name,
-  domain_id = s.domain_id,
-  vocabulary_id = s.vocabulary_id,
-  concept_class_id = s.concept_class_id,
-  standard_concept = s.standard_concept,
-  concept_code = s.concept_code,
-  invalid_reason = s.invalid_reason,
-  embedding = s.embedding,
-  embed_text = s.embed_text,
-  embedded_at = s.embedded_at,
-  source_id = s.source_id,
-  mapping_wave = s.mapping_wave
+  vocabulary_id = s.vocabulary_id, domain_id = s.domain_id,
+  concept_name = s.concept_name, standard_concept = s.standard_concept,
+  embedding = s.embedding, embedded_at = s.embedded_at
 WHEN NOT MATCHED THEN INSERT (
-  namespace,
-  concept_id,
-  concept_name,
-  domain_id,
-  vocabulary_id,
-  concept_class_id,
-  standard_concept,
-  concept_code,
-  invalid_reason,
-  embedding,
-  embed_text,
-  model_version,
-  embedded_at,
-  source_id,
-  mapping_wave
+  concept_id, vocabulary_id, domain_id, concept_name, standard_concept,
+  embedding, embedded_at, embed_model_version
 ) VALUES (
-  s.namespace,
-  s.concept_id,
-  s.concept_name,
-  s.domain_id,
-  s.vocabulary_id,
-  s.concept_class_id,
-  s.standard_concept,
-  s.concept_code,
-  s.invalid_reason,
-  s.embedding,
-  s.embed_text,
-  s.model_version,
-  s.embedded_at,
-  s.source_id,
-  s.mapping_wave
+  s.concept_id, s.vocabulary_id, s.domain_id, s.concept_name, s.standard_concept,
+  s.embedding, s.embedded_at, $embed_model_version
 );
 
-TRUNCATE TABLE concept_embeddings_stage;
+-- 5b) SOURCE concepts -> source_concepts.query_embedding (source_id IS NOT NULL).
+--     Rejoin on the natural (mapping_wave, source_id) key. Rows must already
+--     exist from Stage 0; this only fills the query vector. Same FP32+CLS space.
+MERGE INTO omop_mapping.source_concepts t
+USING (
+  SELECT source_id, mapping_wave,
+         embedding::VECTOR(FLOAT, 768) AS query_embedding, embedded_at
+  FROM omop_mapping.concept_embeddings_stage
+  WHERE source_id IS NOT NULL
+) s
+  ON  t.mapping_wave = s.mapping_wave
+  AND t.source_id = s.source_id
+WHEN MATCHED THEN UPDATE SET
+  query_embedding = s.query_embedding,
+  embed_model_version = $embed_model_version,
+  embedded_at = s.embedded_at;
+
+TRUNCATE TABLE omop_mapping.concept_embeddings_stage;
 ```
+
+> **Why the version is overridden, not copied.** The staging `model_version` is
+> the weights-file SHA-256 (store provenance). Stage 3 compares query vs document
+> vectors only when their `embed_model_version` matches, so both 5a and 5b stamp
+> the single §4.2 value. Keep `gpu-embed retrieval-version` ≡ concept-mapper's
+> `embed_model_version_from_settings()`; if they drift, semantic retrieval
+> silently returns nothing.
+
+### Optional: standalone portability table
+
+For platform-portability dumps (not concept-mapper retrieval), you can still load
+the parquet verbatim into a standalone table that mirrors the store
+(`embedding ARRAY`, `model_version`), keyed on `(namespace, concept_id,
+model_version)`. That table is independent of the contract tables Stage 3 reads.
 
 ## Troubleshooting
 

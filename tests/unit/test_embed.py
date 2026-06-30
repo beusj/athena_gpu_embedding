@@ -15,8 +15,15 @@ from gpu_embedder.embed import (
     compute_model_version,
     embed_all,
     embed_batch,
+    retrieval_model_version,
 )
 from gpu_embedder.models import ConceptRow
+
+# Cross-repo retrieval-version anchor (ALIGNMENT.md §4.2). concept-mapper's
+# tests/unit/test_embedder_contract.py asserts this SAME literal for the same
+# pinned config; if they ever differ, the two repos have drifted and semantic
+# retrieval would silently miss.
+GOLDEN_RETRIEVAL_VERSION = "sapbert-cls-fp32-d34a93eed7"
 
 # ---------------------------------------------------------------------------
 # Helpers / fakes
@@ -362,3 +369,45 @@ class TestEmbedAll:
         bad_model = MagicMock(side_effect=RuntimeError("GPU OOM"))
         with pytest.raises(RuntimeError, match="GPU OOM"):
             self._run(rows, model=bad_model)
+
+
+# ---------------------------------------------------------------------------
+# retrieval_model_version — shared cross-repo stamp (ALIGNMENT.md §4.2)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MODEL = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+
+
+class TestRetrievalModelVersion:
+    def test_matches_cross_repo_golden(self) -> None:
+        assert retrieval_model_version(_DEFAULT_MODEL) == GOLDEN_RETRIEVAL_VERSION
+
+    def test_distinct_from_weights_hash_version(self) -> None:
+        # The retrieval stamp is config-derived, NOT the weights-file SHA-256 that
+        # keys the local store (compute_model_version). They must not be confused.
+        assert retrieval_model_version(_DEFAULT_MODEL) != compute_model_version(_DEFAULT_MODEL)
+
+    def test_pooling_and_precision_change_version(self) -> None:
+        base = retrieval_model_version(_DEFAULT_MODEL)
+        mean = retrieval_model_version(_DEFAULT_MODEL, pooling="mean")
+        int8 = retrieval_model_version(_DEFAULT_MODEL, precision="int8")
+        assert len({base, mean, int8}) == 3
+        assert base.startswith("sapbert-cls-fp32-")
+        assert mean.startswith("sapbert-mean-fp32-")
+        assert int8.startswith("sapbert-cls-int8-")
+
+    def test_revision_changes_version(self) -> None:
+        assert retrieval_model_version(_DEFAULT_MODEL) != retrieval_model_version(
+            _DEFAULT_MODEL, "abc123"
+        )
+
+
+def test_embedding_dim_constants_agree() -> None:
+    # The dimension lives once in gpu_embedder.models (ALIGNMENT.md §7); embed and
+    # store re-use it. This guards against the constant drifting from the
+    # FLOAT[768] literal in SCHEMA_DDL.
+    from gpu_embedder.embed import _RETRIEVAL_DIMENSION
+    from gpu_embedder.models import EMBEDDING_DIM
+    from gpu_embedder.store import EMBEDDING_DIM as STORE_DIM
+
+    assert _RETRIEVAL_DIMENSION == EMBEDDING_DIM == STORE_DIM == 768

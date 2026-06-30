@@ -19,6 +19,10 @@ from datetime import datetime
 # primary key.
 DEFAULT_NAMESPACE = "athena"
 
+# Canonical SapBERT output dimension — the single source of truth for the repo
+# (ALIGNMENT.md §7). The ``FLOAT[768]`` literal in SCHEMA_DDL below must match it.
+EMBEDDING_DIM = 768
+
 # ---------------------------------------------------------------------------
 # Athena concept row
 # ---------------------------------------------------------------------------

@@ -1517,6 +1517,28 @@ def _short_hash_component(value: str, hash_length: int) -> str:
     return _safe_prefix_component(text, fallback="default")
 
 
+# ---------------------------------------------------------------------------
+# retrieval-version subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("retrieval-version")
+def retrieval_version_cmd() -> None:
+    """Print the cross-repo retrieval ``embed_model_version`` (ALIGNMENT.md §4.2).
+
+    This is the value to stamp as ``embed_model_version`` when loading embeddings
+    into concept-mapper's Snowflake tables (see
+    ``docs/runbooks/s3_to_snowflake_load.md``). It is FP32 + the configured pooling
+    and excludes the runtime engine, so it matches the string concept-mapper
+    computes for the same pinned model. Distinct from the weights-hash
+    ``model_version`` that keys the local Lance/DuckDB store.
+    """
+    from gpu_embedder.embed import retrieval_model_version
+
+    cfg = EmbedConfig()
+    typer.echo(retrieval_model_version(cfg.model, cfg.model_revision, pooling=cfg.pooling))
+
+
 @app.command("sync-s3")
 def sync_s3_cmd(
     s3_root: Annotated[
