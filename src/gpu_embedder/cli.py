@@ -1812,7 +1812,18 @@ def sync_s3_cmd(
     sync_cmd = ["aws"]
     if profile:
         sync_cmd.extend(["--profile", profile])
-    sync_cmd.extend(["s3", "sync", local_sync_dir.as_posix(), s3_dest])
+    sync_cmd.extend(
+        [
+            "s3",
+            "sync",
+            local_sync_dir.as_posix(),
+            s3_dest,
+            "--exclude",
+            "*.tmp",
+            "--exclude",
+            "*.parquet.tmp",
+        ]
+    )
 
     typer.echo("Syncing existing parquet export to S3 …")
     subprocess.run(sync_cmd, check=True, env=env)
