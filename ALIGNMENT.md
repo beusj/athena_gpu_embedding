@@ -422,10 +422,14 @@ contract inconsistencies — operational state and open work.
   review — the intended explicit sink (no silent misrouting). Status: (a) **✅
   observability shipped** — `concept-mapper diagnostics unknown-sink` rolls up
   unknown-domain sources by `source_vocabulary_id` so the sink is a triage
-  backlog; (b) 🟡 make the vocab→domain map data-driven (seed/config) so
-  onboarding a vocab is config, not a SQL code change, and add a consistency check
-  that every domain stage-0 emits has a `scoring.yaml` entry (else it silently
-  becomes a sink); (c) **✅ done** — unknown sources now get a broad,
+  backlog; (b) **✅ done** — the vocab→domain map is data-driven
+  (`config/scoring.yaml` `source_vocab_domains`, rendered into the stage-0 CASE via
+  the `{{ source_vocab_domain_case }}` token), so onboarding a vocab is a one-line
+  config edit, not a SQL change; a `PipelineConfig` validator fails fast if any
+  routed domain lacks a `vocab_routing` entry (the silent-sink guard). The
+  remaining future option is a deterministic **feed-of-origin → domain** signal
+  (§10 option 1) once source-feed provenance is carried into `source_concepts`;
+  (c) **✅ done** — unknown sources now get a broad,
   always-reviewed fallback retrieval that infers the domain (see §10), instead of
   being dropped.
 
