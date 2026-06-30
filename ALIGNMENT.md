@@ -391,12 +391,20 @@ contract inconsistencies — operational state and open work.
 - **✅ Semantic retrieval is ON by default** (`SEMANTIC_RETRIEVAL_ENABLED=true`)
   now that the GPU FP32+CLS vectors are loaded. A host without the embeddings
   extra still auto-falls-back via the Stage 3 preflight.
-- **⚠️ Vector index for semantic at scale.** With dense retrieval on, Stage 3
-  runs one `VECTOR_COSINE_SIMILARITY` per source against `concept_embeddings`.
-  Without an ANN index (HNSW — see the `concept_embeddings.sql` DDL note) this is
-  a full-table cosine scan per source; verify the index is in place before a
-  large wave or it becomes the new bottleneck. (Scoring math itself is not a
-  bottleneck — see below.)
+- **✅ Vector search efficiency on Snowflake — clustered, not indexed.** Snowflake
+  has no user-managed HNSW index on `VECTOR` columns; `VECTOR_COSINE_SIMILARITY`
+  is brute-force over the rows surviving the WHERE. Stage 3 always filters by
+  `embed_model_version` + `vocabulary_id` first, so `concept_embeddings` is now
+  `CLUSTER BY (embed_model_version, vocabulary_id)` — micro-partition pruning
+  limits the cosine to the relevant vocab+version subset. **Existing tables need a
+  one-time `ALTER TABLE {mapping_schema}.concept_embeddings CLUSTER BY
+  (embed_model_version, vocabulary_id);`** (the DDL only clusters new tables).
+  Revisit a native vector index when Snowflake GAs one.
+- **✅ Per-term retrieval batched.** `retrieval_lexical.sql` / `retrieval_synonym.sql`
+  now score ALL search terms in ONE round trip (cross-join the term array, top_k
+  per term via `QUALIFY`), replacing the N-queries-per-source loop. Same candidate
+  set, far fewer warehouse round trips. (Scoring math itself was never the
+  bottleneck — it is trivial pure-Python over ~15–60 candidates.)
 - **🟡 Evaluate the Stage 2 normalize operation.** Normalize (`--with-stage2-
   normalize`) expands cryptic source names into search terms/synonyms and feeds
   the query embedding; it materially affects recall on terse Epic names but is
@@ -411,10 +419,44 @@ contract inconsistencies — operational state and open work.
   source whose vocabulary is not in the stage-0 CASE routes to
   `source_domain='unknown'`; `vocab_routing` (config/scoring.yaml) has no
   `unknown` entry, so it retrieves nothing and lands Tier D (unmappable) for
-  review — the intended explicit sink (no silent misrouting). Open work: (a) a
-  by-`source_vocabulary_id` count of unknown-domain sources so the sink is a
-  triage backlog, not a blind spot; (b) make the vocab→domain map data-driven
-  (seed/config) so onboarding a vocab is config, not a SQL code change, and add a
-  consistency check that every domain stage-0 emits has a `scoring.yaml` entry
-  (else it silently becomes a sink); (c) decide whether unknown sources get a
-  broad, always-reviewed fallback retrieval vs nothing.
+  review — the intended explicit sink (no silent misrouting). Status: (a) **✅
+  observability shipped** — `concept-mapper diagnostics unknown-sink` rolls up
+  unknown-domain sources by `source_vocabulary_id` so the sink is a triage
+  backlog; (b) 🟡 make the vocab→domain map data-driven (seed/config) so
+  onboarding a vocab is config, not a SQL code change, and add a consistency check
+  that every domain stage-0 emits has a `scoring.yaml` entry (else it silently
+  becomes a sink); (c) 🟡 decide whether unknown sources get a broad,
+  always-reviewed fallback retrieval vs nothing — and/or **infer the domain** for
+  unknown sources (see §10).
+
+---
+
+## 10. Inferring a domain for `unknown` sources (so they aren't dropped)
+
+Today `unknown` → no candidate vocab → no candidates → Tier D. To salvage these
+without reintroducing the silent misrouting the sink was built to prevent, infer
+a *retrieval* domain (always human-reviewed), cheapest signal first:
+
+1. **Deterministic.** Extend the vocab→domain map (§9 item b) and, if the source
+   feed/table of origin is carried into `source_concepts`, map feed→domain. No
+   model; strongest when provenance exists (a lab feed is a lab regardless of an
+   unrecognized vocab id).
+2. **Semantic bootstrap (reuses the FP32+CLS vectors).** Run an *unrestricted*
+   top-K cosine over `concept_embeddings` (no vocab filter), take the plurality
+   OMOP `domain_id` of the hits as the inferred domain, then run the normal
+   constrained retrieval there (or just keep the broad hits as candidates). One
+   extra cosine query, no LLM — a natural payoff of the dense-retrieval work.
+3. **LLM classification.** Fold a "which OMOP domain?" call into Stage 2 (the LLM
+   already runs there). Most accurate per item; cost scales with the unknown set
+   (small). Classifying a domain — not inventing a concept_id — stays within the
+   "LLM proposes, expert decides" safety rule.
+
+Guards: flag inferred-domain proposals (e.g. `DOMAIN_INFERRED`), cap them at Tier
+C (never auto-accept), and keep the explicit sink for the truly unmappable.
+
+**Key reason this is low-risk:** the inferred domain only needs to get retrieval
+into the right *neighborhood*. dbt's `event_domain_filter` re-derives the FINAL
+CDM domain from the chosen **standard concept's** domain (target → source →
+default), so a roughly-right inference that surfaces the correct concept still
+lands the row in the correct CDM table. Inference drives recall, not final
+placement.
