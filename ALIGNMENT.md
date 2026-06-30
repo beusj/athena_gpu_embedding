@@ -425,13 +425,20 @@ contract inconsistencies — operational state and open work.
   backlog; (b) 🟡 make the vocab→domain map data-driven (seed/config) so
   onboarding a vocab is config, not a SQL code change, and add a consistency check
   that every domain stage-0 emits has a `scoring.yaml` entry (else it silently
-  becomes a sink); (c) 🟡 decide whether unknown sources get a broad,
-  always-reviewed fallback retrieval vs nothing — and/or **infer the domain** for
-  unknown sources (see §10).
+  becomes a sink); (c) **✅ done** — unknown sources now get a broad,
+  always-reviewed fallback retrieval that infers the domain (see §10), instead of
+  being dropped.
 
 ---
 
 ## 10. Inferring a domain for `unknown` sources (so they aren't dropped)
+
+> **✅ Implemented: option 2 (semantic bootstrap).** Stage 3 no longer drops
+> unknown-vocab sources — when `infer_unknown_source_domain` is on (default) and
+> semantic is available, it runs `retrieval_semantic_unrestricted.sql` (broad
+> cosine, no vocab/class filter) to produce candidates. Stage 5 flags the pick
+> `DOMAIN_INFERRED` and caps it at Tier C (never auto-promoted). Options 1 and 3
+> below remain available enhancements.
 
 Today `unknown` → no candidate vocab → no candidates → Tier D. To salvage these
 without reintroducing the silent misrouting the sink was built to prevent, infer
