@@ -380,3 +380,41 @@ is config-driven, but a few **literals** can't read a constant — change them t
 - The drift-guard tests (`test_embedder_contract.py`, `test_embed.py`) assert the
   Python constants agree; they do **not** catch a stale SQL literal — grep
   `768` after any change.
+
+---
+
+## 9. Upstream readiness & operational notes
+
+Beyond the §4 vector-space contract, these affect mapping quality/cost. Not
+contract inconsistencies — operational state and open work.
+
+- **✅ Semantic retrieval is ON by default** (`SEMANTIC_RETRIEVAL_ENABLED=true`)
+  now that the GPU FP32+CLS vectors are loaded. A host without the embeddings
+  extra still auto-falls-back via the Stage 3 preflight.
+- **⚠️ Vector index for semantic at scale.** With dense retrieval on, Stage 3
+  runs one `VECTOR_COSINE_SIMILARITY` per source against `concept_embeddings`.
+  Without an ANN index (HNSW — see the `concept_embeddings.sql` DDL note) this is
+  a full-table cosine scan per source; verify the index is in place before a
+  large wave or it becomes the new bottleneck. (Scoring math itself is not a
+  bottleneck — see below.)
+- **🟡 Evaluate the Stage 2 normalize operation.** Normalize (`--with-stage2-
+  normalize`) expands cryptic source names into search terms/synonyms and feeds
+  the query embedding; it materially affects recall on terse Epic names but is
+  opt-in. Evaluate cost/quality before making it default.
+- **🟡 Athena release parity across the 4 repos (note for the future).** `gpu-
+  embedder` embeds `CONCEPT.csv`, the mapper queries `OMOP_VOCAB`, dbt consumes
+  it, `vocabulary_loader` loads it. `retrieval_semantic.sql` filters
+  `standard_concept='S'` on both `concept_embeddings` and live `concept`; a
+  concept embedded as standard but demoted in a newer load silently drops. Keep
+  all consumers on one Athena release. (Currently aligned.)
+- **🟡 `unknown` vocab-routing sink — observability + data-driven routing.** A
+  source whose vocabulary is not in the stage-0 CASE routes to
+  `source_domain='unknown'`; `vocab_routing` (config/scoring.yaml) has no
+  `unknown` entry, so it retrieves nothing and lands Tier D (unmappable) for
+  review — the intended explicit sink (no silent misrouting). Open work: (a) a
+  by-`source_vocabulary_id` count of unknown-domain sources so the sink is a
+  triage backlog, not a blind spot; (b) make the vocab→domain map data-driven
+  (seed/config) so onboarding a vocab is config, not a SQL code change, and add a
+  consistency check that every domain stage-0 emits has a `scoring.yaml` entry
+  (else it silently becomes a sink); (c) decide whether unknown sources get a
+  broad, always-reviewed fallback retrieval vs nothing.
