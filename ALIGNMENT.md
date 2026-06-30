@@ -443,11 +443,16 @@ contract inconsistencies — operational state and open work.
 >   `DOMAIN_INFERRED` and caps Tier C. Toggle: `infer_unknown_source_domain`.
 > - **Option 1 (feed of origin), mapper side:** `source_concepts.source_feed`
 >   provenance is captured at Stage 0 (CDM = originating table, e.g.
->   `measurement`; STCM = `'stcm'` sentinel). `config/scoring.yaml`
+>   `measurement`; STCM = `'stcm'` sentinel today). `config/scoring.yaml`
 >   `source_feed_domains` maps feed → domain; `_vocab_ids_for` prefers the
 >   feed-routed vocab (deterministic) over the semantic bootstrap for unknown
->   sources. **Fires for CDM-derived feeds; no-ops for the `'stcm'` sentinel until
->   dbt exposes the real STCM feed (the remaining cross-repo piece).**
+>   sources.
+>   **Update (better source found):** dbt already exports the source-feed domain
+>   as `source_to_concept_map.source_domain_id` (an OMOP domain), populated for
+>   unmapped rows too. The planned revision is to consume that column directly —
+>   superseding the `'stcm'` sentinel — keyed by an OMOP-domain→routing map. This
+>   needs **no dbt schema change** and **reuses existing embeddings** (source_id /
+>   source_name / grain unchanged). See §11 for the plan + live verification.
 > - Also fixed: `SourceConcept.source_domain` now accepts `'unknown'` — previously
 >   an unrecognized vocab would have failed Stage 0 validation, so the whole
 >   unknown-handling path could not actually ingest. (option 3 — LLM domain
@@ -461,15 +466,15 @@ Today `unknown` → no candidate vocab → no candidates → Tier D. To salvage 
 without reintroducing the silent misrouting the sink was built to prevent, infer
 a *retrieval* domain (always human-reviewed), cheapest signal first:
 
-1. **Deterministic (✅ mapper side; dbt next).** `source_feed` provenance is
-   captured at Stage 0 and mapped feed→domain via `source_feed_domains`. No model;
-   strongest when provenance exists (a lab feed is a lab regardless of an
-   unrecognized vocab id). **Remaining cross-repo piece:** dbt should expose the
-   real originating feed for STCM sources — `all_source_codes` already knows it
-   (the unioned feed-named models / the excluded `_DBT_SOURCE_RELATION`) but drops
-   it before `source_to_concept_map`. Expose it via a companion object (not the
-   standard STCM, to keep OMOP conformance) and have Stage 0 STCM read it instead
-   of the `'stcm'` sentinel.
+1. **Deterministic (✅ mapper side; dbt already exports the signal).** The
+   source-feed domain is already in `source_to_concept_map.source_domain_id`
+   (`unmapped_codes` sets `ac.domain_id`; `all_source_codes` members set it as a
+   literal OMOP domain per feed). So **no dbt companion object is needed** — Stage 0
+   STCM just reads that column. Planned revision: consume `source_domain_id`
+   (supersedes the `'stcm'` sentinel) via an **OMOP-domain → routing-domain map**
+   (§11). Reuses existing embeddings: `source_id` (= `STCM_<UPPER(vocab)>_<md5(...)>`),
+   `source_name`, and the source grain are unchanged — reading a column already on
+   rows already ingested.
 2. **Semantic bootstrap (reuses the FP32+CLS vectors).** Run an *unrestricted*
    top-K cosine over `concept_embeddings` (no vocab filter), take the plurality
    OMOP `domain_id` of the hits as the inferred domain, then run the normal
@@ -489,3 +494,89 @@ CDM domain from the chosen **standard concept's** domain (target → source →
 default), so a roughly-right inference that surfaces the correct concept still
 lands the row in the correct CDM table. Inference drives recall, not final
 placement.
+
+---
+
+## 11. Consume `source_domain_id` — plan, routing decisions, live verification
+
+Status: **planned, pending live verification.** This supersedes the `'stcm'`
+sentinel + CDM-table `source_feed_domains` that are currently in code.
+
+### 11.1 Plan (mapper-only; no dbt schema change)
+- Stage 0 STCM SQL selects `stcm.source_domain_id` (already exported by dbt) as the
+  source-feed domain; populate `source_feed` from it instead of the `'stcm'`
+  literal. `source_id` / `source_name` / grain unchanged → **existing embeddings
+  reused, no re-embed.**
+- Replace the CDM-table `source_feed_domains` with an **OMOP-domain → routing-domain**
+  map (the values `source_domain_id` actually takes). NULL/blank `source_domain_id`
+  → no signal → fall through to the semantic bootstrap (§10 opt 2).
+
+### 11.2 Proposed OMOP-domain → routing map (⚠ verify vocabs in 11.4 before locking)
+| `source_domain_id` (OMOP) | routing domain | preferred vocab (fallback) |
+|---|---|---|
+| Drug | medication | RxNorm |
+| Measurement, Meas Value | lab_component | LOINC |
+| Condition | problem | SNOMED |
+| Procedure | procedure | CPT4 |
+| Observation | flowsheet_categorical | SNOMED |
+| Unit | unit | UCUM |
+| Provider | provider_specialty | ABMS (NUCC, Medicare Specialty) |
+| Race / Ethnicity | race / ethnicity | Race / Ethnicity |
+| **Visit** | **visit (NEW)** | **Visit** (CMS Place of Service) — *was wrongly → problem* |
+| **Device** | **device (NEW)** | **SNOMED** (HCPCS) — *was wrongly → procedure* |
+| Route | _(unmapped → semantic bootstrap)_ | — |
+
+`visit` and `device` are **new** `vocab_routing` entries. The old defaults
+(`visit_occurrence → problem`, `device_exposure → procedure` in the mapper CDM
+CASE, mirrored in my first draft) are **incorrect** and are being corrected here:
+visits belong in the OMOP **Visit** domain (the visit kind / `visit_concept_id`),
+devices in the OMOP **Device** domain (SNOMED device hierarchy; UDI/GUDID populates
+`unique_device_id`, not `device_concept_id`).
+
+### 11.3 Staleness window (re-run before relying on `source_domain_id`)
+`all_source_codes` source-domain/vocab logic was actively reworked on dev:
+- **2026-06-23** `e96ce4a` — ethnicity/race remap (+ `_legacy`/`_pipeline` route variants).
+- **2026-06-22** `b34535f`, `e05a2a5` — care-site + provider specialty mapping.
+- ≤ 2026-06-10 — clinical domains stable (drug/measurement/condition/procedure/LOINC/UCUM/NDC/ICD).
+
+An STCM snapshot from ~2026-06-23 or earlier may carry **stale race / ethnicity /
+provider-specialty / care-site-specialty** domains+vocab. Re-run
+`dbt build --select +all_source_codes +source_to_concept_map` (with the intended
+`race_mapping_route` / `ethnicity_mapping_route` vars) before trusting those four.
+Clinical domains are unaffected.
+
+### 11.4 Live verification checklist (run on `dev`; aggregate-only, PHI-safe)
+1. **Refresh the STCM** (post-staleness): `dbt build --select +all_source_codes
+   +source_to_concept_map` with the chosen route vars.
+2. **NULL-domain coverage** among unmapped codes (decide if acceptable):
+   ```
+   DBT_WAREHOUSE=CHIC_WH_STD dbt show --inline "select source_vocabulary_id,
+     count(*) unmapped, count_if(source_domain_id is null or trim(source_domain_id)='') null_domain
+     from {{ ref('source_to_concept_map') }} where target_concept_id=0
+     group by 1 order by null_domain desc" --limit 100
+   ```
+3. **Observed source domains** (confirm the §11.2 map covers them all):
+   ```
+   ... "select source_domain_id, count(*) from {{ ref('source_to_concept_map') }}
+        where target_concept_id=0 group by 1 order by 2 desc" --limit 100
+   ```
+4. **Confirm Visit/Device target vocabularies carry standard concepts** (before locking 11.2):
+   ```
+   ... "select domain_id, vocabulary_id, count(*) from {{ ref('concept') }}
+        where domain_id in ('Visit','Device') and standard_concept='S' and invalid_reason is null
+        group by 1,2 order by 1, 3 desc" --limit 100
+   ```
+5. **Embedding reuse check** — confirm the fresh STCM's source codes still hash to
+   the embedded `source_id`s (overlap should be ~100% for unchanged codes); i.e.
+   re-running Stage 0 STCM ingest yields existing `source_concepts.source_id`s with
+   `embed_model_version` already set. No rows should need re-embedding except
+   genuinely new codes.
+6. **Spot-check routing** after wiring 11.2: pick a few unknown-vocab sources with a
+   known `source_domain_id` (e.g. a Visit code) and confirm `_vocab_ids_for` now
+   returns the Visit vocab (not `problem`) and the proposal is `DOMAIN_INFERRED` /
+   Tier C.
+
+### 11.5 Open decisions (need a human call)
+- Confirm Visit target vocab (`Visit` vs `CMS Place of Service` vs both) from 11.4 #4.
+- Confirm Device target (`SNOMED` primary, `HCPCS` fallback) from 11.4 #4.
+- `Route` / `Meas Value` OMOP domains: route or leave to the semantic bootstrap?
