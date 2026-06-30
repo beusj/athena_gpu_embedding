@@ -252,25 +252,31 @@ Ranked; each lists evidence and the convergence action.
    VECTOR cast); update the runbook with a real loader and the source MERGE
    (only referenced today).
 
-4. **🟠 Duplicated GPU offload paths.** `concept-mapper`'s homegrown
-   `embeddings/gpu_export.py` vs the dedicated `athena_gpu_embedding` repo. **→**
-   pick one canonical path; if `gpu_export.py` stays, it must emit the §4.2 stamp
-   (its source columns already match — gap #B is only the version stamp).
+4. **✅ Duplicated GPU offload paths — hardened.** Decision: **keep**
+   `embeddings/gpu_export.py` as the lightweight option. `import_source_embeddings`
+   now **enforces the §4.2 contract version by default** (raises on mismatch;
+   `--allow-version-mismatch` / `allow_version_mismatch=True` to override), and the
+   inline-script docstring uses the shared stamp + CLS. Fully deleting the path in
+   favour of `gpu-embed` remains optional, not required.
 
-5. **🟡 Target-embedding ownership undefined.** Mapper builds targets locally
-   (`embeddings/build.py`); `gpu-embedder` also produces them. **→** designate
-   `gpu-embedder` the owner of Athena target embeddings at scale; the mapper's
-   `build.py`/UDF remain the fallback and MUST produce identical §4 vectors.
+5. **✅ Target-embedding ownership — decided.** `gpu-embedder` is **canonical for
+   both source and target** embeddings (both were embedded on GPU at FP32+CLS with
+   one pinned revision). The mapper's `build.py`/UDF are **slow fallbacks** and now
+   emit a warning (`embedding_fallback_path`) reminding the operator to match the
+   pinned model/revision/FP32/CLS or it writes a divergent version.
 
-6. **🟡 `source_vocabulary_id` case drift (mapper-internal).** Stage 0 STCM
-   **uppercases** `source_vocabulary_id` but stores raw case in `ehr_codes.system`
-   (`sql/stage0_select_source_inventory_stcm.sql`); promote derives the dbt key
-   from `ehr_codes[0]:system` (raw), which matches
-   `all_source_codes.default_vocabulary_id` — so **C works today** but is a latent
-   footgun. **→** normalize to one casing rule end-to-end.
+6. **✅ `source_vocabulary_id` case — fixed.** `retrieval_code.sql` now compares the
+   **vocabulary case-insensitively** (`UPPER(vocabulary_id)`; caller uppercases only
+   the vocab portion). The **code stays exact** — UCUM is case-sensitive
+   (`mg` ≠ `MG`). The dbt overlay join is unaffected (raw=raw still holds), and
+   re-embedding is not involved (§5 item 9).
 
-7. **🟡 `768` / model name duplicated** with no shared source of truth across
-   repos. **→** centralize per repo and cross-check via §6 + the contract test.
+7. **✅ `768` / model name duplication — done.** Dimension centralized in
+   `gpu_embedder.models.EMBEDDING_DIM` (re-used by `embed`/`store`); the mapper's
+   `config` references `embedder.SAPBERT_DIMENSION` / `DEFAULT_MODEL_NAME`.
+   Drift-guard tests in both repos + the model-swap checklist in §8. The
+   `VECTOR(FLOAT,768)` / `FLOAT[768]` SQL literals are irreducible (SQL can't read a
+   Python constant) and are listed in §8.
 
 8. **🟡 OPEN QUESTION — source-domain naming alignment.** concept-mapper's
    `source_domain` taxonomy (`lab_component`, `medication`, `problem`,
@@ -313,16 +319,17 @@ Ranked; each lists evidence and the convergence action.
       defaulting to mean.
 - [x] `model_version_for` uses the §4.2 formula (engine-excluded; `precision` from
       quantization; `pooling` added). Bumps the version → re-embed required.
-- [~] GPU offload path reconciled to the §4.2 stamp in `gpu_export.py` (defers to
-      the dedicated repo; inline script uses the shared stamp + CLS). Deleting the
-      duplicate path entirely is still open (#4).
-- [ ] Normalize `source_vocabulary_id` casing (#6).
+- [x] GPU offload path kept + hardened: `import_source_embeddings` enforces the
+      §4.2 version by default (`--allow-version-mismatch` override) (#4).
+- [x] `build.py`/UDF emit a slow-fallback warning; GPU is canonical (#5).
+- [x] `retrieval_code.sql` vocab compare is case-insensitive, code stays exact (#6).
+- [x] `config` references `embedder` constants for model name + dimension (#7).
 
 **`dbt_omop_clean`**
-- [ ] No embedding-space changes (dbt consumes only `concept_mappings`).
-- [ ] Confirm `int_llm_current_mappings_stcm` join casing stays consistent with
-      whatever casing rule the mapper settles on (#6).
-- [ ] Keep the natural-key overlay + fresh re-validation as-is (§3.3).
+- [x] No embedding-space changes (dbt consumes only `concept_mappings`).
+- [x] `int_llm_current_mappings_stcm` join unaffected: #6 was fixed on the
+      retrieval side, so the natural-key (raw=raw) overlay join is unchanged.
+- [x] Keep the natural-key overlay + fresh re-validation as-is (§3.3).
 
 ---
 
@@ -357,3 +364,19 @@ before retrieval is trustworthy.
    the mapper's import-required columns, and (b) both repos compute the same
    §4.2 string for the same pinned config. A failing check means the repos have
    drifted.
+
+### Model-swap checklist (sites to change)
+
+Swapping the model or dimension touches both repos. The `model_version` identity
+is config-driven, but a few **literals** can't read a constant — change them too:
+
+- **`athena_gpu_embedding`**: `gpu_embedder.models.EMBEDDING_DIM` (the canonical
+  constant; `embed`/`store` re-use it) **and** the `FLOAT[768]` literal in
+  `models.SCHEMA_DDL`. Default model: `GPU_EMBED_MODEL` / `config.model`.
+- **`llm_concept_mapping`**: `embedder.SAPBERT_DIMENSION` + `DEFAULT_MODEL_NAME`
+  (config references these) **and** the `VECTOR(FLOAT, 768)` literals in
+  `sql/ddl/concept_embeddings.sql`, `sql/ddl/source_concepts.sql`,
+  `sql/retrieval_semantic.sql`, `embeddings/build.py`, `embeddings/gpu_export.py`.
+- The drift-guard tests (`test_embedder_contract.py`, `test_embed.py`) assert the
+  Python constants agree; they do **not** catch a stale SQL literal — grep
+  `768` after any change.

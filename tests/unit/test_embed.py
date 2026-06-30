@@ -400,3 +400,14 @@ class TestRetrievalModelVersion:
         assert retrieval_model_version(_DEFAULT_MODEL) != retrieval_model_version(
             _DEFAULT_MODEL, "abc123"
         )
+
+
+def test_embedding_dim_constants_agree() -> None:
+    # The dimension lives once in gpu_embedder.models (ALIGNMENT.md §7); embed and
+    # store re-use it. This guards against the constant drifting from the
+    # FLOAT[768] literal in SCHEMA_DDL.
+    from gpu_embedder.embed import _RETRIEVAL_DIMENSION
+    from gpu_embedder.models import EMBEDDING_DIM
+    from gpu_embedder.store import EMBEDDING_DIM as STORE_DIM
+
+    assert _RETRIEVAL_DIMENSION == EMBEDDING_DIM == STORE_DIM == 768

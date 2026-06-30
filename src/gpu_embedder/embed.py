@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from gpu_embedder.models import ConceptRow, EmbeddedRow
+from gpu_embedder.models import EMBEDDING_DIM, ConceptRow, EmbeddedRow
 
 if TYPE_CHECKING:
     from transformers import AutoModelForMaskedLM, AutoTokenizer  # noqa: F401
@@ -183,7 +183,7 @@ def compute_model_version(
 # Shared cross-repo retrieval stamp (ALIGNMENT.md §4.2)
 # ---------------------------------------------------------------------------
 
-_RETRIEVAL_DIMENSION = 768  # SapBERT (PubMedBERT backbone) output dim
+_RETRIEVAL_DIMENSION = EMBEDDING_DIM  # canonical dim (gpu_embedder.models, ALIGNMENT.md §7)
 
 
 def retrieval_model_version(

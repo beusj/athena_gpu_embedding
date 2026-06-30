@@ -36,6 +36,7 @@ import pyarrow as pa
 
 from gpu_embedder.models import (
     CSV_FINGERPRINTS_DDL,
+    EMBEDDING_DIM,
     MODEL_VERSION_CACHE_DDL,
     SCHEMA_DDL,
     ConceptRow,
@@ -46,7 +47,6 @@ logger = logging.getLogger(__name__)
 TARGET_ROWS_PER_SHARD = 250_000
 NULL_VOCAB_PARTITION = "_null"
 MODEL_REGISTRY_SUBDIR = Path("_meta") / "model_registry"
-EMBEDDING_DIM = 768
 
 # A ``.lance`` store path is a *container directory*: the Lance dataset lives in
 # the subdirectory below it, and registry metadata reuses the parquet
