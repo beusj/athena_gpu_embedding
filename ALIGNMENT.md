@@ -272,6 +272,26 @@ Ranked; each lists evidence and the convergence action.
 7. **🟡 `768` / model name duplicated** with no shared source of truth across
    repos. **→** centralize per repo and cross-check via §6 + the contract test.
 
+8. **🟡 OPEN QUESTION — source-domain naming alignment.** concept-mapper's
+   `source_domain` taxonomy (`lab_component`, `medication`, `problem`,
+   `procedure`, `unit`, `provider_specialty`, `race`, `ethnicity`, `unknown`;
+   `stage0_select_source_inventory_stcm.sql`) is an internal **vocab-routing**
+   label — distinct from OMOP `domain_id` and from dbt's feed `default_domain_id`.
+   It does **not** affect the embedding contract (the vector space is
+   domain-agnostic). Open: decide whether the mapper's `source_domain` labels and
+   dbt's staging/source *default domain* naming should be reconciled for
+   end-to-end consistency. Investigate before changing — dbt domain routing is
+   guarded by `event_domain_filter` + the `concept_in_domain` test, so renames
+   there are sensitive.
+
+9. **✅ RESOLVED — does item 6 (vocab-id casing) affect re-embedding?** No. The
+   embed text is the **bare name** (§4.5), not `ehr_codes`, so vocab-id casing is
+   never in the vector; and `source_id` already uppercases the vocab
+   (`STCM_<UPPER(vocab)>_<md5(lower(trim(code)))>`), so the `(mapping_wave,
+   source_id)` key and the GPU surrogate `concept_id` are casing-stable. Item 6 is
+   a retrieval/join-correctness fix only — no re-embed. (Holds only while
+   `ehr_codes` stays out of the embed text, per §4.5.)
+
 ---
 
 ## 6. Per-repo convergence checklists
