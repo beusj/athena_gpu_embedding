@@ -437,21 +437,39 @@ contract inconsistencies — operational state and open work.
 
 ## 10. Inferring a domain for `unknown` sources (so they aren't dropped)
 
-> **✅ Implemented: option 2 (semantic bootstrap).** Stage 3 no longer drops
-> unknown-vocab sources — when `infer_unknown_source_domain` is on (default) and
-> semantic is available, it runs `retrieval_semantic_unrestricted.sql` (broad
-> cosine, no vocab/class filter) to produce candidates. Stage 5 flags the pick
-> `DOMAIN_INFERRED` and caps it at Tier C (never auto-promoted). Options 1 and 3
-> below remain available enhancements.
+> **✅ Implemented: options 1 + 2.**
+> - **Option 2 (semantic bootstrap):** Stage 3 runs `retrieval_semantic_unrestricted.sql`
+>   (broad cosine, no vocab/class filter) for unknown-vocab sources; Stage 5 flags
+>   `DOMAIN_INFERRED` and caps Tier C. Toggle: `infer_unknown_source_domain`.
+> - **Option 1 (feed of origin), mapper side:** `source_concepts.source_feed`
+>   provenance is captured at Stage 0 (CDM = originating table, e.g.
+>   `measurement`; STCM = `'stcm'` sentinel). `config/scoring.yaml`
+>   `source_feed_domains` maps feed → domain; `_vocab_ids_for` prefers the
+>   feed-routed vocab (deterministic) over the semantic bootstrap for unknown
+>   sources. **Fires for CDM-derived feeds; no-ops for the `'stcm'` sentinel until
+>   dbt exposes the real STCM feed (the remaining cross-repo piece).**
+> - Also fixed: `SourceConcept.source_domain` now accepts `'unknown'` — previously
+>   an unrecognized vocab would have failed Stage 0 validation, so the whole
+>   unknown-handling path could not actually ingest. (option 3 — LLM domain
+>   classification — remains a future enhancement.)
+>
+> Known limitation: `import-source-embeddings --upsert-sources` re-inserts source
+> rows without `source_feed` (NULL) — the normal embedding round-trip leaves it
+> intact; only that reconstruct-from-file path drops it.
 
 Today `unknown` → no candidate vocab → no candidates → Tier D. To salvage these
 without reintroducing the silent misrouting the sink was built to prevent, infer
 a *retrieval* domain (always human-reviewed), cheapest signal first:
 
-1. **Deterministic.** Extend the vocab→domain map (§9 item b) and, if the source
-   feed/table of origin is carried into `source_concepts`, map feed→domain. No
-   model; strongest when provenance exists (a lab feed is a lab regardless of an
-   unrecognized vocab id).
+1. **Deterministic (✅ mapper side; dbt next).** `source_feed` provenance is
+   captured at Stage 0 and mapped feed→domain via `source_feed_domains`. No model;
+   strongest when provenance exists (a lab feed is a lab regardless of an
+   unrecognized vocab id). **Remaining cross-repo piece:** dbt should expose the
+   real originating feed for STCM sources — `all_source_codes` already knows it
+   (the unioned feed-named models / the excluded `_DBT_SOURCE_RELATION`) but drops
+   it before `source_to_concept_map`. Expose it via a companion object (not the
+   standard STCM, to keep OMOP conformance) and have Stage 0 STCM read it instead
+   of the `'stcm'` sentinel.
 2. **Semantic bootstrap (reuses the FP32+CLS vectors).** Run an *unrestricted*
    top-K cosine over `concept_embeddings` (no vocab filter), take the plurality
    OMOP `domain_id` of the hits as the inferred domain, then run the normal
