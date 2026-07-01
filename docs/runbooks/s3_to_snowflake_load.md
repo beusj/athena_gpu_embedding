@@ -219,7 +219,9 @@ WHEN NOT MATCHED THEN INSERT (
 
 -- 5b) SOURCE concepts -> source_concepts.query_embedding (source_id IS NOT NULL).
 --     Rejoin on the natural (mapping_wave, source_id) key. Rows must already
---     exist from Stage 0; this only fills the query vector. Same FP32+CLS space.
+--     exist from Stage 0 for the SAME wave name; this only fills the query vector.
+--     If MERGE matches 0 rows, run concept-mapper Stage 0 first (see
+--     "Source concept sequencing" section below).
 MERGE INTO omop_mapping.source_concepts t
 USING (
   SELECT source_id, mapping_wave,
@@ -257,3 +259,98 @@ model_version)`. That table is independent of the contract tables Stage 3 reads.
 - `AccessDenied` on S3: verify profile permissions and bucket policy
 - Snowflake stage read failures: validate `STORAGE INTEGRATION` trust and allowed locations
 - Load errors on columns: confirm parquet field names and use `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`
+- **Step 5b MERGE matches 0 rows:** the parquet source concepts carry a `mapping_wave` that must
+  already exist as rows in `source_concepts` (created by concept-mapper Stage 0). If Stage 0 has
+  not been run for that wave name, the MERGE has nothing to update. Fix: run Stage 0 first, then
+  re-run the MERGE. See "Source concept sequencing" below.
+- **Only a subset of vocabularies loaded into `concept_embeddings`:** almost certainly caused by
+  `AUTO_COMPRESS=TRUE` on the PUT command (see internal stage section below). GZIP-wrapping
+  parquet files causes COPY INTO `TYPE=PARQUET` to silently skip them.
+- **`VALIDATION_MODE = RETURN_ERRORS` error:** this option is incompatible with
+  `MATCH_BY_COLUMN_NAME`. Remove `VALIDATION_MODE` and inspect per-file status from the
+  COPY INTO result rows instead.
+
+---
+
+## Source concept sequencing
+
+The step 5b MERGE (`source_id IS NOT NULL`) populates `source_concepts.query_embedding` for
+existing rows — it does **not** insert new rows. This means:
+
+1. concept-mapper **Stage 0 must run first** for the wave whose source concepts were GPU-embedded,
+   creating the `(mapping_wave, source_id)` rows in `source_concepts`.
+2. The `mapping_wave` value stamped into the GPU parquet (set at export time by
+   `concept_mapper/embeddings/gpu_export.py`) must **exactly match** the wave name used in
+   Stage 0. Verify with:
+   ```bash
+   python3 -c "
+   import duckdb
+   r = duckdb.sql(\"SELECT DISTINCT mapping_wave FROM read_parquet('exports/parquet/**/part-*.parquet') WHERE source_id IS NOT NULL\").fetchall()
+   [print(row) for row in r]
+   "
+   ```
+3. If Stage 0 was never run for that wave, run it before the MERGE:
+   ```bash
+   cd /data/data_models/llm_concept_mapping
+   # Rebuild STCM full (required if latest source_to_concept_map was sampled):
+   cd /data/data_models/dbt_omop_clean
+   DBT_WAREHOUSE=CHIC_WH_BIG dbt run \
+     --select +source_to_concept_map mapping_source_run \
+     --vars '{"use_sample": "false", "sample_size": 0}'
+   # Then Stage 0:
+   cd /data/data_models/llm_concept_mapping
+   uv run concept-mapper stage ingest \
+     --wave <wave_name_from_parquet> \
+     --source-mode snowflake_stcm \
+     --max-concepts 0 \
+     --source-vocabulary-id <comma-separated CHOA_UNKNOWN_* vocabs>
+   ```
+
+---
+
+## Alternative: internal Snowflake stage (when STORAGE INTEGRATION is unavailable)
+
+If a Snowflake `STORAGE INTEGRATION` for the S3 bucket cannot be created (e.g., STS/IAM
+constraints), sync the parquet files locally and upload via an internal named stage using the
+Snowflake Python connector's `PUT` command.
+
+A ready-to-run script implementing this flow lives at
+`scripts/load_embeddings_to_snowflake.py` in this repo. Configure via
+`GPU_EMBED_S3_BUCKET`, `GPU_EMBED_S3_PREFIX`, `GPU_EMBED_RETRIEVAL_VERSION`,
+`GPU_EMBED_STAGE_NAME`, `GPU_EMBED_STAGING_TABLE` in `.env` (see `.env.example`).
+
+```bash
+# Run from llm_concept_mapping/ (has snowflake-connector-python)
+cd /data/data_models/llm_concept_mapping
+
+# Full flow: S3 sync + upload + COPY + MERGE
+uv run python ../athena_gpu_embedding/scripts/load_embeddings_to_snowflake.py
+
+# Or step by step:
+uv run python ../athena_gpu_embedding/scripts/load_embeddings_to_snowflake.py --sync-only   # just sync S3
+uv run python ../athena_gpu_embedding/scripts/load_embeddings_to_snowflake.py --load-only   # skip sync, do PUT+COPY+MERGE
+uv run python ../athena_gpu_embedding/scripts/load_embeddings_to_snowflake.py --put-only    # PUT only, leave stage open
+uv run python ../athena_gpu_embedding/scripts/load_embeddings_to_snowflake.py --merge-only  # re-run MERGE from existing staging table
+uv run python ../athena_gpu_embedding/scripts/load_embeddings_to_snowflake.py --rollback    # DELETE concept_embeddings rows for this version
+```
+
+**Critical: `AUTO_COMPRESS=FALSE` for parquet.** Parquet files are already internally compressed
+(Snappy/ZSTD). Using `AUTO_COMPRESS=TRUE` (the Snowflake connector default) wraps them in an
+additional GZIP layer. COPY INTO with `TYPE=PARQUET` does not strip the outer GZIP and silently
+skips those files — only files that were never compressed load successfully. Always use
+`AUTO_COMPRESS=FALSE` when staging parquet:
+
+```python
+cur.execute(f"PUT 'file://{f}' @{stage} AUTO_COMPRESS=FALSE OVERWRITE=FALSE")
+```
+
+**Thread safety:** `snowflake.connector` connections are not thread-safe. For parallel PUT, each
+worker thread must open its own connection — do not share a single connection across threads.
+
+**`VALIDATION_MODE` incompatibility:** `VALIDATION_MODE = RETURN_ERRORS` cannot be combined
+with `MATCH_BY_COLUMN_NAME`. Check load results from the COPY INTO result rows instead:
+
+```python
+copy_results = cur.fetchall()
+failed = [r for r in copy_results if r[1] == 'LOAD_FAILED']
+```

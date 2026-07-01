@@ -339,9 +339,14 @@ Each repo is intentionally un-orchestrated; this is the expected ordering.
 
 1. **Athena release** (monthly) → `vocabulary_loader` refreshes `OMOP_VOCAB` →
    `gpu-embedder` (re)embeds new/changed Athena concepts → load `concept_embeddings`.
-2. **New mapping wave** → dbt emits unmapped STCM rows → `concept-mapper` Stage 0
-   (STCM mode) ingests gaps → embed source concepts (local FP32/CLS, in-DB UDF,
-   or `gpu-embedder` round-trip — all §4) → Stages 3–6.
+2. **New mapping wave** → dbt emits unmapped STCM rows → **first rebuild
+   `source_to_concept_map` full** (`dbt run -s +source_to_concept_map mapping_source_run
+   --vars '{"use_sample": "false", "sample_size": 0}'`; required so Stage 0 sees the
+   complete unmapped backlog, not a sampled subset) → `concept-mapper` Stage 0
+   (STCM mode, `--max-concepts 0`) ingests gaps → embed source concepts (`gpu-embedder`
+   GPU round-trip preferred, or local FP32/CLS — all §4) → **then** load embeddings
+   into Snowflake; the source-concept MERGE (`5b`) only updates rows that already exist
+   in `source_concepts`, so Stage 0 must complete before the MERGE → Stages 3–6.
 3. **Human review** → `promote` ACCEPTED/MODIFIED → `concept_mappings`.
 4. **dbt run** → overlay picks up the latest promoted rows → CDM → remaining
    gaps feed the next wave.
@@ -387,6 +392,20 @@ is config-driven, but a few **literals** can't read a constant — change them t
 
 Beyond the §4 vector-space contract, these affect mapping quality/cost. Not
 contract inconsistencies — operational state and open work.
+
+### Snowflake load — internal stage fallback
+
+When a Snowflake `STORAGE INTEGRATION` for S3 cannot be created, use
+`scripts/load_embeddings_to_snowflake.py` (in `athena_gpu_embedding`) which syncs
+parquet locally and uploads via an internal named stage. Two hard-won lessons:
+
+- **`AUTO_COMPRESS=FALSE` is required for parquet.** The Snowflake connector
+  default `AUTO_COMPRESS=TRUE` GZIP-wraps the file; COPY INTO `TYPE=PARQUET`
+  does not strip the outer GZIP and silently skips those files. Only files that
+  were never compressed load — a subset that can look like a successful partial
+  load. Always use `AUTO_COMPRESS=FALSE` when staging parquet.
+- **`VALIDATION_MODE = RETURN_ERRORS` is incompatible with `MATCH_BY_COLUMN_NAME`.**
+  Inspect per-file status from the COPY INTO result rows instead.
 
 - **✅ Semantic retrieval is ON by default** (`SEMANTIC_RETRIEVAL_ENABLED=true`)
   now that the GPU FP32+CLS vectors are loaded. A host without the embeddings
