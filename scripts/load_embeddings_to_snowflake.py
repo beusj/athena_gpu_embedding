@@ -163,11 +163,12 @@ def create_stage(cur) -> None:
     print(f"[step 2] Stage {stage} ready")
 
 
-def put_files(conn, workers: int = 4) -> None:
+def put_files(conn, workers: int = 4, overwrite: bool = True) -> None:
     stage = _cfg('GPU_EMBED_STAGE_NAME', _DEFAULT_STAGE_NAME)
     files = sorted(LOCAL_PARQUET_DIR.rglob("*.parquet"))
+    overwrite_flag = "TRUE" if overwrite else "FALSE"
     print(f"\n[step 3] Uploading {len(files)} parquet files to @{stage} "
-          f"({workers} workers, AUTO_COMPRESS=FALSE)")
+          f"({workers} workers, AUTO_COMPRESS=FALSE, OVERWRITE={overwrite_flag})")
 
     import snowflake.connector  # type: ignore[import]
     params = _build_conn_params()
@@ -185,7 +186,7 @@ def put_files(conn, workers: int = 4) -> None:
             # which silently skips the file.
             result = cur.execute(
                 f"PUT 'file://{f}' @{stage} "
-                f"AUTO_COMPRESS=FALSE OVERWRITE=FALSE",
+                f"AUTO_COMPRESS=FALSE OVERWRITE={overwrite_flag}",
                 timeout=600,
             ).fetchall()
             status = result[0][6] if result else "UNKNOWN"  # column: status
@@ -211,6 +212,20 @@ def put_files(conn, workers: int = 4) -> None:
             print(f"  {e}")
     else:
         print(f"[step 3] All {len(files)} files staged successfully")
+
+    # Verify stage file count matches local file count
+    verify_conn = snowflake.connector.connect(**params)
+    try:
+        vcur = verify_conn.cursor()
+        vcur.execute(f"LIST @{stage}")
+        staged = vcur.fetchall()
+        vcur.close()
+    finally:
+        verify_conn.close()
+    print(f"[step 3] Verification: {len(files)} local files, {len(staged)} files in stage")
+    if len(staged) < len(files):
+        print(f"[step 3] WARNING: {len(files) - len(staged)} files missing from stage — "
+              f"re-run with --put-only to retry")
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +384,7 @@ def main() -> None:
     parser.add_argument("--put-only", action="store_true", help="Only PUT files to stage, skip COPY/MERGE")
     parser.add_argument("--merge-only", action="store_true", help="Skip PUT/COPY, re-run only the MERGE steps from existing staging table")
     parser.add_argument("--rollback", action="store_true", help=f"DELETE all rows from concept_embeddings for version {_DEFAULT_EMBED_MODEL_VERSION} and exit")
+    parser.add_argument("--no-overwrite", action="store_true", help="Skip files already in the stage (OVERWRITE=FALSE). Default is OVERWRITE=TRUE.")
     parser.add_argument("--workers", type=int, default=4, help="Parallel PUT workers (default: 4)")
     parser.add_argument("--embed-model-version",
                         default=_cfg('GPU_EMBED_RETRIEVAL_VERSION', _DEFAULT_EMBED_MODEL_VERSION),
@@ -400,7 +416,7 @@ def main() -> None:
 
         if not args.merge_only:
             create_stage(cur)
-            put_files(conn, workers=args.workers)
+            put_files(conn, workers=args.workers, overwrite=not args.no_overwrite)
             if args.put_only:
                 print("[done] PUT complete. Stage left in place. Re-run with --merge-only to finish.")
                 cur.close()
